@@ -3,7 +3,7 @@ import time
 from lerobot.robots import UR5eRobotConfig, make_robot_from_config
 
 ROBOT_IP = "192.168.1.102"
-FREEDRIVE_DURATION_S = 10.0
+FREEDRIVE_DURATION_S = 20.0
 
 
 def main():

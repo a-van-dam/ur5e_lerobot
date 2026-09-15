@@ -1,13 +1,15 @@
 import math
+import shutil
 import time
-import numpy as np
-import cv2
-import torch
 from pathlib import Path
 
-from lerobot.robots import UR5eRobotConfig, make_robot_from_config
+import cv2
+import numpy as np
+import torch
+
 from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from ur5e import UR5eRobotConfig, make_robot_from_config
 
 ROBOT_IP = "192.168.1.102"
 CAMERA_INDEX = 4       # USB Camera (KYE Systems Corp. eFace 1325R)
@@ -23,6 +25,35 @@ UR5E_JOINTS = [
     "wrist_2",
     "wrist_3",
 ]
+
+
+def setup_dataset(features: dict) -> LeRobotDataset:
+    """Initialize a new LeRobot dataset or resume an existing one."""
+    meta_info = OUTPUT_DIR / "meta" / "info.json"
+    if meta_info.exists():
+        print(f"\nExisting dataset found at: {OUTPUT_DIR.resolve()}")
+        choice = input("[R]esume appending to existing dataset or [O]verwrite & start fresh? [r/o]: ").strip().lower()
+        if choice.startswith("r"):
+            print("Resuming existing dataset...")
+            return LeRobotDataset.resume(
+                repo_id=DATASET_REPO,
+                root=OUTPUT_DIR,
+            )
+        else:
+            print("Removing previous dataset to start fresh...")
+            shutil.rmtree(OUTPUT_DIR)
+    elif OUTPUT_DIR.exists():
+        # Directory exists but lacks metadata, remove to avoid create() conflict
+        shutil.rmtree(OUTPUT_DIR)
+
+    return LeRobotDataset.create(
+        repo_id=DATASET_REPO,
+        fps=FPS,
+        features=features,
+        root=OUTPUT_DIR,
+        robot_type="ur5e",
+        use_videos=True,
+    )
 
 
 def main():
@@ -66,18 +97,11 @@ def main():
         },
     }
 
-    dataset = LeRobotDataset.create(
-        repo_id=DATASET_REPO,
-        fps=FPS,
-        features=features,
-        root=OUTPUT_DIR,
-        robot_type="ur5e",
-        use_videos=True,
-    )
-    print(f"Initialized LeRobot dataset at: {OUTPUT_DIR.resolve()}")
+    dataset = setup_dataset(features)
+    print(f"Dataset ready at: {OUTPUT_DIR.resolve()} (Current episodes: {dataset.num_episodes})")
 
     try:
-        episode_idx = 0
+        episode_idx = dataset.num_episodes
         while True:
             episode_idx += 1
             print("\n" + "=" * 70)
@@ -92,7 +116,7 @@ def main():
             input("\n-> Press [ENTER] to start recording and enable FREEDRIVE...")
 
             print("\n>>> ENABLING FREEDRIVE — You can move the robot arm now! <<<")
-            print(">>> Press [ENTER] in terminal or [q] in video window to STOP recording episode. <<<\n")
+            print(">>> Press [q] or [SPACE] in camera window (or Enter in terminal) to STOP recording. <<<\n")
             robot.enable_freedrive()
 
             frame_count = 0
@@ -117,6 +141,7 @@ def main():
                     "observation.state": torch.from_numpy(q_vals),
                     "action": torch.from_numpy(q_vals),
                     "observation.images.workspace": torch.from_numpy(img),
+                    "task": task_desc,
                 }
                 dataset.add_frame(frame_data)
                 frame_count += 1
@@ -152,16 +177,17 @@ def main():
             robot.disable_freedrive()
 
             print(f"Saving Episode #{episode_idx} ({frame_count} frames, {frame_count / FPS:.1f}s)...")
-            dataset.save_episode(task=task_desc)
+            dataset.save_episode()
             print(f"-> Episode #{episode_idx} saved successfully!")
 
             cont = input("\nRecord another episode? [Y/n]: ").strip().lower()
             if cont in ("n", "no", "q"):
                 break
 
-        print("\nConsolidating dataset and encoding final MP4 videos...")
-        dataset.consolidate()
-        print(f"\n-> Dataset recording COMPLETE! Saved to {OUTPUT_DIR.resolve()}")
+        print("\nFinalizing dataset...")
+        if hasattr(dataset, "finalize"):
+            dataset.finalize()
+        print(f"\n-> Dataset recording COMPLETE! Total episodes: {dataset.num_episodes}")
         print("\nTo visualize the recorded dataset in your browser:")
         print(f"    lerobot-dataset-viz --dataset.repo_id={DATASET_REPO} --dataset.root={OUTPUT_DIR}")
 
@@ -173,4 +199,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

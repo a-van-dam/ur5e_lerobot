@@ -15,7 +15,7 @@ ROBOT_IP = "192.168.1.102"
 CAMERA_INDEX = 4       # USB Camera (KYE Systems Corp. eFace 1325R)
 FPS = 30               # Target recording frequency
 DATASET_REPO = "local/ur5e_freedrive_demos"
-OUTPUT_DIR = Path("./datasets") / "ur5e_freedrive_demos"
+OUTPUT_DIR = Path(__file__).resolve().parent / "datasets" / "ur5e_freedrive_demos"
 
 UR5E_JOINTS = [
     "shoulder_pan",
@@ -188,8 +188,8 @@ def main():
         if hasattr(dataset, "finalize"):
             dataset.finalize()
         print(f"\n-> Dataset recording COMPLETE! Total episodes: {dataset.num_episodes}")
-        print("\nTo visualize the recorded dataset in your browser:")
-        print(f"    lerobot-dataset-viz --dataset.repo_id={DATASET_REPO} --dataset.root={OUTPUT_DIR}")
+        print("\nTo visualize recorded episodes in the dataset (e.g. Episode 0):")
+        print(f"    lerobot-dataset-viz --repo-id {DATASET_REPO} --root {OUTPUT_DIR} --episode-index 0")
 
     finally:
         print("\nDisconnecting...")

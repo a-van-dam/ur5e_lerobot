@@ -113,6 +113,8 @@ python record_freedrive_dataset.py
 ### 5. Inspect in LeRobot Web GUI
 Visualize recorded trajectories, video feeds, and joint plots:
 ```bash
-lerobot-dataset-viz --dataset.repo_id=local/ur5e_freedrive_demos --dataset.root=./datasets/ur5e_freedrive_demos
+conda activate lerobot
+lerobot-dataset-viz --repo-id local/ur5e_freedrive_demos --root ./datasets/ur5e_freedrive_demos --episode-index 0
 ```
+> **Note**: Visualizing with Rerun requires `rerun-sdk` (`pip install rerun-sdk`).
 

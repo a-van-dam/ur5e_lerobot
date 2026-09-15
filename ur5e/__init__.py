@@ -6,5 +6,10 @@ except (ImportError, ModuleNotFoundError):
     from .configuration_ur5e import UR5eRobotConfig
     from .robot_ur5e import UR5eRobot
 
-__all__ = ["UR5eRobotConfig", "UR5eRobot"]
+try:
+    from lerobot.robots import make_robot_from_config
+except (ImportError, ModuleNotFoundError):
+    make_robot_from_config = None
+
+__all__ = ["UR5eRobotConfig", "UR5eRobot", "make_robot_from_config"]
 

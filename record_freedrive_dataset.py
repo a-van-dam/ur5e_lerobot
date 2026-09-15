@@ -9,7 +9,7 @@ import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from ur5e import UR5eRobotConfig, make_robot_from_config
+from lerobot.robots import UR5eRobotConfig, make_robot_from_config
 
 ROBOT_IP = "192.168.1.102"
 CAMERA_INDEX = 4       # USB Camera (KYE Systems Corp. eFace 1325R)

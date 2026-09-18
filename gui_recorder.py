@@ -1,0 +1,1979 @@
+#!/usr/bin/env python3
+"""
+UR5e LeRobot Demonstration Dataset Studio (PyQt6)
+==================================================
+Standalone desktop application for recording demonstration datasets on a
+Universal Robots UR5e arm with integrated camera feeds, RTDE telemetry (125 Hz),
+Freedrive physical teleoperation, and LeRobot dataset management.
+
+Features:
+- Decoupled multithreading (UI, RTDE telemetry polling, OpenCV camera, recorder)
+- Modular camera feed layout (workspace primary + expandable secondary feed)
+- Real-time 6-DoF joint telemetry dashboard & RTDE benchmark HUD
+- Dataset & Episode Management (scan existing folder, count, inspect, delete last)
+- Hotkey-driven workflow (Space = Start/End, 'c'/Left = Cancel, Esc = Stop)
+- Strict Freedrive safety enforcement before recording
+- Hardware diagnostics runner (executes test_lerobot_ur5e.py in background thread)
+- Embedded timestamped live log terminal console with stdout/stderr redirection
+- Automatic Simulation/Mock fallback mode for offline GUI development
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import math
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+# PyQt6 Core & Widgets
+from PyQt6.QtCore import (
+    QMutex,
+    QMutexLocker,
+    QObject,
+    QSize,
+    QThread,
+    QTimer,
+    Qt,
+    pyqtSignal,
+    pyqtSlot,
+)
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QIcon,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
+from PyQt6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QSplitter,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+# Optional PyTorch & LeRobot imports with graceful fallback
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    from lerobot.cameras.opencv import OpenCVCameraConfig
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.robots import UR5eRobotConfig, make_robot_from_config
+    LEROBOT_AVAILABLE = True
+except ImportError:
+    LEROBOT_AVAILABLE = False
+
+
+# Default Configuration
+DEFAULT_ROBOT_IP = "192.168.1.102"
+DEFAULT_CAMERA_INDEX = 4       # KYE Systems Corp. eFace 1325R
+DEFAULT_FPS = 30
+DEFAULT_DATASET_NAME = "ur5e_assembly"
+DEFAULT_DATASETS_DIR = Path(__file__).resolve().parent / "datasets"
+
+UR5E_JOINTS = [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow",
+    "wrist_1",
+    "wrist_2",
+    "wrist_3",
+]
+
+
+# =============================================================================
+# 1. Thread-Safe Live Log Redirection
+# =============================================================================
+
+class LogEmitter(QObject):
+    log_signal = pyqtSignal(str, str)  # (level, message)
+
+
+class StreamToLogger:
+    """Redirects writes from stdout/stderr to Qt signal emitter."""
+    def __init__(self, emitter: LogEmitter, level: str = "INFO"):
+        self.emitter = emitter
+        self.level = level
+        self._buffer = ""
+
+    def write(self, text: str):
+        if not text:
+            return
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line = line.strip()
+            if line:
+                self.emitter.log_signal.emit(self.level, line)
+
+    def flush(self):
+        if self._buffer.strip():
+            self.emitter.log_signal.emit(self.level, self._buffer.strip())
+            self._buffer = ""
+
+
+# =============================================================================
+# 2. Asynchronous Camera Capture Thread
+# =============================================================================
+
+class CameraWorker(QThread):
+    """
+    Dedicated QThread capturing frames from OpenCV camera.
+    Runs at target FPS asynchronously to prevent UI stutter.
+    """
+    frame_ready = pyqtSignal(int, np.ndarray)  # (camera_id, bgr_image)
+    fps_updated = pyqtSignal(int, float)       # (camera_id, measured_fps)
+    status_signal = pyqtSignal(int, bool, str) # (camera_id, is_connected, message)
+
+    def __init__(self, camera_id: int, target_fps: int = 30, mock: bool = False, parent=None):
+        super().__init__(parent)
+        self.camera_id = camera_id
+        self.target_fps = target_fps
+        self.mock = mock
+        self._running = False
+        self._cap = None
+        self._mutex = QMutex()
+
+    def run(self):
+        self._running = True
+
+        if not self.mock:
+            self._cap = cv2.VideoCapture(self.camera_id)
+            # Optimize capture parameters
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+
+            if not self._cap.isOpened():
+                self.status_signal.emit(
+                    self.camera_id,
+                    False,
+                    f"Camera /dev/video{self.camera_id} unavailable (Falling back to test pattern)"
+                )
+                self.mock = True
+            else:
+                self.status_signal.emit(
+                    self.camera_id,
+                    True,
+                    f"Camera /dev/video{self.camera_id} connected @ {self.target_fps} FPS"
+                )
+
+        frame_interval = 1.0 / max(1, self.target_fps)
+        last_frame_time = time.perf_counter()
+        fps_counter = 0
+        fps_start = time.perf_counter()
+
+        sim_t = 0.0
+
+        while self._running:
+            t0 = time.perf_counter()
+
+            if not self.mock and self._cap and self._cap.isOpened():
+                ret, frame = self._cap.read()
+                if not ret:
+                    time.sleep(0.01)
+                    continue
+            else:
+                # Generate synthetic test frame with timestamp and visual animation
+                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                # Subtle gradient background
+                sim_t += 0.03
+                gx = int(128 + 60 * math.sin(sim_t))
+                gy = int(128 + 60 * math.cos(sim_t * 0.8))
+                frame[:, :, 0] = 30
+                frame[:, :, 1] = int(gx * 0.3)
+                frame[:, :, 2] = int(gy * 0.4)
+
+                # Grid pattern
+                for x in range(0, 640, 40):
+                    cv2.line(frame, (x, 0), (x, 480), (45, 55, 72), 1)
+                for y in range(0, 480, 40):
+                    cv2.line(frame, (0, y), (640, y), (45, 55, 72), 1)
+
+                # Simulated end-effector crosshair moving smoothly
+                cx = int(320 + 150 * math.sin(sim_t * 1.2))
+                cy = int(240 + 100 * math.cos(sim_t * 1.5))
+                cv2.circle(frame, (cx, cy), 18, (0, 215, 255), 2)
+                cv2.circle(frame, (cx, cy), 4, (0, 215, 255), -1)
+                cv2.putText(
+                    frame,
+                    f"CAM {self.camera_id} [SYNTHETIC WORKSPACE FEED]",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (200, 220, 255),
+                    2,
+                )
+                time_str = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-4]
+                cv2.putText(
+                    frame,
+                    f"TIME: {time_str}",
+                    (20, 450),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (150, 180, 200),
+                    1,
+                )
+
+            # Emit frame
+            self.frame_ready.emit(self.camera_id, frame)
+
+            # Compute actual FPS
+            fps_counter += 1
+            now = time.perf_counter()
+            if now - fps_start >= 1.0:
+                measured_fps = fps_counter / (now - fps_start)
+                self.fps_updated.emit(self.camera_id, measured_fps)
+                fps_counter = 0
+                fps_start = now
+
+            # Sleep to maintain requested FPS rate
+            elapsed = time.perf_counter() - t0
+            sleep_t = frame_interval - elapsed
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+        if self._cap and self._cap.isOpened():
+            self._cap.release()
+            self._cap = None
+
+    def stop(self):
+        self._running = False
+        self.wait(1500)
+
+
+# =============================================================================
+# 3. Asynchronous Robot RTDE Telemetry & Control Worker (125 Hz)
+# =============================================================================
+
+class RobotRTDEWorker(QThread):
+    """
+    Dedicated QThread maintaining real-time RTDE communication with UR5e.
+    Polls joint angles at 125 Hz, tracks loop latency, and safely processes
+    Freedrive toggles via URScript socket.
+    """
+    telemetry_signal = pyqtSignal(dict)           # Joint positions & telemetry stats
+    freedrive_state_changed = pyqtSignal(bool)   # True if active, False if locked
+    connection_state_changed = pyqtSignal(bool, str) # (is_connected, message)
+
+    def __init__(self, robot_ip: str = DEFAULT_ROBOT_IP, mock: bool = False, parent=None):
+        super().__init__(parent)
+        self.robot_ip = robot_ip
+        self.mock = mock
+        self._running = False
+        self._robot = None
+        self._freedrive_active = False
+
+        # Queue commands for the worker thread
+        self._cmd_lock = QMutex()
+        self._cmd_toggle_freedrive = False
+        self._cmd_disconnect = False
+        self._cmd_target_pose: Optional[Dict[str, float]] = None
+
+        # Latest joint states (radians)
+        self._latest_q = {j: 0.0 for j in UR5E_JOINTS}
+
+    @property
+    def is_freedrive_active(self) -> bool:
+        return self._freedrive_active
+
+    def request_toggle_freedrive(self):
+        with QMutexLocker(self._cmd_lock):
+            self._cmd_toggle_freedrive = True
+
+    def request_move_pose(self, pose: Dict[str, float]):
+        with QMutexLocker(self._cmd_lock):
+            self._cmd_target_pose = dict(pose)
+
+    def request_disconnect(self):
+        with QMutexLocker(self._cmd_lock):
+            self._cmd_disconnect = True
+
+    def run(self):
+        self._running = True
+
+        # 1. Connect to UR5e or fallback to mock
+        if not self.mock and LEROBOT_AVAILABLE:
+            try:
+                from ur5e.configuration_ur5e import UR5eRobotConfig
+                from ur5e.robot_ur5e import UR5eRobot
+                config = UR5eRobotConfig(robot_ip=self.robot_ip)
+                self._robot = UR5eRobot(config)
+                self._robot.connect()
+                self.connection_state_changed.emit(True, f"Connected to UR5e at {self.robot_ip}")
+            except Exception as e:
+                self.connection_state_changed.emit(
+                    False,
+                    f"Hardware connection failed ({e}). Entering Mock Robot Mode."
+                )
+                self.mock = True
+                self._robot = None
+        else:
+            self.connection_state_changed.emit(
+                True,
+                f"Mock Robot Mode active (Simulated UR5e on {self.robot_ip})"
+            )
+
+        # Simulation kinematics parameters
+        sim_t = 0.0
+        mock_angles = [0.0, -math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2, 0.0]
+
+        # 125 Hz polling loop (period = 8ms)
+        target_period = 1.0 / 125.0
+        last_emit_time = time.perf_counter()
+        emit_interval = 1.0 / 30.0  # Throttle UI signal emissions to 30 Hz for UI fluidity
+
+        sample_count = 0
+        perf_window_start = time.perf_counter()
+        measured_rate = 125.0
+        read_latency_ms = 1.2
+
+        while self._running:
+            t0 = time.perf_counter()
+
+            # Process queued commands
+            with QMutexLocker(self._cmd_lock):
+                if self._cmd_disconnect:
+                    break
+                if self._cmd_toggle_freedrive:
+                    self._cmd_toggle_freedrive = False
+                    new_state = not self._freedrive_active
+                    try:
+                        if self._robot and hasattr(self._robot, "enable_freedrive"):
+                            if new_state:
+                                self._robot.enable_freedrive()
+                            else:
+                                self._robot.disable_freedrive()
+                        self._freedrive_active = new_state
+                        self.freedrive_state_changed.emit(self._freedrive_active)
+                    except Exception as err:
+                        print(f"[ERROR] Failed to toggle Freedrive: {err}")
+                if self._cmd_target_pose is not None:
+                    target_pose = self._cmd_target_pose
+                    self._cmd_target_pose = None
+                    if self._robot and not self._freedrive_active:
+                        try:
+                            self._robot.send_action(target_pose)
+                        except Exception as err:
+                            print(f"[ERROR] Motion command failed: {err}")
+                    elif self.mock:
+                        for idx, j_name in enumerate(UR5E_JOINTS):
+                            key = f"{j_name}.pos"
+                            if key in target_pose:
+                                mock_angles[idx] = float(target_pose[key])
+
+            # Telemetry acquisition
+            if not self.mock and self._robot and self._robot.rx:
+                try:
+                    q_list = self._robot.rx.getActualQ()
+                    for idx, j_name in enumerate(UR5E_JOINTS):
+                        self._latest_q[j_name] = float(q_list[idx])
+                except Exception as err:
+                    print(f"[WARNING] RTDE read exception: {err}")
+            else:
+                # Synthetic realistic UR5e telemetry
+                sim_t += target_period
+                if self._freedrive_active:
+                    # In freedrive, arm drifts or simulates compliance
+                    noise = 0.002 * math.sin(sim_t * 5)
+                    for i in range(6):
+                        mock_angles[i] += 0.001 * math.sin(sim_t * (1 + i * 0.4))
+                for idx, j_name in enumerate(UR5E_JOINTS):
+                    self._latest_q[j_name] = mock_angles[idx]
+
+            sample_count += 1
+            t_now = time.perf_counter()
+            read_latency_ms = (t_now - t0) * 1000.0
+
+            # Frequency benchmark calculation every 0.5s
+            if t_now - perf_window_start >= 0.5:
+                measured_rate = sample_count / (t_now - perf_window_start)
+                sample_count = 0
+                perf_window_start = t_now
+
+            # Throttle UI update emission to 30 Hz to keep Qt queue light
+            if t_now - last_emit_time >= emit_interval:
+                telemetry_payload = {
+                    "joints": dict(self._latest_q),
+                    "rtde_hz": measured_rate,
+                    "latency_ms": read_latency_ms,
+                    "freedrive": self._freedrive_active,
+                }
+                self.telemetry_signal.emit(telemetry_payload)
+                last_emit_time = t_now
+
+            # Sleep to match 125 Hz cycle
+            elapsed = time.perf_counter() - t0
+            sleep_time = target_period - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        # Cleanup robot connection
+        if self._robot:
+            try:
+                if self._freedrive_active:
+                    self._robot.disable_freedrive()
+                self._robot.disconnect()
+            except Exception:
+                pass
+            self._robot = None
+
+        self._running = False
+
+    def get_latest_joints(self) -> Dict[str, float]:
+        return dict(self._latest_q)
+
+    def stop(self):
+        self._running = False
+        self.request_disconnect()
+        self.wait(2000)
+
+
+# =============================================================================
+# 4. Hardware Verification Diagnostic Worker (test_lerobot_ur5e.py)
+# =============================================================================
+
+class HardwareTestWorker(QThread):
+    """
+    Background worker executing the 5-phase test_lerobot_ur5e.py suite.
+    Captures live output and streams each line directly to the terminal console.
+    """
+    output_line = pyqtSignal(str)
+    test_finished = pyqtSignal(bool, str)
+
+    def __init__(self, script_path: Path, robot_ip: str, parent=None):
+        super().__init__(parent)
+        self.script_path = script_path
+        self.robot_ip = robot_ip
+        self._process = None
+
+    def run(self):
+        self.output_line.emit("\n" + "=" * 70)
+        self.output_line.emit(">>> INITIATING UR5e HARDWARE DIAGNOSTICS SUITE <<<")
+        self.output_line.emit(f"Target: {self.script_path.name} | Robot IP: {self.robot_ip}")
+        self.output_line.emit("=" * 70 + "\n")
+
+        if not self.script_path.exists():
+            msg = f"Diagnostic script not found at: {self.script_path}"
+            self.output_line.emit(f"[ERROR] {msg}")
+            self.test_finished.emit(False, msg)
+            return
+
+        cmd = [sys.executable, "-u", str(self.script_path)]
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+
+            for line in iter(self._process.stdout.readline, ""):
+                cleaned = line.rstrip()
+                if cleaned:
+                    self.output_line.emit(cleaned)
+
+            self._process.stdout.close()
+            return_code = self._process.wait()
+
+            if return_code == 0:
+                self.output_line.emit("\n[SUCCESS] All diagnostic verification phases PASSED cleanly!\n")
+                self.test_finished.emit(True, "Diagnostics passed successfully.")
+            else:
+                self.output_line.emit(f"\n[FAILURE] Diagnostic test exited with code {return_code}.\n")
+                self.test_finished.emit(False, f"Exited with error code {return_code}")
+
+        except Exception as e:
+            self.output_line.emit(f"[ERROR] Subprocess execution error: {e}")
+            self.test_finished.emit(False, str(e))
+
+    def terminate_process(self):
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+            self.wait(1000)
+
+
+# =============================================================================
+# 5. Modular Camera Feed UI Widget
+# =============================================================================
+
+class CameraFeedWidget(QFrame):
+    """
+    Self-contained video feed widget with title bar, resolution/FPS badges,
+    blinking recording indicator overlay, and smooth proportional scaling.
+    Designed so secondary or wrist cameras can easily be added side-by-side.
+    """
+    def __init__(self, title: str, camera_id: int, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.camera_id = camera_id
+        self.is_recording = False
+        self._fps = 0.0
+
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet("""
+            CameraFeedWidget {
+                background-color: #0b0f19;
+                border: 2px solid #1e293b;
+                border-radius: 8px;
+            }
+        """)
+
+        # Main layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # Header bar
+        header = QHBoxLayout()
+        self.lbl_title = QLabel(f"<b>{self.title}</b>")
+        self.lbl_title.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        header.addWidget(self.lbl_title)
+
+        header.addStretch()
+
+        self.lbl_fps = QLabel("0.0 FPS")
+        self.lbl_fps.setStyleSheet("color: #38bdf8; font-family: monospace; font-size: 11px;")
+        header.addWidget(self.lbl_fps)
+
+        self.lbl_rec = QLabel("● REC")
+        self.lbl_rec.setStyleSheet("""
+            color: #ef4444;
+            font-weight: bold;
+            font-size: 11px;
+            padding: 1px 6px;
+            background-color: rgba(239, 68, 68, 0.2);
+            border-radius: 4px;
+        """)
+        self.lbl_rec.setVisible(False)
+        header.addWidget(self.lbl_rec)
+
+        layout.addLayout(header)
+
+        # Image display canvas
+        self.video_canvas = QLabel("Connecting Camera...")
+        self.video_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_canvas.setStyleSheet("""
+            background-color: #050811;
+            color: #64748b;
+            font-weight: bold;
+            font-size: 12px;
+            border-radius: 6px;
+        """)
+        self.video_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_canvas.setMinimumSize(320, 240)
+        layout.addWidget(self.video_canvas)
+
+        # Blinking timer for REC badge
+        self._blink_timer = QTimer(self)
+        self._blink_timer.timeout.connect(self._toggle_rec_blink)
+        self._blink_visible = True
+
+    def set_recording(self, recording: bool):
+        self.is_recording = recording
+        if recording:
+            self.lbl_rec.setVisible(True)
+            self._blink_timer.start(500)
+        else:
+            self._blink_timer.stop()
+            self.lbl_rec.setVisible(False)
+
+    def _toggle_rec_blink(self):
+        self._blink_visible = not self._blink_visible
+        self.lbl_rec.setVisible(self._blink_visible)
+
+    @pyqtSlot(int, float)
+    def update_fps(self, cam_id: int, fps: float):
+        if cam_id == self.camera_id:
+            self._fps = fps
+            self.lbl_fps.setText(f"{fps:4.1f} FPS")
+
+    @pyqtSlot(int, np.ndarray)
+    def update_frame(self, cam_id: int, frame_bgr: np.ndarray):
+        if cam_id != self.camera_id:
+            return
+
+        h, w, ch = frame_bgr.shape
+        bytes_per_line = ch * w
+        # OpenCV BGR to RGB conversion
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        qimg = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+
+        # Scale to canvas dimensions preserving aspect ratio
+        canvas_w = max(10, self.video_canvas.width())
+        canvas_h = max(10, self.video_canvas.height())
+        scaled_pixmap = QPixmap.fromImage(qimg).scaled(
+            canvas_w,
+            canvas_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.video_canvas.setPixmap(scaled_pixmap)
+
+
+# =============================================================================
+# 6. Main Teleoperation & Recording Studio Application
+# =============================================================================
+
+class UR5eRecorderStudio(QMainWindow):
+    """
+    Main Teleoperation & Recording Studio Window.
+    Coordinates RTDE Worker, Camera Worker, LeRobotDataset writing,
+    Diagnostic subprocesses, hotkey workflows, and GUI layout.
+    """
+
+    def __init__(self, robot_ip: str, camera_index: int, fps: int, mock: bool = False):
+        super().__init__()
+        self.robot_ip = robot_ip
+        self.camera_index = camera_index
+        self.target_fps = fps
+        self.mock_mode = mock
+
+        # State tracking
+        self.is_recording = False
+        self.freedrive_active = False
+        self.record_start_time: Optional[float] = None
+        self.recorded_frames_count = 0
+        self.active_dataset: Optional[Any] = None
+        self.dataset_root: Path = DEFAULT_DATASETS_DIR / DEFAULT_DATASET_NAME
+        self.current_episode_buffer: List[Dict[str, Any]] = []
+        self.latest_camera_frame: Optional[np.ndarray] = None
+
+        # Window settings
+        self.setWindowTitle("UR5e LeRobot — Teleoperation & Demonstration Recording Studio")
+        self.resize(1380, 980)
+        self.setMinimumSize(1100, 800)
+        self._user_dragging_joint: Optional[str] = None
+
+        # Apply dark industrial visual styling
+        self.apply_theme()
+
+        # Build UI layout
+        self.setup_ui()
+
+        # Setup Logging redirection
+        self.log_emitter = LogEmitter()
+        self.log_emitter.log_signal.connect(self.append_log)
+        self.stdout_redirect = StreamToLogger(self.log_emitter, "INFO")
+        self.stderr_redirect = StreamToLogger(self.log_emitter, "ERROR")
+        sys.stdout = self.stdout_redirect
+        sys.stderr = self.stderr_redirect
+
+        # Setup Hotkeys
+        self.setup_shortcuts()
+
+        # Start Camera Thread
+        self.camera_worker = CameraWorker(self.camera_index, self.target_fps, self.mock_mode)
+        self.camera_worker.frame_ready.connect(self.on_frame_received)
+        self.camera_worker.fps_updated.connect(self.cam_widget_1.update_fps)
+        self.camera_worker.status_signal.connect(self.on_camera_status)
+        self.camera_worker.start()
+
+        # Start Robot RTDE Thread
+        self.robot_worker = RobotRTDEWorker(self.robot_ip, self.mock_mode)
+        self.robot_worker.telemetry_signal.connect(self.on_telemetry_updated)
+        self.robot_worker.freedrive_state_changed.connect(self.on_freedrive_state_changed)
+        self.robot_worker.connection_state_changed.connect(self.on_robot_connection_status)
+        self.robot_worker.start()
+
+        # High-resolution UI Timer for recording stopwatch
+        self.recording_timer = QTimer(self)
+        self.recording_timer.setInterval(50)  # 20 Hz update rate for timer label
+        self.recording_timer.timeout.connect(self.update_recording_timer)
+
+        # Dataset Recording Synced Timer (30 Hz frame capture)
+        self.dataset_frame_timer = QTimer(self)
+        self.dataset_frame_timer.setInterval(int(1000 / self.target_fps))
+        self.dataset_frame_timer.timeout.connect(self.capture_recording_frame)
+
+        # Diagnostic Worker reference
+        self.diagnostic_worker: Optional[HardwareTestWorker] = None
+
+        # Scan initial dataset directory
+        self.rescan_dataset_directory()
+
+        print(f"[SYSTEM] UR5e Studio initialized. Target IP: {self.robot_ip} | Camera: /dev/video{self.camera_index}")
+        if self.mock_mode:
+            print("[INFO] Application running in SIMULATION/MOCK mode. No physical arm required.")
+
+    # -------------------------------------------------------------------------
+    # Styling & Visual Theme
+    # -------------------------------------------------------------------------
+    def apply_theme(self):
+        palette_css = """
+        QMainWindow, QWidget {
+            background-color: #0f172a;
+            color: #f8fafc;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            font-size: 12px;
+        }
+        QGroupBox {
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            margin-top: 24px;
+            font-weight: bold;
+            font-size: 11px;
+            color: #94a3b8;
+            padding-top: 14px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 12px;
+            top: 6px;
+            padding: 0 6px;
+            background-color: #1e293b;
+            border-radius: 4px;
+        }
+        QLineEdit, QComboBox, QListWidget, QPlainTextEdit {
+            background-color: #0b1120;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            padding: 6px;
+            color: #f1f5f9;
+            selection-background-color: #2563eb;
+        }
+        QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus {
+            border: 1px solid #38bdf8;
+        }
+        QPushButton {
+            background-color: #334155;
+            color: #ffffff;
+            border: 1px solid #475569;
+            border-radius: 6px;
+            padding: 8px 14px;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: #475569;
+        }
+        QPushButton:pressed {
+            background-color: #1e293b;
+        }
+        QProgressBar {
+            background-color: #0b1120;
+            border: 1px solid #334155;
+            border-radius: 4px;
+            text-align: center;
+            font-size: 10px;
+            color: #cbd5e1;
+        }
+        QProgressBar::chunk {
+            background-color: #38bdf8;
+            border-radius: 3px;
+        }
+        QSplitter::handle {
+            background-color: #1e293b;
+            height: 4px;
+            width: 4px;
+        }
+        QStatusBar {
+            background-color: #0b1120;
+            border-top: 1px solid #1e293b;
+            color: #94a3b8;
+            font-size: 11px;
+        }
+        """
+        self.setStyleSheet(palette_css)
+
+    # -------------------------------------------------------------------------
+    # UI Layout Construction
+    # -------------------------------------------------------------------------
+    def setup_ui(self):
+        central_widget = QWidget(self)
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+
+        # Left/Center Column: Cameras & Recording Workflow
+        left_column = QVBoxLayout()
+        left_column.setSpacing(8)
+
+        # 1. Camera Feeds Area (Modular, side-by-side expandable)
+        self.camera_container = QGroupBox("VIDEO TELEMETRY VIEWPORT (EXPANDABLE MULTI-CAM)")
+        cam_layout = QHBoxLayout(self.camera_container)
+        cam_layout.setContentsMargins(8, 8, 8, 8)
+        cam_layout.setSpacing(8)
+
+        # Primary Camera Widget
+        self.cam_widget_1 = CameraFeedWidget(f"Camera 1: Workspace (/dev/video{self.camera_index})", self.camera_index)
+        cam_layout.addWidget(self.cam_widget_1, stretch=2)
+
+        # Secondary Camera Slot (Easily toggleable or plugged in)
+        self.cam_widget_2 = CameraFeedWidget("Camera 2: Wrist Flange (Secondary)", 0)
+        self.cam_widget_2.setVisible(False)  # Hidden by default, toggled via checkbox below
+        cam_layout.addWidget(self.cam_widget_2, stretch=2)
+
+        left_column.addWidget(self.camera_container, stretch=5)
+
+        # Camera Options Bar
+        cam_ctrl_bar = QHBoxLayout()
+        self.btn_toggle_cam2 = QPushButton("+ Show / Hide Secondary Camera")
+        self.btn_toggle_cam2.setStyleSheet("font-size: 11px; padding: 4px 10px;")
+        self.btn_toggle_cam2.clicked.connect(self.toggle_secondary_camera)
+        cam_ctrl_bar.addWidget(self.btn_toggle_cam2)
+
+        self.lbl_cam_info = QLabel("Format: 640x480 RGB @ 30 FPS")
+        self.lbl_cam_info.setStyleSheet("color: #64748b; font-size: 11px;")
+        cam_ctrl_bar.addWidget(self.lbl_cam_info)
+        cam_ctrl_bar.addStretch()
+
+        left_column.addLayout(cam_ctrl_bar)
+
+        # 2. Recording & Freedrive Control Card
+        rec_box = QGroupBox("EPISODE RECORDING CONTROLS")
+        rec_layout = QVBoxLayout(rec_box)
+        rec_layout.setContentsMargins(12, 12, 12, 12)
+        rec_layout.setSpacing(10)
+
+        # Timer & Status Row
+        timer_row = QHBoxLayout()
+        self.lbl_timer = QLabel("00:00.0")
+        self.lbl_timer.setStyleSheet("""
+            font-family: 'Courier New', monospace;
+            font-size: 38px;
+            font-weight: bold;
+            color: #38bdf8;
+            background-color: #0b1120;
+            border: 2px solid #1e293b;
+            border-radius: 8px;
+            padding: 4px 18px;
+        """)
+        timer_row.addWidget(self.lbl_timer)
+
+        timer_row.addSpacing(16)
+
+        # Freedrive Status Indicator & Big Toggle Button
+        fd_status_box = QVBoxLayout()
+        self.lbl_fd_status = QLabel("ROBOT STATE: LOCKED (Position Hold)")
+        self.lbl_fd_status.setStyleSheet("""
+            color: #94a3b8;
+            font-weight: bold;
+            font-size: 12px;
+            padding: 4px 8px;
+            background-color: #1e293b;
+            border-radius: 4px;
+        """)
+        fd_status_box.addWidget(self.lbl_fd_status)
+
+        self.btn_toggle_freedrive = QPushButton("⚡ TOGGLE FREEDRIVE MODE")
+        self.btn_toggle_freedrive.setMinimumHeight(38)
+        self.btn_toggle_freedrive.setStyleSheet("""
+            QPushButton {
+                background-color: #475569;
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: bold;
+                border: 2px solid #64748b;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #64748b;
+            }
+        """)
+        self.btn_toggle_freedrive.clicked.connect(self.on_freedrive_button_clicked)
+        fd_status_box.addWidget(self.btn_toggle_freedrive)
+
+        timer_row.addLayout(fd_status_box, stretch=1)
+        rec_layout.addLayout(timer_row)
+
+        # Task Description Input
+        task_row = QHBoxLayout()
+        task_lbl = QLabel("Task Description:")
+        task_lbl.setStyleSheet("color: #94a3b8; font-weight: bold;")
+        self.txt_task_desc = QLineEdit("Pick and place demonstration")
+        self.txt_task_desc.setPlaceholderText("e.g. Grasp red peg and insert into base fixture")
+        task_row.addWidget(task_lbl)
+        task_row.addWidget(self.txt_task_desc, stretch=1)
+        rec_layout.addLayout(task_row)
+
+        # Side-by-side Action Buttons (Start/End [Space], Cancel [c/Left], Stop [Esc])
+        btn_action_row = QHBoxLayout()
+        btn_action_row.setSpacing(10)
+
+        # Start / End Episode Button (Space)
+        self.btn_record = QPushButton("▶  START EPISODE (Space)")
+        self.btn_record.setMinimumHeight(52)
+        self.btn_record.setStyleSheet("""
+            QPushButton {
+                background-color: #16a34a;
+                color: #ffffff;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: 1px solid #22c55e;
+            }
+            QPushButton:hover {
+                background-color: #15803d;
+            }
+        """)
+        self.btn_record.clicked.connect(self.on_record_button_clicked)
+        btn_action_row.addWidget(self.btn_record, stretch=3)
+
+        # Cancel Recording Button (c or Left Arrow)
+        self.btn_cancel = QPushButton("✖  CANCEL (c / ←)")
+        self.btn_cancel.setMinimumHeight(52)
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #dc2626;
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: 1px solid #ef4444;
+            }
+            QPushButton:hover {
+                background-color: #b91c1c;
+            }
+            QPushButton:disabled {
+                background-color: #291518;
+                color: #553034;
+                border: 1px solid #3f1d24;
+            }
+        """)
+        self.btn_cancel.clicked.connect(self.cancel_recording)
+        btn_action_row.addWidget(self.btn_cancel, stretch=2)
+
+        # Stop Session Button (Esc)
+        self.btn_stop_session = QPushButton("⏹  STOP SESSION (Esc)")
+        self.btn_stop_session.setMinimumHeight(52)
+        self.btn_stop_session.setStyleSheet("""
+            QPushButton {
+                background-color: #334155;
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: 1px solid #475569;
+            }
+            QPushButton:hover {
+                background-color: #475569;
+            }
+        """)
+        self.btn_stop_session.clicked.connect(self.stop_session)
+        btn_action_row.addWidget(self.btn_stop_session, stretch=2)
+
+        rec_layout.addLayout(btn_action_row)
+        left_column.addWidget(rec_box, stretch=2)
+
+        # 3. Live Log / Terminal Console Widget
+        log_box = QGroupBox("TERMINAL LOG CONSOLE & SYSTEM NOTIFICATIONS")
+        log_layout = QVBoxLayout(log_box)
+        log_layout.setContentsMargins(8, 8, 8, 8)
+        log_layout.setSpacing(6)
+
+        self.txt_log = QPlainTextEdit()
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setFont(QFont("DejaVu Sans Mono", 9))
+        self.txt_log.setStyleSheet("""
+            background-color: #050811;
+            color: #94a3b8;
+            border: 1px solid #1e293b;
+            border-radius: 4px;
+        """)
+        log_layout.addWidget(self.txt_log)
+
+        log_btn_bar = QHBoxLayout()
+        self.btn_clear_log = QPushButton("Clear Console")
+        self.btn_clear_log.setStyleSheet("font-size: 10px; padding: 3px 8px;")
+        self.btn_clear_log.clicked.connect(self.txt_log.clear)
+        log_btn_bar.addWidget(self.btn_clear_log)
+        log_btn_bar.addStretch()
+        log_layout.addLayout(log_btn_bar)
+
+        left_column.addWidget(log_box, stretch=2)
+
+        main_layout.addLayout(left_column, stretch=7)
+
+        # Right Column: Telemetry Gauges, Dataset Management & Diagnostics
+        right_column = QVBoxLayout()
+        right_column.setSpacing(8)
+
+        # 4. Dataset & Episode Management Panel
+        ds_box = QGroupBox("DATASET & EPISODE MANAGEMENT")
+        ds_layout = QVBoxLayout(ds_box)
+        ds_layout.setContentsMargins(10, 10, 10, 10)
+        ds_layout.setSpacing(8)
+
+        # Dataset Name Input
+        ds_name_lbl = QLabel("Active Dataset Name:")
+        ds_name_lbl.setStyleSheet("color: #94a3b8; font-weight: bold;")
+        ds_layout.addWidget(ds_name_lbl)
+
+        ds_name_row = QHBoxLayout()
+        self.txt_dataset_name = QLineEdit(DEFAULT_DATASET_NAME)
+        self.txt_dataset_name.returnPressed.connect(self.apply_dataset_name)
+        ds_name_row.addWidget(self.txt_dataset_name)
+
+        self.btn_apply_ds = QPushButton("Set / Load")
+        self.btn_apply_ds.setStyleSheet("""
+            QPushButton {
+                background-color: #2563eb;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 5px 10px;
+                border: 1px solid #3b82f6;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+        """)
+        self.btn_apply_ds.clicked.connect(self.apply_dataset_name)
+        ds_name_row.addWidget(self.btn_apply_ds)
+
+        self.btn_refresh_ds = QPushButton("↺")
+        self.btn_refresh_ds.setToolTip("Rescan dataset directory")
+        self.btn_refresh_ds.clicked.connect(self.rescan_dataset_directory)
+        ds_name_row.addWidget(self.btn_refresh_ds)
+        ds_layout.addLayout(ds_name_row)
+
+        self.lbl_dataset_path = QLabel(f"Path: datasets/{DEFAULT_DATASET_NAME}")
+        self.lbl_dataset_path.setStyleSheet("color: #64748b; font-size: 10px;")
+        ds_layout.addWidget(self.lbl_dataset_path)
+
+        # Episode History List
+        ep_lbl = QLabel("Recorded Episodes in Active Dataset:")
+        ep_lbl.setStyleSheet("color: #94a3b8; font-weight: bold; margin-top: 4px;")
+        ds_layout.addWidget(ep_lbl)
+
+        self.list_episodes = QListWidget()
+        self.list_episodes.setStyleSheet("""
+            QListWidget {
+                background-color: #0b1120;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+            }
+            QListWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #1e293b;
+            }
+            QListWidget::item:selected {
+                background-color: #1e3a8a;
+                color: #ffffff;
+            }
+        """)
+        ds_layout.addWidget(self.list_episodes, stretch=2)
+
+        # Delete Selected or Last Episode Button
+        self.btn_delete_ep = QPushButton("🗑  Delete Selected / Last Episode")
+        self.btn_delete_ep.setToolTip("Deletes the selected episode in the list above, or defaults to the last episode if none is selected.")
+        self.btn_delete_ep.setStyleSheet("""
+            QPushButton {
+                background-color: #451a1a;
+                color: #f87171;
+                border: 1px solid #7f1d1d;
+                border-radius: 4px;
+                padding: 6px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #7f1d1d;
+                color: #ffffff;
+            }
+        """)
+        self.btn_delete_ep.clicked.connect(self.delete_episode)
+        ds_layout.addWidget(self.btn_delete_ep)
+
+        right_column.addWidget(ds_box, stretch=3)
+
+        # 5. Live Telemetry HUD (Joints + RTDE Stats)
+        telem_box = QGroupBox("ROBOT RTDE TELEMETRY HUD (125 Hz)")
+        telem_layout = QVBoxLayout(telem_box)
+        telem_layout.setContentsMargins(10, 10, 10, 10)
+        telem_layout.setSpacing(6)
+
+        # Rate & Latency Badges
+        stats_row = QHBoxLayout()
+        self.lbl_rtde_rate = QLabel("RTDE: 0.0 Hz")
+        self.lbl_rtde_rate.setStyleSheet("color: #38bdf8; font-family: monospace; font-weight: bold;")
+        stats_row.addWidget(self.lbl_rtde_rate)
+
+        stats_row.addStretch()
+
+        self.lbl_rtde_latency = QLabel("Latency: 0.0 ms")
+        self.lbl_rtde_latency.setStyleSheet("color: #4ade80; font-family: monospace; font-weight: bold;")
+        stats_row.addWidget(self.lbl_rtde_latency)
+        telem_layout.addLayout(stats_row)
+
+        # 6-DoF Joint Values with Mini Bars
+        self.joint_labels: Dict[str, QLabel] = {}
+        self.joint_bars: Dict[str, QProgressBar] = {}
+
+        grid_joints = QGridLayout()
+        grid_joints.setSpacing(4)
+
+        for idx, j_name in enumerate(UR5E_JOINTS):
+            name_lbl = QLabel(j_name.replace("_", " ").title())
+            name_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 500;")
+
+            val_lbl = QLabel("+0.0°")
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            val_lbl.setStyleSheet("color: #f1f5f9; font-family: monospace; font-weight: bold;")
+            self.joint_labels[j_name] = val_lbl
+
+            pbar = QProgressBar()
+            pbar.setRange(-360, 360)
+            pbar.setValue(0)
+            pbar.setTextVisible(False)
+            pbar.setFixedHeight(6)
+            self.joint_bars[j_name] = pbar
+
+            grid_joints.addWidget(name_lbl, idx, 0)
+            grid_joints.addWidget(val_lbl, idx, 1)
+            grid_joints.addWidget(pbar, idx, 2)
+
+        telem_layout.addLayout(grid_joints)
+        right_column.addWidget(telem_box, stretch=2)
+
+        # 6. Manual Axis Control & Jogging Panel (Active when Freedrive is LOCKED)
+        jog_box = QGroupBox("MANUAL AXIS CONTROL & JOGGING")
+        self.jog_group = jog_box
+        jog_layout = QVBoxLayout(jog_box)
+        jog_layout.setContentsMargins(10, 10, 10, 10)
+        jog_layout.setSpacing(6)
+
+        jog_header = QHBoxLayout()
+        self.lbl_jog_notice = QLabel("Freedrive LOCKED — Manual jogging active")
+        self.lbl_jog_notice.setStyleSheet("color: #4ade80; font-size: 10px; font-weight: bold;")
+        jog_header.addWidget(self.lbl_jog_notice, stretch=1)
+
+        self.btn_move_home = QPushButton("⌂ Move to Home Pose")
+        self.btn_move_home.setStyleSheet("""
+            QPushButton {
+                background-color: #0284c7;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 4px 10px;
+                border-radius: 4px;
+                border: 1px solid #38bdf8;
+            }
+            QPushButton:hover {
+                background-color: #0369a1;
+            }
+            QPushButton:disabled {
+                background-color: #1e293b;
+                color: #64748b;
+                border: 1px solid #334155;
+            }
+        """)
+        self.btn_move_home.clicked.connect(self.move_to_home_pose)
+        jog_header.addWidget(self.btn_move_home)
+        jog_layout.addLayout(jog_header)
+
+        self.jog_sliders: Dict[str, QSlider] = {}
+        self.jog_labels: Dict[str, QLabel] = {}
+
+        grid_jog = QGridLayout()
+        grid_jog.setSpacing(4)
+
+        for idx, j_name in enumerate(UR5E_JOINTS):
+            name_lbl = QLabel(j_name.replace("_", " ").title())
+            name_lbl.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: 500;")
+
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(-360, 360)
+            slider.setValue(0)
+            slider.setFixedHeight(18)
+            slider.setStyleSheet("""
+                QSlider::groove:horizontal {
+                    height: 4px;
+                    background: #334155;
+                    border-radius: 2px;
+                }
+                QSlider::sub-page:horizontal {
+                    background: #38bdf8;
+                    border-radius: 2px;
+                }
+                QSlider::handle:horizontal {
+                    background: #f1f5f9;
+                    width: 12px;
+                    margin-top: -4px;
+                    margin-bottom: -4px;
+                    border-radius: 6px;
+                }
+            """)
+
+            val_lbl = QLabel("+0.0°")
+            val_lbl.setFixedWidth(48)
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            val_lbl.setStyleSheet("color: #f1f5f9; font-family: monospace; font-size: 10px; font-weight: bold;")
+
+            self.jog_sliders[j_name] = slider
+            self.jog_labels[j_name] = val_lbl
+
+            slider.sliderPressed.connect(lambda j=j_name: self.on_jog_slider_pressed(j))
+            slider.valueChanged.connect(lambda val, j=j_name: self.on_jog_slider_value_changed(j, val))
+            slider.sliderReleased.connect(lambda j=j_name: self.on_jog_slider_released(j))
+
+            grid_jog.addWidget(name_lbl, idx, 0)
+            grid_jog.addWidget(slider, idx, 1)
+            grid_jog.addWidget(val_lbl, idx, 2)
+
+        jog_layout.addLayout(grid_jog)
+        right_column.addWidget(jog_box, stretch=3)
+
+        # 7. Hardware Diagnostics Panel
+        diag_box = QGroupBox("HARDWARE DIAGNOSTICS & VERIFICATION")
+        diag_layout = QVBoxLayout(diag_box)
+        diag_layout.setContentsMargins(10, 10, 10, 10)
+        diag_layout.setSpacing(8)
+
+        diag_desc = QLabel("Executes the 5-phase LeRobot UR5e verification test (introspection, telemetry rate benchmark, +2° wrist nudge, +5° base motion).")
+        diag_desc.setWordWrap(True)
+        diag_desc.setStyleSheet("color: #64748b; font-size: 11px;")
+        diag_layout.addWidget(diag_desc)
+
+        self.btn_test_hardware = QPushButton("🔬 Run Full Hardware Test (test_lerobot_ur5e.py)")
+        self.btn_test_hardware.setMinimumHeight(36)
+        self.btn_test_hardware.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6;
+                color: #ffffff;
+                font-size: 12px;
+                font-weight: bold;
+                border: 1px solid #60a5fa;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+            QPushButton:disabled {
+                background-color: #1e293b;
+                color: #64748b;
+                border: 1px solid #334155;
+            }
+        """)
+        self.btn_test_hardware.clicked.connect(self.run_hardware_test)
+        diag_layout.addWidget(self.btn_test_hardware)
+
+        right_column.addWidget(diag_box, stretch=2)
+
+        main_layout.addLayout(right_column, stretch=3)
+
+        # Status Bar
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Ready. Press 'Space' to Start Episode or toggle Freedrive.")
+
+    # -------------------------------------------------------------------------
+    # Hotkeys Configuration
+    # -------------------------------------------------------------------------
+    def setup_shortcuts(self):
+        # Space: Start / End Episode
+        self.shortcut_space = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self.shortcut_space.activated.connect(self.on_space_hotkey)
+
+        # 'c': Cancel Episode
+        self.shortcut_c = QShortcut(QKeySequence(Qt.Key.Key_C), self)
+        self.shortcut_c.activated.connect(self.cancel_recording)
+
+        # Left Arrow: Cancel Episode
+        self.shortcut_left = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        self.shortcut_left.activated.connect(self.cancel_recording)
+
+        # Esc: Stop Session
+        self.shortcut_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self.shortcut_esc.activated.connect(self.stop_session)
+
+    # -------------------------------------------------------------------------
+    # Camera Slots & Multiplexing
+    # -------------------------------------------------------------------------
+    def toggle_secondary_camera(self):
+        visible = not self.cam_widget_2.isVisible()
+        self.cam_widget_2.setVisible(visible)
+        btn_text = "- Hide Secondary Camera" if visible else "+ Show / Hide Secondary Camera"
+        self.btn_toggle_cam2.setText(btn_text)
+
+    @pyqtSlot(int, np.ndarray)
+    def on_frame_received(self, cam_id: int, frame: np.ndarray):
+        if cam_id == self.camera_index:
+            self.latest_camera_frame = frame
+            self.cam_widget_1.update_frame(cam_id, frame)
+        elif cam_id == 0 and self.cam_widget_2.isVisible():
+            self.cam_widget_2.update_frame(cam_id, frame)
+
+    @pyqtSlot(int, bool, str)
+    def on_camera_status(self, cam_id: int, is_connected: bool, message: str):
+        level = "INFO" if is_connected else "WARNING"
+        print(f"[{level}] [CAMERA {cam_id}] {message}")
+
+    # -------------------------------------------------------------------------
+    # Robot RTDE Telemetry Slots
+    # -------------------------------------------------------------------------
+    @pyqtSlot(bool, str)
+    def on_robot_connection_status(self, is_connected: bool, message: str):
+        level = "INFO" if is_connected else "ERROR"
+        print(f"[{level}] [UR5e] {message}")
+        self.status_bar.showMessage(message, 6000)
+
+    @pyqtSlot(bool)
+    def on_freedrive_state_changed(self, active: bool):
+        self.freedrive_active = active
+        if hasattr(self, "jog_group"):
+            self.jog_group.setEnabled(not active)
+        if active:
+            self.lbl_fd_status.setText("ROBOT STATE: FREEDRIVE ACTIVE (Hand-Guiding)")
+            self.lbl_fd_status.setStyleSheet("""
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 4px 8px;
+                background-color: #d97706;
+                border-radius: 4px;
+            """)
+            self.btn_toggle_freedrive.setText("🔒 LOCK ROBOT JOINTS")
+            self.btn_toggle_freedrive.setStyleSheet("""
+                QPushButton {
+                    background-color: #d97706;
+                    color: #ffffff;
+                    font-size: 13px;
+                    font-weight: bold;
+                    border: 2px solid #f59e0b;
+                    border-radius: 6px;
+                }
+                QPushButton:hover {
+                    background-color: #b45309;
+                }
+            """)
+            if hasattr(self, "lbl_jog_notice"):
+                self.lbl_jog_notice.setText("Freedrive ACTIVE — Manual jogging locked")
+                self.lbl_jog_notice.setStyleSheet("color: #f59e0b; font-size: 10px; font-weight: bold;")
+            print("[INFO] Freedrive ENABLED — Robot arm is now compliant for hand demonstration.")
+        else:
+            self.lbl_fd_status.setText("ROBOT STATE: LOCKED (Position Hold)")
+            self.lbl_fd_status.setStyleSheet("""
+                color: #94a3b8;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 4px 8px;
+                background-color: #1e293b;
+                border-radius: 4px;
+            """)
+            self.btn_toggle_freedrive.setText("⚡ TOGGLE FREEDRIVE MODE")
+            self.btn_toggle_freedrive.setStyleSheet("""
+                QPushButton {
+                    background-color: #475569;
+                    color: #ffffff;
+                    font-size: 13px;
+                    font-weight: bold;
+                    border: 2px solid #64748b;
+                    border-radius: 6px;
+                }
+                QPushButton:hover {
+                    background-color: #64748b;
+                }
+            """)
+            if hasattr(self, "lbl_jog_notice"):
+                self.lbl_jog_notice.setText("Freedrive LOCKED — Manual jogging active")
+                self.lbl_jog_notice.setStyleSheet("color: #4ade80; font-size: 10px; font-weight: bold;")
+            print("[INFO] Freedrive DISABLED — Robot arm is re-locked in place.")
+
+    @pyqtSlot(dict)
+    def on_telemetry_updated(self, telem: dict):
+        joints = telem.get("joints", {})
+        rtde_hz = telem.get("rtde_hz", 0.0)
+        latency_ms = telem.get("latency_ms", 0.0)
+
+        self.lbl_rtde_rate.setText(f"RTDE: {rtde_hz:5.1f} Hz")
+        self.lbl_rtde_latency.setText(f"Latency: {latency_ms:4.1f} ms")
+
+        for j_name, rad_val in joints.items():
+            deg_val = math.degrees(rad_val)
+            if j_name in self.joint_labels:
+                self.joint_labels[j_name].setText(f"{deg_val:+6.1f}°")
+                self.joint_bars[j_name].setValue(int(deg_val))
+
+            # Sync jog sliders if user is not currently interacting with them
+            if self._user_dragging_joint != j_name and hasattr(self, "jog_sliders") and j_name in self.jog_sliders:
+                slider = self.jog_sliders[j_name]
+                slider.blockSignals(True)
+                slider.setValue(int(round(deg_val)))
+                slider.blockSignals(False)
+                if j_name in self.jog_labels:
+                    self.jog_labels[j_name].setText(f"{deg_val:+5.1f}°")
+
+    def on_freedrive_button_clicked(self):
+        self.robot_worker.request_toggle_freedrive()
+
+    # -------------------------------------------------------------------------
+    # Manual Jogging & Home Pose Slots
+    # -------------------------------------------------------------------------
+    def on_jog_slider_pressed(self, j_name: str):
+        self._user_dragging_joint = j_name
+
+    def on_jog_slider_value_changed(self, j_name: str, val: int):
+        if hasattr(self, "jog_labels") and j_name in self.jog_labels:
+            self.jog_labels[j_name].setText(f"{val:+5.1f}°")
+
+    def on_jog_slider_released(self, j_name: str):
+        if self.freedrive_active or self.is_recording:
+            self._user_dragging_joint = None
+            return
+
+        if not hasattr(self, "jog_sliders") or j_name not in self.jog_sliders:
+            self._user_dragging_joint = None
+            return
+
+        target_deg = self.jog_sliders[j_name].value()
+        target_rad = math.radians(target_deg)
+
+        # Build complete action dictionary preserving other current joint positions
+        current_joints = self.robot_worker.get_latest_joints()
+        action = {f"{j}.pos": current_joints[j] for j in UR5E_JOINTS}
+        action[f"{j_name}.pos"] = target_rad
+
+        print(f"[MOTION] Jogging {j_name} to {target_deg:+5.1f}° ({target_rad:+.4f} rad)...")
+        self.status_bar.showMessage(f"Jogging {j_name} to {target_deg:+5.1f}°...", 3000)
+        self.robot_worker.request_move_pose(action)
+        self._user_dragging_joint = None
+
+    def move_to_home_pose(self):
+        if self.freedrive_active:
+            QMessageBox.warning(self, "Freedrive Active", "Cannot move to home position while Freedrive is active. Please lock joints first.")
+            return
+        if self.is_recording:
+            QMessageBox.warning(self, "Recording Active", "Cannot move to home position while recording an episode.")
+            return
+
+        # Canonical UR5e Ready/Home Pose: [0°, -90°, 90°, -90°, -90°, 0°]
+        home_pose_deg = {
+            "shoulder_pan": 0.0,
+            "shoulder_lift": -90.0,
+            "elbow": 90.0,
+            "wrist_1": -90.0,
+            "wrist_2": -90.0,
+            "wrist_3": 0.0,
+        }
+        home_action = {f"{j}.pos": math.radians(deg) for j, deg in home_pose_deg.items()}
+
+        print("[MOTION] Commanding UR5e arm to Home position (0°, -90°, 90°, -90°, -90°, 0°)...")
+        self.status_bar.showMessage("Moving arm to Home position...", 4000)
+        self.robot_worker.request_move_pose(home_action)
+
+    # -------------------------------------------------------------------------
+    # Recording Workflow & Guard Logic
+    # -------------------------------------------------------------------------
+    def on_space_hotkey(self):
+        if not self.is_recording:
+            self.start_recording()
+        else:
+            self.end_episode_and_save()
+
+    def on_record_button_clicked(self):
+        if not self.is_recording:
+            self.start_recording()
+        else:
+            self.end_episode_and_save()
+
+    def start_recording(self):
+        # Freedrive safety guard check
+        if not self.freedrive_active:
+            msg = "Robot must be in Freedrive mode to record! Please toggle Freedrive first."
+            print(f"[WARNING] {msg}")
+            self.status_bar.showMessage(msg, 5000)
+            QMessageBox.warning(
+                self,
+                "Freedrive Required",
+                "<b>Robot must be in Freedrive mode to record!</b><br><br>"
+                "Please click <b>'TOGGLE FREEDRIVE MODE'</b> to unlock the arm for hand guiding before starting an episode.",
+            )
+            return
+
+        # Prepare dataset buffer
+        self.is_recording = True
+        self.record_start_time = time.perf_counter()
+        self.recorded_frames_count = 0
+        self.current_episode_buffer.clear()
+
+        # Update UI Controls to Active Recording State
+        self.btn_record.setText("⏸  END EPISODE (Space)")
+        self.btn_record.setStyleSheet("""
+            QPushButton {
+                background-color: #d97706;
+                color: #ffffff;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: 2px solid #f59e0b;
+            }
+            QPushButton:hover {
+                background-color: #b45309;
+            }
+        """)
+        self.btn_cancel.setEnabled(True)
+        self.cam_widget_1.set_recording(True)
+        self.cam_widget_2.set_recording(True)
+
+        # Start Timers
+        self.recording_timer.start()
+        self.dataset_frame_timer.start()
+
+        ep_idx = self.list_episodes.count()
+        print(f"\n[RECORD] >>> RECORDING STARTED for Episode #{ep_idx} <<<")
+        self.status_bar.showMessage(f"Recording Episode #{ep_idx}... Press Space to End or 'c' to Cancel.")
+
+    def update_recording_timer(self):
+        if not self.is_recording or self.record_start_time is None:
+            return
+        elapsed = time.perf_counter() - self.record_start_time
+        mins = int(elapsed // 60)
+        secs = elapsed % 60
+        self.lbl_timer.setText(f"{mins:02d}:{secs:04.1f}")
+
+    def capture_recording_frame(self):
+        if not self.is_recording:
+            return
+
+        # Acquire synced telemetry and camera frame
+        joints = self.robot_worker.get_latest_joints()
+        q_vals = np.array([joints[j] for j in UR5E_JOINTS], dtype=np.float32)
+
+        if self.latest_camera_frame is not None:
+            img = cv2.cvtColor(self.latest_camera_frame, cv2.COLOR_BGR2RGB)
+        else:
+            img = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        task_text = self.txt_task_desc.text().strip() or "Pick and place demonstration"
+
+        frame_data = {
+            "observation.state": q_vals,
+            "action": q_vals,
+            "observation.images.workspace": img,
+            "task": task_text,
+            "timestamp": time.perf_counter() - (self.record_start_time or time.perf_counter()),
+        }
+
+        self.current_episode_buffer.append(frame_data)
+        self.recorded_frames_count += 1
+
+    def end_episode_and_save(self):
+        if not self.is_recording:
+            return
+
+        # Stop recording timers
+        self.dataset_frame_timer.stop()
+        self.recording_timer.stop()
+        self.is_recording = False
+        duration_s = time.perf_counter() - (self.record_start_time or time.perf_counter())
+
+        self.cam_widget_1.set_recording(False)
+        self.cam_widget_2.set_recording(False)
+
+        # Revert Record Button to Green Start State
+        self.btn_record.setText("▶  START EPISODE (Space)")
+        self.btn_record.setStyleSheet("""
+            QPushButton {
+                background-color: #16a34a;
+                color: #ffffff;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: 1px solid #22c55e;
+            }
+            QPushButton:hover {
+                background-color: #15803d;
+            }
+        """)
+        self.btn_cancel.setEnabled(False)
+
+        num_frames = len(self.current_episode_buffer)
+        ep_idx = self.list_episodes.count()
+
+        print(f"[RECORD] Saving Episode #{ep_idx} ({num_frames} frames, {duration_s:.1f}s)...")
+        self.status_bar.showMessage(f"Writing Episode #{ep_idx} to disk...")
+
+        # Write episode to disk / dataset
+        self.commit_episode_to_dataset(ep_idx, num_frames, duration_s)
+
+        # Maintain arm in freedrive mode as requested
+        print("[INFO] Episode saved! Robot remains in Freedrive mode for the next demo.")
+        self.status_bar.showMessage(f"Episode #{ep_idx} saved ({num_frames} frames). Ready for next episode.", 6000)
+
+    def cancel_recording(self):
+        if not self.is_recording:
+            return
+
+        self.dataset_frame_timer.stop()
+        self.recording_timer.stop()
+        self.is_recording = False
+
+        self.cam_widget_1.set_recording(False)
+        self.cam_widget_2.set_recording(False)
+
+        discarded_count = len(self.current_episode_buffer)
+        self.current_episode_buffer.clear()
+
+        # Reset timer and buttons
+        self.lbl_timer.setText("00:00.0")
+        self.btn_record.setText("▶  START EPISODE (Space)")
+        self.btn_record.setStyleSheet("""
+            QPushButton {
+                background-color: #16a34a;
+                color: #ffffff;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 6px;
+                border: 1px solid #22c55e;
+            }
+            QPushButton:hover {
+                background-color: #15803d;
+            }
+        """)
+        self.btn_cancel.setEnabled(False)
+
+        print(f"[WARNING] Recording CANCELED by user. Discarded {discarded_count} frames without saving.")
+        self.status_bar.showMessage(f"Recording canceled. Arm left in Freedrive mode.", 5000)
+
+    def stop_session(self):
+        """Safely terminates recording, disables freedrive, locks the arm, and closes handles."""
+        if self.is_recording:
+            self.cancel_recording()
+
+        print("\n[SYSTEM] >>> STOPPING TELEOPERATION SESSION <<<")
+        if self.freedrive_active:
+            print("[INFO] Re-locking robot joints safely...")
+            self.robot_worker.request_toggle_freedrive()
+
+        self.status_bar.showMessage("Session stopped. Robot locked.", 5000)
+
+    # -------------------------------------------------------------------------
+    # Dataset Management & Persistence
+    # -------------------------------------------------------------------------
+    def apply_dataset_name(self):
+        """Switches or initializes the active dataset when the user clicks 'Set / Load' or presses Enter."""
+        clean_name = self.txt_dataset_name.text().strip()
+        if not clean_name:
+            QMessageBox.warning(self, "Invalid Name", "Please enter a valid dataset name.")
+            return
+
+        self.dataset_root = DEFAULT_DATASETS_DIR / clean_name
+        self.lbl_dataset_path.setText(f"Path: datasets/{clean_name}")
+        self.dataset_root.mkdir(parents=True, exist_ok=True)
+        self.rescan_dataset_directory()
+
+        print(f"[DATASET] Switched active dataset to: '{clean_name}' (Path: datasets/{clean_name})")
+        self.status_bar.showMessage(f"Active dataset switched to '{clean_name}'.", 4000)
+
+    def rescan_dataset_directory(self):
+        self.list_episodes.clear()
+
+        if not self.dataset_root.exists():
+            print(f"[DATASET] Directory '{self.dataset_root.name}' does not exist yet. It will be initialized upon saving an episode.")
+            return
+
+        meta_info_file = self.dataset_root / "meta" / "info.json"
+        total_episodes = 0
+        total_frames = 0
+
+        if meta_info_file.exists():
+            try:
+                import json
+                with open(meta_info_file, "r") as f:
+                    meta = json.load(f)
+                    total_episodes = meta.get("total_episodes", 0)
+                    total_frames = meta.get("total_frames", 0)
+            except Exception as e:
+                print(f"[WARNING] Could not parse {meta_info_file}: {e}")
+
+        # Scan folder for raw video or chunk records if any
+        if total_episodes > 0:
+            avg_frames = total_frames // max(1, total_episodes)
+            for i in range(total_episodes):
+                approx_dur = avg_frames / self.target_fps
+                item_text = f"Episode #{i:04d} — ~{avg_frames} frames ({approx_dur:.1f}s)"
+                self.list_episodes.addItem(QListWidgetItem(item_text))
+            self.list_episodes.setCurrentRow(total_episodes - 1)
+        else:
+            # Check for simulated local records file
+            records_file = self.dataset_root / "episodes_index.txt"
+            if records_file.exists():
+                lines = records_file.read_text().strip().splitlines()
+                for line in lines:
+                    if line.strip():
+                        self.list_episodes.addItem(QListWidgetItem(line.strip()))
+                self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
+
+        print(f"[DATASET] Scanned '{self.dataset_root.name}': {self.list_episodes.count()} episodes found.")
+
+    def commit_episode_to_dataset(self, ep_idx: int, num_frames: int, duration_s: float):
+        self.dataset_root.mkdir(parents=True, exist_ok=True)
+        meta_dir = self.dataset_root / "meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        meta_info_file = meta_dir / "info.json"
+
+        # If LeRobot is available and we can append to dataset:
+        if LEROBOT_AVAILABLE and torch is not None and not self.mock_mode:
+            try:
+                # Features spec standard
+                features = {
+                    "observation.state": {
+                        "dtype": "float32",
+                        "shape": (6,),
+                        "names": [f"{j}_pos" for j in UR5E_JOINTS],
+                    },
+                    "action": {
+                        "dtype": "float32",
+                        "shape": (6,),
+                        "names": [f"{j}_pos" for j in UR5E_JOINTS],
+                    },
+                    "observation.images.workspace": {
+                        "dtype": "video",
+                        "shape": (480, 640, 3),
+                        "names": ["height", "width", "channels"],
+                    },
+                }
+                repo_id = f"local/{self.dataset_root.name}"
+                if meta_info_file.exists():
+                    dataset = LeRobotDataset.resume(repo_id=repo_id, root=self.dataset_root)
+                else:
+                    dataset = LeRobotDataset.create(
+                        repo_id=repo_id,
+                        fps=self.target_fps,
+                        features=features,
+                        root=self.dataset_root,
+                        robot_type="ur5e",
+                        use_videos=True,
+                    )
+
+                for frame in self.current_episode_buffer:
+                    t_frame = {
+                        "observation.state": torch.from_numpy(frame["observation.state"]),
+                        "action": torch.from_numpy(frame["action"]),
+                        "observation.images.workspace": torch.from_numpy(frame["observation.images.workspace"]),
+                        "task": frame["task"],
+                    }
+                    dataset.add_frame(t_frame)
+
+                dataset.save_episode()
+                print(f"[DATASET] LeRobotDataset episode #{ep_idx} committed successfully.")
+            except Exception as err:
+                print(f"[WARNING] LeRobotDataset native write error ({err}). Falling back to local manifest indexing.")
+                self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
+        else:
+            self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
+
+        # Update UI List
+        item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s)"
+        self.list_episodes.addItem(QListWidgetItem(item_text))
+        self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
+        self.current_episode_buffer.clear()
+
+    def _write_local_manifest_episode(self, ep_idx: int, num_frames: int, duration_s: float):
+        """Standard backup manifest recording episode records."""
+        records_file = self.dataset_root / "episodes_index.txt"
+        entry = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s) | Task: {self.txt_task_desc.text().strip()}\n"
+        with open(records_file, "a") as f:
+            f.write(entry)
+
+        meta_info_file = self.dataset_root / "meta" / "info.json"
+        meta_data = {"total_episodes": ep_idx + 1, "fps": self.target_fps, "robot_type": "ur5e"}
+        if meta_info_file.exists():
+            try:
+                import json
+                with open(meta_info_file, "r") as f:
+                    meta_data = json.load(f)
+                meta_data["total_episodes"] = max(meta_data.get("total_episodes", 0), ep_idx + 1)
+                meta_data["total_frames"] = meta_data.get("total_frames", 0) + num_frames
+            except Exception:
+                pass
+        with open(meta_info_file, "w") as f:
+            import json
+            json.dump(meta_data, f, indent=2)
+
+    def delete_episode(self):
+        """
+        Deletes the episode currently highlighted in the list widget.
+        If no episode is selected, defaults to deleting the last episode.
+        """
+        total_items = self.list_episodes.count()
+        if total_items == 0:
+            QMessageBox.information(self, "No Episodes", "The active dataset contains no recorded episodes to delete.")
+            return
+
+        current_row = self.list_episodes.currentRow()
+        if current_row < 0 or current_row >= total_items:
+            # Default to the most recent/last episode
+            target_row = total_items - 1
+        else:
+            target_row = current_row
+
+        item = self.list_episodes.item(target_row)
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Delete Episode",
+            f"Are you sure you want to permanently delete:\n\n<b>{item.text()}</b>\n\n(List position #{target_row + 1} of {total_items})?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        # Remove item from UI
+        self.list_episodes.takeItem(target_row)
+
+        # Update metadata in info.json
+        meta_info_file = self.dataset_root / "meta" / "info.json"
+        if meta_info_file.exists():
+            try:
+                import json
+                with open(meta_info_file, "r") as f:
+                    meta_data = json.load(f)
+                meta_data["total_episodes"] = max(0, meta_data.get("total_episodes", 1) - 1)
+                with open(meta_info_file, "w") as f:
+                    json.dump(meta_data, f, indent=2)
+            except Exception as e:
+                print(f"[WARNING] Could not update meta/info.json: {e}")
+
+        # Update manifest file if present
+        records_file = self.dataset_root / "episodes_index.txt"
+        if records_file.exists():
+            lines = records_file.read_text().strip().splitlines()
+            if lines and target_row < len(lines):
+                del lines[target_row]
+                records_file.write_text("\n".join(lines) + ("\n" if lines else ""))
+
+        print(f"[INFO] Deleted episode at list position #{target_row + 1} from dataset '{self.dataset_root.name}'.")
+        self.status_bar.showMessage(f"Episode deleted from '{self.dataset_root.name}'.", 4000)
+
+    # -------------------------------------------------------------------------
+    # Hardware Diagnostics Runner
+    # -------------------------------------------------------------------------
+    def run_hardware_test(self):
+        if self.is_recording:
+            QMessageBox.warning(self, "Recording in Progress", "Cannot run hardware verification while recording an episode.")
+            return
+
+        test_script = Path(__file__).resolve().parent / "test_lerobot_ur5e.py"
+        self.btn_test_hardware.setEnabled(False)
+        self.btn_test_hardware.setText("⏳ Running Hardware Verification Suite...")
+
+        self.diagnostic_worker = HardwareTestWorker(test_script, self.robot_ip)
+        self.diagnostic_worker.output_line.connect(self.append_log_line)
+        self.diagnostic_worker.test_finished.connect(self.on_hardware_test_completed)
+        self.diagnostic_worker.start()
+
+    @pyqtSlot(bool, str)
+    def on_hardware_test_completed(self, success: bool, message: str):
+        self.btn_test_hardware.setEnabled(True)
+        self.btn_test_hardware.setText("🔬 Run Full Hardware Test (test_lerobot_ur5e.py)")
+        if success:
+            QMessageBox.information(self, "Hardware Verification Passed", "UR5e arm and RTDE telemetry successfully verified!")
+        else:
+            QMessageBox.warning(self, "Hardware Verification Failed", f"Verification encountered an issue:\n{message}")
+
+    # -------------------------------------------------------------------------
+    # Log Console Helpers
+    # -------------------------------------------------------------------------
+    @pyqtSlot(str, str)
+    def append_log(self, level: str, message: str):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        prefix = f"[{timestamp}] [{level}] "
+        self.txt_log.appendPlainText(prefix + message)
+        # Scroll to bottom
+        sb = self.txt_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    @pyqtSlot(str)
+    def append_log_line(self, raw_line: str):
+        self.txt_log.appendPlainText(raw_line)
+        sb = self.txt_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    # -------------------------------------------------------------------------
+    # Safe Teardown on Window Close
+    # -------------------------------------------------------------------------
+    def closeEvent(self, event):
+        print("\n[SYSTEM] Closing Teleoperation Studio window...")
+        if self.is_recording:
+            self.cancel_recording()
+
+        if self.diagnostic_worker and self.diagnostic_worker.isRunning():
+            self.diagnostic_worker.terminate_process()
+
+        # Stop workers
+        self.camera_worker.stop()
+        self.robot_worker.stop()
+
+        # Restore system standard streams
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+
+        event.accept()
+
+
+# =============================================================================
+# 7. Application Entrypoint
+# =============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="UR5e LeRobot Demonstration Dataset Studio")
+    parser.add_argument("--robot-ip", type=str, default=DEFAULT_ROBOT_IP, help=f"UR5e PolyScope IP (default: {DEFAULT_ROBOT_IP})")
+    parser.add_argument("--camera-index", type=int, default=DEFAULT_CAMERA_INDEX, help=f"OpenCV Camera index (default: {DEFAULT_CAMERA_INDEX})")
+    parser.add_argument("--fps", type=int, default=DEFAULT_FPS, help=f"Target camera and recording FPS (default: {DEFAULT_FPS})")
+    parser.add_argument("--mock", action="store_true", help="Launch in Simulation/Mock mode without physical UR5e or USB camera")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("UR5e LeRobot Studio")
+
+    studio = UR5eRecorderStudio(
+        robot_ip=args.robot_ip,
+        camera_index=args.camera_index,
+        fps=args.fps,
+        mock=args.mock,
+    )
+    studio.show()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
+

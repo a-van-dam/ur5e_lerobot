@@ -41,6 +41,7 @@ ur5e_lerobot/
 │   ├── __init__.py
 │   ├── configuration_ur5e.py      # UR5eRobotConfig (Draccus-compatible)
 │   └── robot_ur5e.py              # UR5eRobot implementation
+├── gui_recorder.py                # Standalone PyQt6 Teleoperation & Dataset Studio
 ├── test_lerobot_ur5e.py           # 5-phase comprehensive diagnostic suite
 ├── test_freedrive.py              # 10-second physical hand-guiding test
 ├── test_webcam.py                 # Live USB camera preview (/dev/video4)
@@ -59,9 +60,10 @@ ur5e_lerobot/
    ```
 
 2. **Dependencies**:
+   * `PyQt6`
+   * `opencv-python`
    * `ur_rtde` / `rtde_receive`
    * `lerobot` (Hugging Face)
-   * `opencv-python`
    * `torch`
 
 3. **Robot Network Configuration**:
@@ -74,11 +76,22 @@ ur5e_lerobot/
 
 ## Quickstart
 
-### 1. Test Robot Telemetry & Bidirectional Motion
-Run the 5-phase verification suite:
+### 0. Launch the Teleoperation & Dataset Studio (Desktop GUI)
+Launch the full multithreaded PyQt6 studio for teleoperation and episodic dataset recording:
 ```bash
-python test_lerobot_ur5e.py
+python gui_recorder.py
 ```
+* **Simulation / Mock Mode**: If you are testing the GUI without the physical UR5e arm or USB camera connected, run:
+  ```bash
+  python gui_recorder.py --mock
+  ```
+* **Hotkeys**:
+  - **`Space`**: Start / End demonstration episode. (Must be in Freedrive mode to start!)
+  - **`c`** or **`Left Arrow`**: Cancel and discard the active recording without saving.
+  - **`Esc`**: Stop session and safely lock robot joints.
+* **Hardware Diagnostics**: Click **"Run Full Hardware Test"** to execute `test_lerobot_ur5e.py` asynchronously inside the GUI console.
+
+### 1. Test Robot Telemetry & Bidirectional Motion (CLI)
 * **Phase 1**: Connection & feature introspection (`observation_features` & `action_features`).
 * **Phase 2**: 125 Hz RTDE telemetry benchmark (100 frame sampling & latency check).
 * **Phase 3**: Single-joint nudge & return (+2° on Wrist 3).

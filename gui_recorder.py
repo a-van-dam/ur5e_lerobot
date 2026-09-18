@@ -124,13 +124,20 @@ class LogEmitter(QObject):
 
 
 class StreamToLogger:
-    """Redirects writes from stdout/stderr to Qt signal emitter."""
-    def __init__(self, emitter: LogEmitter, level: str = "INFO"):
+    """Redirects writes from stdout/stderr to Qt signal emitter while preserving terminal output."""
+    def __init__(self, emitter: LogEmitter, level: str = "INFO", original_stream=None):
         self.emitter = emitter
         self.level = level
+        self.original_stream = original_stream
         self._buffer = ""
 
     def write(self, text: str):
+        if self.original_stream:
+            try:
+                self.original_stream.write(text)
+                self.original_stream.flush()
+            except Exception:
+                pass
         if not text:
             return
         self._buffer += text
@@ -141,6 +148,11 @@ class StreamToLogger:
                 self.emitter.log_signal.emit(self.level, line)
 
     def flush(self):
+        if self.original_stream:
+            try:
+                self.original_stream.flush()
+            except Exception:
+                pass
         if self._buffer.strip():
             self.emitter.log_signal.emit(self.level, self._buffer.strip())
             self._buffer = ""
@@ -687,13 +699,21 @@ class UR5eRecorderStudio(QMainWindow):
         # Build UI layout
         self.setup_ui()
 
-        # Setup Logging redirection
+        # Setup Logging redirection with terminal console mirroring
         self.log_emitter = LogEmitter()
         self.log_emitter.log_signal.connect(self.append_log)
-        self.stdout_redirect = StreamToLogger(self.log_emitter, "INFO")
-        self.stderr_redirect = StreamToLogger(self.log_emitter, "ERROR")
+        self.stdout_redirect = StreamToLogger(self.log_emitter, "INFO", original_stream=sys.__stdout__)
+        self.stderr_redirect = StreamToLogger(self.log_emitter, "ERROR", original_stream=sys.__stderr__)
         sys.stdout = self.stdout_redirect
         sys.stderr = self.stderr_redirect
+
+        # Catch and print unhandled exceptions to terminal stderr
+        def excepthook(exc_type, exc_value, exc_tb):
+            import traceback
+            traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.__stderr__)
+            if hasattr(self, "log_emitter"):
+                self.log_emitter.log_signal.emit("CRITICAL", f"Unhandled exception: {exc_value}")
+        sys.excepthook = excepthook
 
         # Setup Hotkeys
         self.setup_shortcuts()
@@ -1592,44 +1612,69 @@ class UR5eRecorderStudio(QMainWindow):
         if not self.is_recording:
             return
 
-        # Stop recording timers
-        self.dataset_frame_timer.stop()
-        self.recording_timer.stop()
-        self.is_recording = False
-        duration_s = time.perf_counter() - (self.record_start_time or time.perf_counter())
+        try:
+            # Stop recording timers
+            self.dataset_frame_timer.stop()
+            self.recording_timer.stop()
+            self.is_recording = False
+            duration_s = time.perf_counter() - (self.record_start_time or time.perf_counter())
 
-        self.cam_widget_1.set_recording(False)
-        self.cam_widget_2.set_recording(False)
+            self.cam_widget_1.set_recording(False)
+            self.cam_widget_2.set_recording(False)
 
-        # Revert Record Button to Green Start State
-        self.btn_record.setText("▶  START EPISODE (Space)")
-        self.btn_record.setStyleSheet("""
-            QPushButton {
-                background-color: #16a34a;
-                color: #ffffff;
-                font-size: 14px;
-                font-weight: bold;
-                border-radius: 6px;
-                border: 1px solid #22c55e;
-            }
-            QPushButton:hover {
-                background-color: #15803d;
-            }
-        """)
-        self.btn_cancel.setEnabled(False)
+            # Prevent accidental double-clicks: disable button and display saving state
+            self.btn_record.setEnabled(False)
+            self.btn_record.setText("⏳  SAVING EPISODE (Encoding Video & Parquet)...")
+            self.btn_record.setStyleSheet("""
+                QPushButton {
+                    background-color: #92400e;
+                    color: #fef08a;
+                    font-size: 13px;
+                    font-weight: bold;
+                    border-radius: 6px;
+                    border: 2px solid #f59e0b;
+                }
+            """)
+            self.btn_cancel.setEnabled(False)
+            self.btn_stop_session.setEnabled(False)
+            QApplication.processEvents()
 
-        num_frames = len(self.current_episode_buffer)
-        ep_idx = self.list_episodes.count()
+            num_frames = len(self.current_episode_buffer)
+            ep_idx = self.list_episodes.count()
 
-        print(f"[RECORD] Saving Episode #{ep_idx} ({num_frames} frames, {duration_s:.1f}s)...")
-        self.status_bar.showMessage(f"Writing Episode #{ep_idx} to disk...")
+            print(f"[RECORD] Saving Episode #{ep_idx} ({num_frames} frames, {duration_s:.1f}s)...")
+            self.status_bar.showMessage(f"Writing Episode #{ep_idx} to disk...")
 
-        # Write episode to disk / dataset
-        self.commit_episode_to_dataset(ep_idx, num_frames, duration_s)
+            # Write episode to disk / dataset
+            self.commit_episode_to_dataset(ep_idx, num_frames, duration_s)
 
-        # Maintain arm in freedrive mode as requested
-        print("[INFO] Episode saved! Robot remains in Freedrive mode for the next demo.")
-        self.status_bar.showMessage(f"Episode #{ep_idx} saved ({num_frames} frames). Ready for next episode.", 6000)
+            # Maintain arm in freedrive mode as requested
+            print("[INFO] Episode saved! Robot remains in Freedrive mode for the next demo.")
+            self.status_bar.showMessage(f"Episode #{ep_idx} saved ({num_frames} frames). Ready for next episode.", 6000)
+        except Exception as e:
+            print(f"[CRITICAL ERROR] Failed in end_episode_and_save: {e}", file=sys.__stderr__)
+            import traceback
+            traceback.print_exc(file=sys.__stderr__)
+            self.status_bar.showMessage(f"Error saving episode: {e}", 8000)
+            QMessageBox.critical(self, "Save Error", f"An error occurred while saving the demonstration:\n\n{e}")
+        finally:
+            # Re-enable controls and restore green start state
+            self.btn_record.setEnabled(True)
+            self.btn_stop_session.setEnabled(True)
+            self.btn_record.setText("▶  START EPISODE (Space)")
+            self.btn_record.setStyleSheet("""
+                QPushButton {
+                    background-color: #16a34a;
+                    color: #ffffff;
+                    font-size: 14px;
+                    font-weight: bold;
+                    border-radius: 6px;
+                    border: 1px solid #22c55e;
+                }
+                QPushButton:hover {
+                    background-color: #15803d;
+                }
+            """)
 
     def cancel_recording(self):
         if not self.is_recording:
@@ -1688,9 +1733,9 @@ class UR5eRecorderStudio(QMainWindow):
             QMessageBox.warning(self, "Invalid Name", "Please enter a valid dataset name.")
             return
 
+        self.active_dataset = None
         self.dataset_root = DEFAULT_DATASETS_DIR / clean_name
         self.lbl_dataset_path.setText(f"Path: datasets/{clean_name}")
-        self.dataset_root.mkdir(parents=True, exist_ok=True)
         self.rescan_dataset_directory()
 
         print(f"[DATASET] Switched active dataset to: '{clean_name}' (Path: datasets/{clean_name})")
@@ -1700,7 +1745,7 @@ class UR5eRecorderStudio(QMainWindow):
         self.list_episodes.clear()
 
         if not self.dataset_root.exists():
-            print(f"[DATASET] Directory '{self.dataset_root.name}' does not exist yet. It will be initialized upon saving an episode.")
+            print(f"[DATASET] Directory '{self.dataset_root.name}' does not exist yet. It will be created when an episode is saved.")
             return
 
         meta_info_file = self.dataset_root / "meta" / "info.json"
@@ -1737,90 +1782,147 @@ class UR5eRecorderStudio(QMainWindow):
 
         print(f"[DATASET] Scanned '{self.dataset_root.name}': {self.list_episodes.count()} episodes found.")
 
-    def commit_episode_to_dataset(self, ep_idx: int, num_frames: int, duration_s: float):
-        self.dataset_root.mkdir(parents=True, exist_ok=True)
-        meta_dir = self.dataset_root / "meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-        meta_info_file = meta_dir / "info.json"
+    def get_or_create_dataset(self) -> Optional[Any]:
+        """
+        Initializes or resumes the official LeRobotDataset instance for the active dataset folder.
+        Automatically cleans up legacy dummy metadata and ensures standard LeRobot Parquet/video features.
+        """
+        if not LEROBOT_AVAILABLE or torch is None:
+            print("[WARNING] 'lerobot' or 'torch' is not installed in the current environment.", file=sys.__stderr__)
+            print("          Please ensure you are running in the 'lerobot' conda environment.", file=sys.__stderr__)
+            return None
 
-        # If LeRobot is available and we can append to dataset:
-        if LEROBOT_AVAILABLE and torch is not None and not self.mock_mode:
-            try:
-                # Features spec standard
-                features = {
-                    "observation.state": {
-                        "dtype": "float32",
-                        "shape": (6,),
-                        "names": [f"{j}_pos" for j in UR5E_JOINTS],
-                    },
-                    "action": {
-                        "dtype": "float32",
-                        "shape": (6,),
-                        "names": [f"{j}_pos" for j in UR5E_JOINTS],
-                    },
-                    "observation.images.workspace": {
-                        "dtype": "video",
-                        "shape": (480, 640, 3),
-                        "names": ["height", "width", "channels"],
-                    },
-                }
-                repo_id = f"local/{self.dataset_root.name}"
-                if meta_info_file.exists():
-                    dataset = LeRobotDataset.resume(repo_id=repo_id, root=self.dataset_root)
-                else:
-                    dataset = LeRobotDataset.create(
-                        repo_id=repo_id,
-                        fps=self.target_fps,
-                        features=features,
-                        root=self.dataset_root,
-                        robot_type="ur5e",
-                        use_videos=True,
-                    )
-
-                for frame in self.current_episode_buffer:
-                    t_frame = {
-                        "observation.state": torch.from_numpy(frame["observation.state"]),
-                        "action": torch.from_numpy(frame["action"]),
-                        "observation.images.workspace": torch.from_numpy(frame["observation.images.workspace"]),
-                        "task": frame["task"],
-                    }
-                    dataset.add_frame(t_frame)
-
-                dataset.save_episode()
-                print(f"[DATASET] LeRobotDataset episode #{ep_idx} committed successfully.")
-            except Exception as err:
-                print(f"[WARNING] LeRobotDataset native write error ({err}). Falling back to local manifest indexing.")
-                self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
-        else:
-            self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
-
-        # Update UI List
-        item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s)"
-        self.list_episodes.addItem(QListWidgetItem(item_text))
-        self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
-        self.current_episode_buffer.clear()
-
-    def _write_local_manifest_episode(self, ep_idx: int, num_frames: int, duration_s: float):
-        """Standard backup manifest recording episode records."""
-        records_file = self.dataset_root / "episodes_index.txt"
-        entry = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s) | Task: {self.txt_task_desc.text().strip()}\n"
-        with open(records_file, "a") as f:
-            f.write(entry)
+        if self.active_dataset is not None:
+            if hasattr(self.active_dataset, "root") and Path(self.active_dataset.root).resolve() == self.dataset_root.resolve():
+                return self.active_dataset
 
         meta_info_file = self.dataset_root / "meta" / "info.json"
-        meta_data = {"total_episodes": ep_idx + 1, "fps": self.target_fps, "robot_type": "ur5e"}
+        repo_id = f"local/{self.dataset_root.name}"
+
+        features = {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (6,),
+                "names": [f"{j}_pos" for j in UR5E_JOINTS],
+            },
+            "action": {
+                "dtype": "float32",
+                "shape": (6,),
+                "names": [f"{j}_pos" for j in UR5E_JOINTS],
+            },
+            "observation.images.workspace": {
+                "dtype": "video",
+                "shape": (480, 640, 3),
+                "names": ["height", "width", "channels"],
+            },
+        }
+
+        # Check if an existing info.json is a valid LeRobot metadata file
+        is_valid_lerobot = False
         if meta_info_file.exists():
             try:
                 import json
                 with open(meta_info_file, "r") as f:
-                    meta_data = json.load(f)
-                meta_data["total_episodes"] = max(meta_data.get("total_episodes", 0), ep_idx + 1)
-                meta_data["total_frames"] = meta_data.get("total_frames", 0) + num_frames
+                    meta = json.load(f)
+                if "features" in meta and "codebase_version" in meta:
+                    is_valid_lerobot = True
             except Exception:
-                pass
-        with open(meta_info_file, "w") as f:
-            import json
-            json.dump(meta_data, f, indent=2)
+                is_valid_lerobot = False
+
+        try:
+            if is_valid_lerobot:
+                print(f"[DATASET] Resuming official LeRobot dataset at: {self.dataset_root.resolve()}")
+                self.active_dataset = LeRobotDataset.resume(repo_id=repo_id, root=self.dataset_root)
+            else:
+                # If directory already exists without valid metadata, remove it so LeRobotDataset.create() does not conflict
+                if self.dataset_root.exists():
+                    print(f"[DATASET] Cleaning pre-existing empty/invalid folder at {self.dataset_root.resolve()} for fresh creation...")
+                    shutil.rmtree(self.dataset_root)
+
+                print(f"[DATASET] Creating fresh LeRobot dataset at: {self.dataset_root.resolve()}")
+                self.active_dataset = LeRobotDataset.create(
+                    repo_id=repo_id,
+                    fps=self.target_fps,
+                    features=features,
+                    root=self.dataset_root,
+                    robot_type="ur5e",
+                    use_videos=True,
+                )
+            return self.active_dataset
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize LeRobotDataset: {e}", file=sys.__stderr__)
+            import traceback
+            traceback.print_exc(file=sys.__stderr__)
+            return None
+
+    def commit_episode_to_dataset(self, ep_idx: int, num_frames: int, duration_s: float):
+        try:
+            dataset = self.get_or_create_dataset()
+
+            if dataset is not None and torch is not None:
+                task_str = self.txt_task_desc.text().strip() or "Pick and place demonstration"
+                for frame in self.current_episode_buffer:
+                    t_frame = {
+                        "observation.state": torch.from_numpy(frame["observation.state"]),
+                        "action": torch.from_numpy(frame["action"]),
+                        "observation.images.workspace": torch.from_numpy(
+                            np.ascontiguousarray(frame["observation.images.workspace"], dtype=np.uint8)
+                        ),
+                        "task": task_str,
+                    }
+                    dataset.add_frame(t_frame)
+
+                dataset.save_episode()
+                print(f"[DATASET] ✔ LeRobot episode #{ep_idx:04d} written successfully ({num_frames} frames)!")
+                print(f"          • Telemetry Parquet: {self.dataset_root / 'data'}")
+                print(f"          • Workspace Video:   {self.dataset_root / 'videos'}")
+                print(f"          • Total episodes:    {dataset.num_episodes}")
+            else:
+                print("[WARNING] Saving to fallback manifest because LeRobot is unavailable in this environment.", file=sys.__stderr__)
+                self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
+
+            # Update UI List
+            item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s)"
+            self.list_episodes.addItem(QListWidgetItem(item_text))
+            self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
+            self.current_episode_buffer.clear()
+        except Exception as err:
+            print(f"[ERROR] commit_episode_to_dataset exception: {err}", file=sys.__stderr__)
+            import traceback
+            traceback.print_exc(file=sys.__stderr__)
+            self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
+            item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s)"
+            self.list_episodes.addItem(QListWidgetItem(item_text))
+            self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
+            self.current_episode_buffer.clear()
+
+    def _write_local_manifest_episode(self, ep_idx: int, num_frames: int, duration_s: float):
+        """Standard backup manifest recording episode records."""
+        try:
+            self.dataset_root.mkdir(parents=True, exist_ok=True)
+            records_file = self.dataset_root / "episodes_index.txt"
+            entry = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s) | Task: {self.txt_task_desc.text().strip()}\n"
+            with open(records_file, "a") as f:
+                f.write(entry)
+
+            meta_dir = self.dataset_root / "meta"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            meta_info_file = meta_dir / "info.json"
+            meta_data = {"total_episodes": ep_idx + 1, "fps": self.target_fps, "robot_type": "ur5e"}
+            if meta_info_file.exists():
+                try:
+                    import json
+                    with open(meta_info_file, "r") as f:
+                        meta_data = json.load(f)
+                    meta_data["total_episodes"] = max(meta_data.get("total_episodes", 0), ep_idx + 1)
+                    meta_data["total_frames"] = meta_data.get("total_frames", 0) + num_frames
+                except Exception:
+                    pass
+            with open(meta_info_file, "w") as f:
+                import json
+                json.dump(meta_data, f, indent=2)
+        except Exception as e:
+            print(f"[ERROR] Error writing local manifest: {e}", file=sys.__stderr__)
 
     def delete_episode(self):
         """

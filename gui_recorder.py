@@ -171,23 +171,38 @@ class CameraWorker(QThread):
     fps_updated = pyqtSignal(int, float)       # (camera_id, measured_fps)
     status_signal = pyqtSignal(int, bool, str) # (camera_id, is_connected, message)
 
-    def __init__(self, camera_id: int, target_fps: int = 30, mock: bool = False, parent=None):
+    def __init__(self, camera_id: int, target_fps: int = 30, width: int = 320, height: int = 240, mock: bool = False, parent=None):
         super().__init__(parent)
         self.camera_id = camera_id
         self.target_fps = target_fps
+        self.target_width = width
+        self.target_height = height
         self.mock = mock
         self._running = False
         self._cap = None
         self._mutex = QMutex()
+
+    def set_resolution(self, width: int, height: int):
+        self._mutex.lock()
+        self.target_width = width
+        self.target_height = height
+        cap = self._cap
+        self._mutex.unlock()
+        if cap is not None and cap.isOpened():
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            except Exception:
+                pass
 
     def run(self):
         self._running = True
 
         if not self.mock:
             self._cap = cv2.VideoCapture(self.camera_id)
-            # Optimize capture parameters
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            # Request capture parameters from driver
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
             self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
 
             if not self._cap.isOpened():
@@ -214,14 +229,21 @@ class CameraWorker(QThread):
         while self._running:
             t0 = time.perf_counter()
 
+            self._mutex.lock()
+            tw, th = self.target_width, self.target_height
+            self._mutex.unlock()
+
             if not self.mock and self._cap and self._cap.isOpened():
                 ret, frame = self._cap.read()
                 if not ret:
                     time.sleep(0.01)
                     continue
+                # Resize to target resolution if different
+                if frame.shape[1] != tw or frame.shape[0] != th:
+                    frame = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_AREA)
             else:
-                # Generate synthetic test frame with timestamp and visual animation
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                # Generate synthetic test frame with timestamp and visual animation matching current resolution
+                frame = np.zeros((th, tw, 3), dtype=np.uint8)
                 # Subtle gradient background
                 sim_t += 0.03
                 gx = int(128 + 60 * math.sin(sim_t))
@@ -230,33 +252,37 @@ class CameraWorker(QThread):
                 frame[:, :, 1] = int(gx * 0.3)
                 frame[:, :, 2] = int(gy * 0.4)
 
-                # Grid pattern
-                for x in range(0, 640, 40):
-                    cv2.line(frame, (x, 0), (x, 480), (45, 55, 72), 1)
-                for y in range(0, 480, 40):
-                    cv2.line(frame, (0, y), (640, y), (45, 55, 72), 1)
+                # Scaled grid pattern
+                step = max(20, min(tw, th) // 8)
+                for x in range(0, tw, step):
+                    cv2.line(frame, (x, 0), (x, th), (45, 55, 72), 1)
+                for y in range(0, th, step):
+                    cv2.line(frame, (0, y), (tw, y), (45, 55, 72), 1)
 
                 # Simulated end-effector crosshair moving smoothly
-                cx = int(320 + 150 * math.sin(sim_t * 1.2))
-                cy = int(240 + 100 * math.cos(sim_t * 1.5))
-                cv2.circle(frame, (cx, cy), 18, (0, 215, 255), 2)
-                cv2.circle(frame, (cx, cy), 4, (0, 215, 255), -1)
+                cx = int(tw / 2 + (tw / 4) * math.sin(sim_t * 1.2))
+                cy = int(th / 2 + (th / 4) * math.cos(sim_t * 1.5))
+                r = max(6, min(tw, th) // 20)
+                cv2.circle(frame, (cx, cy), r, (0, 215, 255), 2)
+                cv2.circle(frame, (cx, cy), 3, (0, 215, 255), -1)
+
+                font_scale = max(0.35, min(tw, th) / 600.0)
                 cv2.putText(
                     frame,
-                    f"CAM {self.camera_id} [SYNTHETIC WORKSPACE FEED]",
-                    (20, 40),
+                    f"CAM {self.camera_id} [{tw}x{th}]",
+                    (10, max(18, int(th * 0.12))),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
+                    font_scale,
                     (200, 220, 255),
-                    2,
+                    1,
                 )
                 time_str = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-4]
                 cv2.putText(
                     frame,
                     f"TIME: {time_str}",
-                    (20, 450),
+                    (10, max(36, th - 12)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
+                    font_scale * 0.9,
                     (150, 180, 200),
                     1,
                 )
@@ -693,6 +719,9 @@ class UR5eRecorderStudio(QMainWindow):
         self.setMinimumSize(1100, 800)
         self._user_dragging_joint: Optional[str] = None
 
+        self.camera_width = 320
+        self.camera_height = 240
+
         # Apply dark industrial visual styling
         self.apply_theme()
 
@@ -719,7 +748,9 @@ class UR5eRecorderStudio(QMainWindow):
         self.setup_shortcuts()
 
         # Start Camera Thread
-        self.camera_worker = CameraWorker(self.camera_index, self.target_fps, self.mock_mode)
+        self.camera_worker = CameraWorker(
+            self.camera_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode
+        )
         self.camera_worker.frame_ready.connect(self.on_frame_received)
         self.camera_worker.fps_updated.connect(self.cam_widget_1.update_fps)
         self.camera_worker.status_signal.connect(self.on_camera_status)
@@ -871,8 +902,29 @@ class UR5eRecorderStudio(QMainWindow):
         self.btn_toggle_cam2.clicked.connect(self.toggle_secondary_camera)
         cam_ctrl_bar.addWidget(self.btn_toggle_cam2)
 
-        self.lbl_cam_info = QLabel("Format: 640x480 RGB @ 30 FPS")
-        self.lbl_cam_info.setStyleSheet("color: #64748b; font-size: 11px;")
+        # Resolution Dropdown
+        lbl_res = QLabel("Resolution:")
+        lbl_res.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px; margin-left: 8px;")
+        cam_ctrl_bar.addWidget(lbl_res)
+
+        self.RESOLUTION_PRESETS = [
+            ("320 x 240 (Fast Training - Recommended)", 320, 240),
+            ("256 x 256 (Square - Policy/ACT)", 256, 256),
+            ("224 x 224 (Square - ResNet/ViT)", 224, 224),
+            ("640 x 480 (Full / High-Res)", 640, 480),
+            ("160 x 120 (Ultra Fast)", 160, 120),
+        ]
+        self.combo_resolution = QComboBox()
+        for label, _, _ in self.RESOLUTION_PRESETS:
+            self.combo_resolution.addItem(label)
+        self.combo_resolution.setCurrentIndex(0)  # Default: 320x240
+        self.combo_resolution.setStyleSheet("font-size: 11px; padding: 3px 8px;")
+        self.combo_resolution.setToolTip("Select camera recording resolution. Smaller resolutions (e.g. 320x240) train faster and save disk space.")
+        self.combo_resolution.currentIndexChanged.connect(self.on_resolution_changed)
+        cam_ctrl_bar.addWidget(self.combo_resolution)
+
+        self.lbl_cam_info = QLabel("Format: 320x240 RGB @ 30 FPS")
+        self.lbl_cam_info.setStyleSheet("color: #64748b; font-size: 11px; margin-left: 6px;")
         cam_ctrl_bar.addWidget(self.lbl_cam_info)
         cam_ctrl_bar.addStretch()
 
@@ -1135,6 +1187,54 @@ class UR5eRecorderStudio(QMainWindow):
         self.btn_delete_ep.clicked.connect(self.delete_episode)
         ds_layout.addWidget(self.btn_delete_ep)
 
+        # 3D Visualizer Console Command Section
+        viz_sep = QFrame()
+        viz_sep.setFrameShape(QFrame.Shape.HLine)
+        viz_sep.setStyleSheet("color: #334155; margin-top: 6px; margin-bottom: 2px;")
+        ds_layout.addWidget(viz_sep)
+
+        viz_title_lbl = QLabel("3D Visualizer Console Command:")
+        viz_title_lbl.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
+        ds_layout.addWidget(viz_title_lbl)
+
+        viz_cmd_row = QHBoxLayout()
+        self.txt_viz_command = QLineEdit()
+        self.txt_viz_command.setReadOnly(True)
+        self.txt_viz_command.setFont(QFont("DejaVu Sans Mono", 9))
+        self.txt_viz_command.setStyleSheet("""
+            QLineEdit {
+                background-color: #050811;
+                color: #38bdf8;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+                padding: 6px;
+                selection-background-color: #1e3a8a;
+            }
+        """)
+        viz_cmd_row.addWidget(self.txt_viz_command, stretch=4)
+
+        self.btn_copy_viz_cmd = QPushButton("📋 Copy")
+        self.btn_copy_viz_cmd.setToolTip("Copy visualizer command to clipboard")
+        self.btn_copy_viz_cmd.setStyleSheet("""
+            QPushButton {
+                background-color: #1e3a8a;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 6px 12px;
+                border: 1px solid #3b82f6;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+        """)
+        self.btn_copy_viz_cmd.clicked.connect(self.copy_visualizer_command)
+        viz_cmd_row.addWidget(self.btn_copy_viz_cmd, stretch=1)
+        ds_layout.addLayout(viz_cmd_row)
+
+        self.list_episodes.currentRowChanged.connect(lambda _: self.update_visualizer_command())
+
         right_column.addWidget(ds_box, stretch=3)
 
         # 5. Live Telemetry HUD (Joints + RTDE Stats)
@@ -1346,6 +1446,95 @@ class UR5eRecorderStudio(QMainWindow):
         btn_text = "- Hide Secondary Camera" if visible else "+ Show / Hide Secondary Camera"
         self.btn_toggle_cam2.setText(btn_text)
 
+    def on_resolution_changed(self, index: int):
+        if index < 0 or index >= len(self.RESOLUTION_PRESETS):
+            return
+        desc, w, h = self.RESOLUTION_PRESETS[index]
+        self.camera_width = w
+        self.camera_height = h
+        self.camera_worker.set_resolution(w, h)
+        self.lbl_cam_info.setText(f"Format: {w}x{h} RGB @ {self.target_fps} FPS")
+        print(f"[CAMERA] Resolution updated to {w}x{h} ({desc})")
+        self.status_bar.showMessage(f"Camera resolution set to {w}x{h}.", 3000)
+        # Invalidate active dataset handle so any new recording starts with the chosen resolution
+        self.active_dataset = None
+
+    def _sync_resolution_ui(self, w: int, h: int):
+        self.camera_width = w
+        self.camera_height = h
+        self.camera_worker.set_resolution(w, h)
+        self.lbl_cam_info.setText(f"Format: {w}x{h} RGB @ {self.target_fps} FPS")
+        if hasattr(self, "combo_resolution"):
+            self.combo_resolution.blockSignals(True)
+            found_idx = -1
+            for idx, (_, ow, oh) in enumerate(self.RESOLUTION_PRESETS):
+                if ow == w and oh == h:
+                    found_idx = idx
+                    break
+            if found_idx >= 0:
+                self.combo_resolution.setCurrentIndex(found_idx)
+            else:
+                custom_label = f"{w} x {h} (Dataset Configured)"
+                self.combo_resolution.addItem(custom_label)
+                self.combo_resolution.setCurrentIndex(self.combo_resolution.count() - 1)
+            self.combo_resolution.blockSignals(False)
+
+    def update_visualizer_command(self):
+        clean_name = self.dataset_root.name
+        selected_idx = 0
+        curr_item = self.list_episodes.currentItem()
+        if curr_item is not None:
+            text = curr_item.text()
+            import re
+            m = re.search(r"Episode #(\d+)", text)
+            if m:
+                selected_idx = int(m.group(1))
+            else:
+                row = self.list_episodes.currentRow()
+                if row >= 0:
+                    selected_idx = row
+        cmd = f"lerobot-dataset-viz --repo-id local/{clean_name} --root ./datasets/{clean_name} --episode-index {selected_idx}"
+        if hasattr(self, "txt_viz_command"):
+            self.txt_viz_command.setText(cmd)
+
+    def copy_visualizer_command(self):
+        cmd = self.txt_viz_command.text().strip()
+        if not cmd:
+            return
+        QApplication.clipboard().setText(cmd)
+        self.btn_copy_viz_cmd.setText("✔ Copied!")
+        self.btn_copy_viz_cmd.setStyleSheet("""
+            QPushButton {
+                background-color: #16a34a;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 6px 12px;
+                border: 1px solid #22c55e;
+                border-radius: 4px;
+            }
+        """)
+        QTimer.singleShot(2000, self._reset_copy_btn)
+        self.status_bar.showMessage("Visualizer command copied to clipboard!", 3500)
+        print(f"[SYSTEM] Copied to clipboard: {cmd}")
+
+    def _reset_copy_btn(self):
+        self.btn_copy_viz_cmd.setText("📋 Copy")
+        self.btn_copy_viz_cmd.setStyleSheet("""
+            QPushButton {
+                background-color: #1e3a8a;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 6px 12px;
+                border: 1px solid #3b82f6;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+        """)
+
     @pyqtSlot(int, np.ndarray)
     def on_frame_received(self, cam_id: int, frame: np.ndarray):
         if cam_id == self.camera_index:
@@ -1547,6 +1736,10 @@ class UR5eRecorderStudio(QMainWindow):
         self.recorded_frames_count = 0
         self.current_episode_buffer.clear()
 
+        # Disable resolution switching during active demonstration
+        if hasattr(self, "combo_resolution"):
+            self.combo_resolution.setEnabled(False)
+
         # Update UI Controls to Active Recording State
         self.btn_record.setText("⏸  END EPISODE (Space)")
         self.btn_record.setStyleSheet("""
@@ -1591,9 +1784,12 @@ class UR5eRecorderStudio(QMainWindow):
         q_vals = np.array([joints[j] for j in UR5E_JOINTS], dtype=np.float32)
 
         if self.latest_camera_frame is not None:
-            img = cv2.cvtColor(self.latest_camera_frame, cv2.COLOR_BGR2RGB)
+            raw_frame = self.latest_camera_frame
+            if raw_frame.shape[1] != self.camera_width or raw_frame.shape[0] != self.camera_height:
+                raw_frame = cv2.resize(raw_frame, (self.camera_width, self.camera_height), interpolation=cv2.INTER_AREA)
+            img = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
         else:
-            img = np.zeros((480, 640, 3), dtype=np.uint8)
+            img = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
 
         task_text = self.txt_task_desc.text().strip() or "Pick and place demonstration"
 
@@ -1661,6 +1857,8 @@ class UR5eRecorderStudio(QMainWindow):
             # Re-enable controls and restore green start state
             self.btn_record.setEnabled(True)
             self.btn_stop_session.setEnabled(True)
+            if hasattr(self, "combo_resolution"):
+                self.combo_resolution.setEnabled(True)
             self.btn_record.setText("▶  START EPISODE (Space)")
             self.btn_record.setStyleSheet("""
                 QPushButton {
@@ -1686,6 +1884,8 @@ class UR5eRecorderStudio(QMainWindow):
 
         self.cam_widget_1.set_recording(False)
         self.cam_widget_2.set_recording(False)
+        if hasattr(self, "combo_resolution"):
+            self.combo_resolution.setEnabled(True)
 
         discarded_count = len(self.current_episode_buffer)
         self.current_episode_buffer.clear()
@@ -1746,6 +1946,7 @@ class UR5eRecorderStudio(QMainWindow):
 
         if not self.dataset_root.exists():
             print(f"[DATASET] Directory '{self.dataset_root.name}' does not exist yet. It will be created when an episode is saved.")
+            self.update_visualizer_command()
             return
 
         meta_info_file = self.dataset_root / "meta" / "info.json"
@@ -1759,6 +1960,10 @@ class UR5eRecorderStudio(QMainWindow):
                     meta = json.load(f)
                     total_episodes = meta.get("total_episodes", 0)
                     total_frames = meta.get("total_frames", 0)
+                    cam_shape = meta.get("features", {}).get("observation.images.workspace", {}).get("shape", [])
+                    if len(cam_shape) == 3:
+                        h, w = cam_shape[0], cam_shape[1]
+                        self._sync_resolution_ui(w, h)
             except Exception as e:
                 print(f"[WARNING] Could not parse {meta_info_file}: {e}")
 
@@ -1781,6 +1986,7 @@ class UR5eRecorderStudio(QMainWindow):
                 self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
 
         print(f"[DATASET] Scanned '{self.dataset_root.name}': {self.list_episodes.count()} episodes found.")
+        self.update_visualizer_command()
 
     def get_or_create_dataset(self) -> Optional[Any]:
         """
@@ -1812,7 +2018,7 @@ class UR5eRecorderStudio(QMainWindow):
             },
             "observation.images.workspace": {
                 "dtype": "video",
-                "shape": (480, 640, 3),
+                "shape": (self.camera_height, self.camera_width, 3),
                 "names": ["height", "width", "channels"],
             },
         }
@@ -1826,6 +2032,10 @@ class UR5eRecorderStudio(QMainWindow):
                     meta = json.load(f)
                 if "features" in meta and "codebase_version" in meta:
                     is_valid_lerobot = True
+                    cam_shape = meta.get("features", {}).get("observation.images.workspace", {}).get("shape", [])
+                    if len(cam_shape) == 3:
+                        h, w = cam_shape[0], cam_shape[1]
+                        self._sync_resolution_ui(w, h)
             except Exception:
                 is_valid_lerobot = False
 
@@ -1839,7 +2049,7 @@ class UR5eRecorderStudio(QMainWindow):
                     print(f"[DATASET] Cleaning pre-existing empty/invalid folder at {self.dataset_root.resolve()} for fresh creation...")
                     shutil.rmtree(self.dataset_root)
 
-                print(f"[DATASET] Creating fresh LeRobot dataset at: {self.dataset_root.resolve()}")
+                print(f"[DATASET] Creating fresh LeRobot dataset at: {self.dataset_root.resolve()} ({self.camera_width}x{self.camera_height})")
                 self.active_dataset = LeRobotDataset.create(
                     repo_id=repo_id,
                     fps=self.target_fps,
@@ -1873,10 +2083,15 @@ class UR5eRecorderStudio(QMainWindow):
                     dataset.add_frame(t_frame)
 
                 dataset.save_episode()
-                print(f"[DATASET] ✔ LeRobot episode #{ep_idx:04d} written successfully ({num_frames} frames)!")
+                # Immediately finalize so parquet footers and meta/episodes are completely written to disk
+                dataset.finalize()
+                total_episodes_saved = dataset.num_episodes
+                self.active_dataset = None  # Reset instance so next episode cleanly resumes via LeRobotDataset.resume()
+                print(f"[DATASET] ✔ LeRobot episode #{ep_idx:04d} written and finalized successfully ({num_frames} frames)!")
                 print(f"          • Telemetry Parquet: {self.dataset_root / 'data'}")
                 print(f"          • Workspace Video:   {self.dataset_root / 'videos'}")
-                print(f"          • Total episodes:    {dataset.num_episodes}")
+                print(f"          • Metadata Episodes: {self.dataset_root / 'meta' / 'episodes'}")
+                print(f"          • Total episodes:    {total_episodes_saved}")
             else:
                 print("[WARNING] Saving to fallback manifest because LeRobot is unavailable in this environment.", file=sys.__stderr__)
                 self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
@@ -1886,6 +2101,7 @@ class UR5eRecorderStudio(QMainWindow):
             self.list_episodes.addItem(QListWidgetItem(item_text))
             self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
             self.current_episode_buffer.clear()
+            self.update_visualizer_command()
         except Exception as err:
             print(f"[ERROR] commit_episode_to_dataset exception: {err}", file=sys.__stderr__)
             import traceback
@@ -1895,6 +2111,7 @@ class UR5eRecorderStudio(QMainWindow):
             self.list_episodes.addItem(QListWidgetItem(item_text))
             self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
             self.current_episode_buffer.clear()
+            self.update_visualizer_command()
 
     def _write_local_manifest_episode(self, ep_idx: int, num_frames: int, duration_s: float):
         """Standard backup manifest recording episode records."""
@@ -1979,6 +2196,7 @@ class UR5eRecorderStudio(QMainWindow):
 
         print(f"[INFO] Deleted episode at list position #{target_row + 1} from dataset '{self.dataset_root.name}'.")
         self.status_bar.showMessage(f"Episode deleted from '{self.dataset_root.name}'.", 4000)
+        self.update_visualizer_command()
 
     # -------------------------------------------------------------------------
     # Hardware Diagnostics Runner
@@ -2038,6 +2256,13 @@ class UR5eRecorderStudio(QMainWindow):
         # Stop workers
         self.camera_worker.stop()
         self.robot_worker.stop()
+
+        if self.active_dataset is not None:
+            try:
+                self.active_dataset.finalize()
+                self.active_dataset = None
+            except Exception as e:
+                print(f"[SYSTEM] Dataset finalize on close: {e}", file=sys.__stderr__)
 
         # Restore system standard streams
         sys.stdout = sys.__stdout__

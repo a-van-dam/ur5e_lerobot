@@ -100,7 +100,8 @@ except ImportError:
 
 # Default Configuration
 DEFAULT_ROBOT_IP = "192.168.1.102"
-DEFAULT_CAMERA_INDEX = 4       # KYE Systems Corp. eFace 1325R
+DEFAULT_CAMERA_INDEX = 4         # HD Webcam C525 (Workspace)
+DEFAULT_CAMERA_2_INDEX = 6       # eFace 1325R (Wrist Flange)
 DEFAULT_FPS = 30
 DEFAULT_DATASET_NAME = "ur5e_assembly"
 DEFAULT_DATASETS_DIR = Path(__file__).resolve().parent / "datasets"
@@ -113,6 +114,33 @@ UR5E_JOINTS = [
     "wrist_2",
     "wrist_3",
 ]
+
+
+def detect_available_cameras() -> List[Tuple[int, str]]:
+    """
+    Scans Linux v4l2 device nodes and returns a list of (camera_index, user_friendly_label).
+    Filters out unsupported or metadata-only sub-nodes using the sysfs 'index' attribute.
+    """
+    cameras = []
+    v4l_dir = Path("/sys/class/video4linux")
+    if v4l_dir.exists():
+        for dev in sorted(v4l_dir.glob("video*"), key=lambda p: int(p.name.replace("video", "")) if p.name.replace("video", "").isdigit() else 999):
+            idx_file = dev / "index"
+            if idx_file.exists():
+                try:
+                    if idx_file.read_text().strip() != "0":
+                        continue
+                except Exception:
+                    pass
+            idx = int(dev.name.replace("video", ""))
+            name_file = dev / "name"
+            dev_name = name_file.read_text().strip() if name_file.exists() else f"Camera {idx}"
+            clean_name = dev_name.split(":")[0].strip()
+            cameras.append((idx, f"/dev/video{idx}: {clean_name}"))
+
+    if not cameras:
+        cameras = [(0, "/dev/video0: Default Camera")]
+    return cameras
 
 
 # =============================================================================
@@ -696,10 +724,13 @@ class UR5eRecorderStudio(QMainWindow):
     Diagnostic subprocesses, hotkey workflows, and GUI layout.
     """
 
-    def __init__(self, robot_ip: str, camera_index: int, fps: int, mock: bool = False):
+    def __init__(self, robot_ip: str, camera_index: int, fps: int, camera_2_index: int = DEFAULT_CAMERA_2_INDEX, dual_cam: bool = False, mock: bool = False):
         super().__init__()
         self.robot_ip = robot_ip
         self.camera_index = camera_index
+        self.camera_1_index = camera_index
+        self.camera_2_index = camera_2_index
+        self.enable_dual_cameras = False
         self.target_fps = fps
         self.mock_mode = mock
 
@@ -711,7 +742,9 @@ class UR5eRecorderStudio(QMainWindow):
         self.active_dataset: Optional[Any] = None
         self.dataset_root: Path = DEFAULT_DATASETS_DIR / DEFAULT_DATASET_NAME
         self.current_episode_buffer: List[Dict[str, Any]] = []
-        self.latest_camera_frame: Optional[np.ndarray] = None
+        self.latest_camera_frame_1: Optional[np.ndarray] = None
+        self.latest_camera_frame_2: Optional[np.ndarray] = None
+        self.latest_camera_frame: Optional[np.ndarray] = None  # Alias for camera 1
 
         # Window settings
         self.setWindowTitle("UR5e LeRobot — Teleoperation & Demonstration Recording Studio")
@@ -747,14 +780,21 @@ class UR5eRecorderStudio(QMainWindow):
         # Setup Hotkeys
         self.setup_shortcuts()
 
-        # Start Camera Thread
-        self.camera_worker = CameraWorker(
-            self.camera_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode
+        # Start Primary Camera Thread
+        self.camera_worker_1 = CameraWorker(
+            self.camera_1_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode
         )
-        self.camera_worker.frame_ready.connect(self.on_frame_received)
-        self.camera_worker.fps_updated.connect(self.cam_widget_1.update_fps)
-        self.camera_worker.status_signal.connect(self.on_camera_status)
-        self.camera_worker.start()
+        self.camera_worker_1.frame_ready.connect(self.on_cam1_frame_received)
+        self.camera_worker_1.fps_updated.connect(self.cam_widget_1.update_fps)
+        self.camera_worker_1.status_signal.connect(self.on_camera_status)
+        self.camera_worker_1.start()
+        self.camera_worker = self.camera_worker_1  # Backwards compatibility alias
+
+        # Secondary camera worker reference
+        self.camera_worker_2: Optional[CameraWorker] = None
+
+        if dual_cam:
+            self.set_dual_cameras_enabled(True)
 
         # Start Robot RTDE Thread
         self.robot_worker = RobotRTDEWorker(self.robot_ip, self.mock_mode)
@@ -889,22 +929,61 @@ class UR5eRecorderStudio(QMainWindow):
         cam_layout.addWidget(self.cam_widget_1, stretch=2)
 
         # Secondary Camera Slot (Easily toggleable or plugged in)
-        self.cam_widget_2 = CameraFeedWidget("Camera 2: Wrist Flange (Secondary)", 0)
-        self.cam_widget_2.setVisible(False)  # Hidden by default, toggled via checkbox below
+        self.cam_widget_2 = CameraFeedWidget(f"Camera 2: Wrist Flange (/dev/video{self.camera_2_index})", self.camera_2_index)
+        self.cam_widget_2.setVisible(False)  # Hidden by default, toggled via button below
         cam_layout.addWidget(self.cam_widget_2, stretch=2)
 
         left_column.addWidget(self.camera_container, stretch=5)
 
         # Camera Options Bar
         cam_ctrl_bar = QHBoxLayout()
-        self.btn_toggle_cam2 = QPushButton("+ Show / Hide Secondary Camera")
+        self.btn_toggle_cam2 = QPushButton("+ Enable Secondary Camera")
         self.btn_toggle_cam2.setStyleSheet("font-size: 11px; padding: 4px 10px;")
+        self.btn_toggle_cam2.setToolTip("Toggle secondary camera (Wrist Flange). When enabled, both cameras stream and record into the dataset.")
         self.btn_toggle_cam2.clicked.connect(self.toggle_secondary_camera)
         cam_ctrl_bar.addWidget(self.btn_toggle_cam2)
 
+        # Discovered Cameras List
+        available_cameras = detect_available_cameras()
+
+        # Cam 1 Device Selector
+        lbl_cam1 = QLabel("Cam 1:")
+        lbl_cam1.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px; margin-left: 6px;")
+        cam_ctrl_bar.addWidget(lbl_cam1)
+
+        self.combo_cam1 = QComboBox()
+        self.combo_cam1.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+        self.combo_cam1.setToolTip("Select device for Primary Camera (Workspace)")
+        for idx, label in available_cameras:
+            self.combo_cam1.addItem(label, idx)
+        # Select active camera_1_index
+        idx_match = self.combo_cam1.findData(self.camera_1_index)
+        if idx_match >= 0:
+            self.combo_cam1.setCurrentIndex(idx_match)
+        self.combo_cam1.currentIndexChanged.connect(self.on_cam1_device_changed)
+        cam_ctrl_bar.addWidget(self.combo_cam1)
+
+        # Cam 2 Device Selector (Visible when dual camera is active)
+        self.lbl_cam2 = QLabel("Cam 2:")
+        self.lbl_cam2.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px; margin-left: 6px;")
+        self.lbl_cam2.setVisible(False)
+        cam_ctrl_bar.addWidget(self.lbl_cam2)
+
+        self.combo_cam2 = QComboBox()
+        self.combo_cam2.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+        self.combo_cam2.setToolTip("Select device for Secondary Camera (Wrist Flange)")
+        for idx, label in available_cameras:
+            self.combo_cam2.addItem(label, idx)
+        idx2_match = self.combo_cam2.findData(self.camera_2_index)
+        if idx2_match >= 0:
+            self.combo_cam2.setCurrentIndex(idx2_match)
+        self.combo_cam2.setVisible(False)
+        self.combo_cam2.currentIndexChanged.connect(self.on_cam2_device_changed)
+        cam_ctrl_bar.addWidget(self.combo_cam2)
+
         # Resolution Dropdown
-        lbl_res = QLabel("Resolution:")
-        lbl_res.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px; margin-left: 8px;")
+        lbl_res = QLabel("Res:")
+        lbl_res.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px; margin-left: 6px;")
         cam_ctrl_bar.addWidget(lbl_res)
 
         self.RESOLUTION_PRESETS = [
@@ -918,13 +997,17 @@ class UR5eRecorderStudio(QMainWindow):
         for label, _, _ in self.RESOLUTION_PRESETS:
             self.combo_resolution.addItem(label)
         self.combo_resolution.setCurrentIndex(0)  # Default: 320x240
-        self.combo_resolution.setStyleSheet("font-size: 11px; padding: 3px 8px;")
-        self.combo_resolution.setToolTip("Select camera recording resolution. Smaller resolutions (e.g. 320x240) train faster and save disk space.")
+        self.combo_resolution.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+        self.combo_resolution.setToolTip("Select recording resolution for cameras. Smaller resolutions (e.g. 320x240) train faster and save disk space.")
         self.combo_resolution.currentIndexChanged.connect(self.on_resolution_changed)
         cam_ctrl_bar.addWidget(self.combo_resolution)
 
+        self.lbl_dual_badge = QLabel("○ 1-Cam Mode")
+        self.lbl_dual_badge.setStyleSheet("color: #64748b; font-size: 10px; margin-left: 6px;")
+        cam_ctrl_bar.addWidget(self.lbl_dual_badge)
+
         self.lbl_cam_info = QLabel("Format: 320x240 RGB @ 30 FPS")
-        self.lbl_cam_info.setStyleSheet("color: #64748b; font-size: 11px; margin-left: 6px;")
+        self.lbl_cam_info.setStyleSheet("color: #64748b; font-size: 10px; margin-left: 4px;")
         cam_ctrl_bar.addWidget(self.lbl_cam_info)
         cam_ctrl_bar.addStretch()
 
@@ -1441,10 +1524,98 @@ class UR5eRecorderStudio(QMainWindow):
     # Camera Slots & Multiplexing
     # -------------------------------------------------------------------------
     def toggle_secondary_camera(self):
-        visible = not self.cam_widget_2.isVisible()
-        self.cam_widget_2.setVisible(visible)
-        btn_text = "- Hide Secondary Camera" if visible else "+ Show / Hide Secondary Camera"
-        self.btn_toggle_cam2.setText(btn_text)
+        self.set_dual_cameras_enabled(not self.enable_dual_cameras)
+
+    def set_dual_cameras_enabled(self, enabled: bool):
+        self.enable_dual_cameras = enabled
+        self.cam_widget_2.setVisible(enabled)
+        if hasattr(self, "lbl_cam2"):
+            self.lbl_cam2.setVisible(enabled)
+        if hasattr(self, "combo_cam2"):
+            self.combo_cam2.setVisible(enabled)
+
+        if enabled:
+            self.btn_toggle_cam2.setText("- Disable Secondary Camera")
+            self.btn_toggle_cam2.setStyleSheet("""
+                QPushButton {
+                    background-color: #1e3a8a;
+                    color: #93c5fd;
+                    border: 1px solid #3b82f6;
+                    font-size: 11px;
+                    padding: 4px 10px;
+                }
+            """)
+            if hasattr(self, "lbl_dual_badge"):
+                self.lbl_dual_badge.setText("● 2-Cam Mode (Workspace+Wrist)")
+                self.lbl_dual_badge.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 10px; margin-left: 6px;")
+
+            # Start worker 2 if not active
+            if self.camera_worker_2 is None:
+                print(f"[CAMERA 2] Initializing Secondary Camera on /dev/video{self.camera_2_index}...")
+                self.camera_worker_2 = CameraWorker(
+                    self.camera_2_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode
+                )
+                self.camera_worker_2.frame_ready.connect(self.on_cam2_frame_received)
+                self.camera_worker_2.fps_updated.connect(self.cam_widget_2.update_fps)
+                self.camera_worker_2.status_signal.connect(self.on_camera_status)
+                self.camera_worker_2.start()
+        else:
+            self.btn_toggle_cam2.setText("+ Enable Secondary Camera")
+            self.btn_toggle_cam2.setStyleSheet("""
+                QPushButton {
+                    background-color: #334155;
+                    color: #ffffff;
+                    border: 1px solid #475569;
+                    font-size: 11px;
+                    padding: 4px 10px;
+                }
+            """)
+            if hasattr(self, "lbl_dual_badge"):
+                self.lbl_dual_badge.setText("○ 1-Cam Mode")
+                self.lbl_dual_badge.setStyleSheet("color: #64748b; font-size: 10px; margin-left: 6px;")
+
+            if self.camera_worker_2 is not None:
+                print(f"[CAMERA 2] Stopping Secondary Camera (/dev/video{self.camera_2_index})...")
+                self.camera_worker_2.stop()
+                self.camera_worker_2 = None
+                self.latest_camera_frame_2 = None
+
+        # Invalidate active dataset handle so next episode writes correct schema (1 or 2 cameras)
+        self.active_dataset = None
+
+    def on_cam1_device_changed(self, index: int):
+        cam_id = self.combo_cam1.itemData(index)
+        if cam_id is not None and cam_id != self.camera_1_index:
+            print(f"[CAMERA 1] Switching Workspace camera to /dev/video{cam_id}...")
+            self.camera_1_index = cam_id
+            self.camera_index = cam_id
+            if self.camera_worker_1 is not None:
+                self.camera_worker_1.stop()
+                self.camera_worker_1 = CameraWorker(
+                    self.camera_1_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode
+                )
+                self.camera_worker_1.frame_ready.connect(self.on_cam1_frame_received)
+                self.camera_worker_1.fps_updated.connect(self.cam_widget_1.update_fps)
+                self.camera_worker_1.status_signal.connect(self.on_camera_status)
+                self.camera_worker_1.start()
+                self.camera_worker = self.camera_worker_1
+            self.cam_widget_1.lbl_title.setText(f"Camera 1: Workspace (/dev/video{self.camera_1_index})")
+
+    def on_cam2_device_changed(self, index: int):
+        cam_id = self.combo_cam2.itemData(index)
+        if cam_id is not None and cam_id != self.camera_2_index:
+            print(f"[CAMERA 2] Switching Wrist camera to /dev/video{cam_id}...")
+            self.camera_2_index = cam_id
+            if self.camera_worker_2 is not None:
+                self.camera_worker_2.stop()
+                self.camera_worker_2 = CameraWorker(
+                    self.camera_2_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode
+                )
+                self.camera_worker_2.frame_ready.connect(self.on_cam2_frame_received)
+                self.camera_worker_2.fps_updated.connect(self.cam_widget_2.update_fps)
+                self.camera_worker_2.status_signal.connect(self.on_camera_status)
+                self.camera_worker_2.start()
+            self.cam_widget_2.lbl_title.setText(f"Camera 2: Wrist Flange (/dev/video{self.camera_2_index})")
 
     def on_resolution_changed(self, index: int):
         if index < 0 or index >= len(self.RESOLUTION_PRESETS):
@@ -1452,7 +1623,10 @@ class UR5eRecorderStudio(QMainWindow):
         desc, w, h = self.RESOLUTION_PRESETS[index]
         self.camera_width = w
         self.camera_height = h
-        self.camera_worker.set_resolution(w, h)
+        if self.camera_worker_1 is not None:
+            self.camera_worker_1.set_resolution(w, h)
+        if self.camera_worker_2 is not None:
+            self.camera_worker_2.set_resolution(w, h)
         self.lbl_cam_info.setText(f"Format: {w}x{h} RGB @ {self.target_fps} FPS")
         print(f"[CAMERA] Resolution updated to {w}x{h} ({desc})")
         self.status_bar.showMessage(f"Camera resolution set to {w}x{h}.", 3000)
@@ -1462,7 +1636,10 @@ class UR5eRecorderStudio(QMainWindow):
     def _sync_resolution_ui(self, w: int, h: int):
         self.camera_width = w
         self.camera_height = h
-        self.camera_worker.set_resolution(w, h)
+        if self.camera_worker_1 is not None:
+            self.camera_worker_1.set_resolution(w, h)
+        if self.camera_worker_2 is not None:
+            self.camera_worker_2.set_resolution(w, h)
         self.lbl_cam_info.setText(f"Format: {w}x{h} RGB @ {self.target_fps} FPS")
         if hasattr(self, "combo_resolution"):
             self.combo_resolution.blockSignals(True)
@@ -1536,12 +1713,20 @@ class UR5eRecorderStudio(QMainWindow):
         """)
 
     @pyqtSlot(int, np.ndarray)
+    def on_cam1_frame_received(self, cam_id: int, frame: np.ndarray):
+        self.latest_camera_frame_1 = frame
+        self.latest_camera_frame = frame
+        self.cam_widget_1.update_frame(cam_id, frame)
+
+    @pyqtSlot(int, np.ndarray)
+    def on_cam2_frame_received(self, cam_id: int, frame: np.ndarray):
+        self.latest_camera_frame_2 = frame
+        self.cam_widget_2.update_frame(cam_id, frame)
+
+    @pyqtSlot(int, np.ndarray)
     def on_frame_received(self, cam_id: int, frame: np.ndarray):
-        if cam_id == self.camera_index:
-            self.latest_camera_frame = frame
-            self.cam_widget_1.update_frame(cam_id, frame)
-        elif cam_id == 0 and self.cam_widget_2.isVisible():
-            self.cam_widget_2.update_frame(cam_id, frame)
+        # Backwards compatibility slot
+        self.on_cam1_frame_received(cam_id, frame)
 
     @pyqtSlot(int, bool, str)
     def on_camera_status(self, cam_id: int, is_connected: bool, message: str):
@@ -1736,9 +1921,15 @@ class UR5eRecorderStudio(QMainWindow):
         self.recorded_frames_count = 0
         self.current_episode_buffer.clear()
 
-        # Disable resolution switching during active demonstration
+        # Disable resolution and camera controls during active demonstration
         if hasattr(self, "combo_resolution"):
             self.combo_resolution.setEnabled(False)
+        if hasattr(self, "combo_cam1"):
+            self.combo_cam1.setEnabled(False)
+        if hasattr(self, "combo_cam2"):
+            self.combo_cam2.setEnabled(False)
+        if hasattr(self, "btn_toggle_cam2"):
+            self.btn_toggle_cam2.setEnabled(False)
 
         # Update UI Controls to Active Recording State
         self.btn_record.setText("⏸  END EPISODE (Space)")
@@ -1783,23 +1974,36 @@ class UR5eRecorderStudio(QMainWindow):
         joints = self.robot_worker.get_latest_joints()
         q_vals = np.array([joints[j] for j in UR5E_JOINTS], dtype=np.float32)
 
-        if self.latest_camera_frame is not None:
-            raw_frame = self.latest_camera_frame
-            if raw_frame.shape[1] != self.camera_width or raw_frame.shape[0] != self.camera_height:
-                raw_frame = cv2.resize(raw_frame, (self.camera_width, self.camera_height), interpolation=cv2.INTER_AREA)
-            img = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
+        # Primary Camera (Workspace)
+        cam1_frame = self.latest_camera_frame_1 if self.latest_camera_frame_1 is not None else self.latest_camera_frame
+        if cam1_frame is not None:
+            raw_1 = cam1_frame
+            if raw_1.shape[1] != self.camera_width or raw_1.shape[0] != self.camera_height:
+                raw_1 = cv2.resize(raw_1, (self.camera_width, self.camera_height), interpolation=cv2.INTER_AREA)
+            img_workspace = cv2.cvtColor(raw_1, cv2.COLOR_BGR2RGB)
         else:
-            img = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
+            img_workspace = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
 
         task_text = self.txt_task_desc.text().strip() or "Pick and place demonstration"
 
         frame_data = {
             "observation.state": q_vals,
             "action": q_vals,
-            "observation.images.workspace": img,
+            "observation.images.workspace": img_workspace,
             "task": task_text,
             "timestamp": time.perf_counter() - (self.record_start_time or time.perf_counter()),
         }
+
+        # Secondary Camera (Wrist Flange) if dual mode is active
+        if self.enable_dual_cameras:
+            if self.latest_camera_frame_2 is not None:
+                raw_2 = self.latest_camera_frame_2
+                if raw_2.shape[1] != self.camera_width or raw_2.shape[0] != self.camera_height:
+                    raw_2 = cv2.resize(raw_2, (self.camera_width, self.camera_height), interpolation=cv2.INTER_AREA)
+                img_wrist = cv2.cvtColor(raw_2, cv2.COLOR_BGR2RGB)
+            else:
+                img_wrist = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
+            frame_data["observation.images.wrist"] = img_wrist
 
         self.current_episode_buffer.append(frame_data)
         self.recorded_frames_count += 1
@@ -1859,6 +2063,12 @@ class UR5eRecorderStudio(QMainWindow):
             self.btn_stop_session.setEnabled(True)
             if hasattr(self, "combo_resolution"):
                 self.combo_resolution.setEnabled(True)
+            if hasattr(self, "combo_cam1"):
+                self.combo_cam1.setEnabled(True)
+            if hasattr(self, "combo_cam2"):
+                self.combo_cam2.setEnabled(True)
+            if hasattr(self, "btn_toggle_cam2"):
+                self.btn_toggle_cam2.setEnabled(True)
             self.btn_record.setText("▶  START EPISODE (Space)")
             self.btn_record.setStyleSheet("""
                 QPushButton {
@@ -1886,6 +2096,12 @@ class UR5eRecorderStudio(QMainWindow):
         self.cam_widget_2.set_recording(False)
         if hasattr(self, "combo_resolution"):
             self.combo_resolution.setEnabled(True)
+        if hasattr(self, "combo_cam1"):
+            self.combo_cam1.setEnabled(True)
+        if hasattr(self, "combo_cam2"):
+            self.combo_cam2.setEnabled(True)
+        if hasattr(self, "btn_toggle_cam2"):
+            self.btn_toggle_cam2.setEnabled(True)
 
         discarded_count = len(self.current_episode_buffer)
         self.current_episode_buffer.clear()
@@ -1964,6 +2180,9 @@ class UR5eRecorderStudio(QMainWindow):
                     if len(cam_shape) == 3:
                         h, w = cam_shape[0], cam_shape[1]
                         self._sync_resolution_ui(w, h)
+                    has_wrist = "observation.images.wrist" in meta.get("features", {})
+                    if has_wrist != self.enable_dual_cameras:
+                        self.set_dual_cameras_enabled(has_wrist)
             except Exception as e:
                 print(f"[WARNING] Could not parse {meta_info_file}: {e}")
 
@@ -2022,6 +2241,12 @@ class UR5eRecorderStudio(QMainWindow):
                 "names": ["height", "width", "channels"],
             },
         }
+        if self.enable_dual_cameras:
+            features["observation.images.wrist"] = {
+                "dtype": "video",
+                "shape": (self.camera_height, self.camera_width, 3),
+                "names": ["height", "width", "channels"],
+            }
 
         # Check if an existing info.json is a valid LeRobot metadata file
         is_valid_lerobot = False
@@ -2036,6 +2261,9 @@ class UR5eRecorderStudio(QMainWindow):
                     if len(cam_shape) == 3:
                         h, w = cam_shape[0], cam_shape[1]
                         self._sync_resolution_ui(w, h)
+                    has_wrist = "observation.images.wrist" in meta.get("features", {})
+                    if has_wrist != self.enable_dual_cameras:
+                        self.set_dual_cameras_enabled(has_wrist)
             except Exception:
                 is_valid_lerobot = False
 
@@ -2049,7 +2277,8 @@ class UR5eRecorderStudio(QMainWindow):
                     print(f"[DATASET] Cleaning pre-existing empty/invalid folder at {self.dataset_root.resolve()} for fresh creation...")
                     shutil.rmtree(self.dataset_root)
 
-                print(f"[DATASET] Creating fresh LeRobot dataset at: {self.dataset_root.resolve()} ({self.camera_width}x{self.camera_height})")
+                mode_desc = "Workspace + Wrist (Dual Cam)" if self.enable_dual_cameras else "Workspace (Single Cam)"
+                print(f"[DATASET] Creating fresh LeRobot dataset at: {self.dataset_root.resolve()} [{mode_desc}] ({self.camera_width}x{self.camera_height})")
                 self.active_dataset = LeRobotDataset.create(
                     repo_id=repo_id,
                     fps=self.target_fps,
@@ -2080,16 +2309,23 @@ class UR5eRecorderStudio(QMainWindow):
                         ),
                         "task": task_str,
                     }
+                    if "observation.images.wrist" in frame:
+                        t_frame["observation.images.wrist"] = torch.from_numpy(
+                            np.ascontiguousarray(frame["observation.images.wrist"], dtype=np.uint8)
+                        )
                     dataset.add_frame(t_frame)
 
                 dataset.save_episode()
                 # Immediately finalize so parquet footers and meta/episodes are completely written to disk
                 dataset.finalize()
                 total_episodes_saved = dataset.num_episodes
+                has_wrist = self.enable_dual_cameras
                 self.active_dataset = None  # Reset instance so next episode cleanly resumes via LeRobotDataset.resume()
                 print(f"[DATASET] ✔ LeRobot episode #{ep_idx:04d} written and finalized successfully ({num_frames} frames)!")
                 print(f"          • Telemetry Parquet: {self.dataset_root / 'data'}")
-                print(f"          • Workspace Video:   {self.dataset_root / 'videos'}")
+                print(f"          • Workspace Video:   {self.dataset_root / 'videos' / 'observation.images.workspace'}")
+                if has_wrist:
+                    print(f"          • Wrist Video:       {self.dataset_root / 'videos' / 'observation.images.wrist'}")
                 print(f"          • Metadata Episodes: {self.dataset_root / 'meta' / 'episodes'}")
                 print(f"          • Total episodes:    {total_episodes_saved}")
             else:
@@ -2254,7 +2490,10 @@ class UR5eRecorderStudio(QMainWindow):
             self.diagnostic_worker.terminate_process()
 
         # Stop workers
-        self.camera_worker.stop()
+        if self.camera_worker_1 is not None:
+            self.camera_worker_1.stop()
+        if self.camera_worker_2 is not None:
+            self.camera_worker_2.stop()
         self.robot_worker.stop()
 
         if self.active_dataset is not None:
@@ -2278,7 +2517,9 @@ class UR5eRecorderStudio(QMainWindow):
 def parse_args():
     parser = argparse.ArgumentParser(description="UR5e LeRobot Demonstration Dataset Studio")
     parser.add_argument("--robot-ip", type=str, default=DEFAULT_ROBOT_IP, help=f"UR5e PolyScope IP (default: {DEFAULT_ROBOT_IP})")
-    parser.add_argument("--camera-index", type=int, default=DEFAULT_CAMERA_INDEX, help=f"OpenCV Camera index (default: {DEFAULT_CAMERA_INDEX})")
+    parser.add_argument("--camera-index", type=int, default=DEFAULT_CAMERA_INDEX, help=f"OpenCV Camera 1 index (default: {DEFAULT_CAMERA_INDEX})")
+    parser.add_argument("--camera2-index", type=int, default=DEFAULT_CAMERA_2_INDEX, help=f"OpenCV Camera 2 index (default: {DEFAULT_CAMERA_2_INDEX})")
+    parser.add_argument("--dual-cam", action="store_true", help="Launch with secondary camera stream enabled")
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS, help=f"Target camera and recording FPS (default: {DEFAULT_FPS})")
     parser.add_argument("--mock", action="store_true", help="Launch in Simulation/Mock mode without physical UR5e or USB camera")
     return parser.parse_args()
@@ -2293,6 +2534,8 @@ def main():
     studio = UR5eRecorderStudio(
         robot_ip=args.robot_ip,
         camera_index=args.camera_index,
+        camera_2_index=args.camera2_index,
+        dual_cam=args.dual_cam,
         fps=args.fps,
         mock=args.mock,
     )

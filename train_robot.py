@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""
+UR5e LeRobot Local Demonstration Training Script
+=================================================
+Trains imitation learning policies (ACT, Diffusion Policy, VQ-BeT) on locally recorded
+UR5e demonstration datasets using Hugging Face's LeRobot framework.
+
+Designed to be simple and straightforward to configure via top-of-file constants or CLI,
+while modular enough to be seamlessly wrapped by a graphical user interface (GUI).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime
+import json
+import os
+from pathlib import Path
+import random
+import sys
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+
+# Try importing LeRobot components
+try:
+    import lerobot
+    from lerobot.configs import FeatureType
+    from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
+    from lerobot.policies import make_pre_post_processors
+    from lerobot.policies.act import ACTConfig, ACTPolicy
+    from lerobot.utils.feature_utils import dataset_to_policy_features
+    LEROBOT_AVAILABLE = True
+except ImportError as e:
+    LEROBOT_AVAILABLE = False
+    LEROBOT_IMPORT_ERROR = str(e)
+
+
+# =============================================================================
+# 1. User Configuration & Hyperparameters (Adjust freely here)
+# =============================================================================
+
+# Path to local dataset folder (relative to this script or absolute)
+DATASET_PATH = "datasets/object_detection_test"
+
+# Available Policy Architectures
+AVAILABLE_POLICIES = [
+    "act",        # [0] Recommended: Action Chunking with Transformers (fast, handles multi-modal arm tasks)
+    "diffusion",  # [1] Diffusion Policy (requires 'diffusers' package: pip install diffusers)
+    "vqbet",      # [2] Vector-Quantized Behavior Transformer
+]
+SELECTED_POLICY_INDEX = 0  # <--- Select policy by index (0: ACT, 1: Diffusion, 2: VQ-BeT)
+
+# Available Optimizers
+AVAILABLE_OPTIMIZERS = [
+    "AdamW",      # [0] Standard for Transformers / ACT (adaptive with decoupled weight decay)
+    "Adam",       # [1] Standard adaptive optimizer
+    "SGD",        # [2] Stochastic Gradient Descent with momentum
+]
+SELECTED_OPTIMIZER_INDEX = 0  # <--- Select optimizer by index (0: AdamW, 1: Adam, 2: SGD)
+
+# Training Hyperparameters
+TRAINING_STEPS = 5000         # Total optimization steps
+BATCH_SIZE = 16               # Samples per training batch (RTX 3080 16GB handles 16-64 easily)
+LEARNING_RATE = 1e-4          # Initial optimizer learning rate
+WEIGHT_DECAY = 1e-4           # L2 regularization weight decay
+GRAD_CLIP_NORM = 10.0         # Gradient clipping max norm to prevent exploding gradients
+
+# Checkpoint & Disk Space Management
+# Overwrites the same folder every save to prevent gigabytes of redundant copies
+SAVE_CHECKPOINT_FREQ = 500    # Save policy weights every N steps
+OUTPUT_DIR = "outputs/train/ur5e_policy"  # Directory for model checkpoint, logs, and plots
+
+# Validation & Evaluation
+VAL_SPLIT_RATIO = 0.1         # Reserve 10% of frames/episodes for validation
+EVAL_FREQ = 250               # Compute validation loss every N steps
+
+# Logging & Hardware
+LOG_FREQ = 10                 # Console progress print interval (in steps)
+NUM_WORKERS = 4               # DataLoader background subprocess workers (0 for single-thread)
+SEED = 42                     # Random seed for reproducibility
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# =============================================================================
+# 2. Helper Functions: Timestamps, Plotting & Logging
+# =============================================================================
+
+def set_seed(seed: int):
+    """Sets random seeds across Python, NumPy, and PyTorch for deterministic training."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def make_delta_timestamps(delta_indices: list[int] | None, fps: int) -> list[float]:
+    """Converts relative frame delta indices into floating-point second offsets."""
+    if delta_indices is None:
+        return [0.0]
+    return [i / fps for i in delta_indices]
+
+
+def plot_loss_curve(
+    log_file: Path,
+    output_png: Path,
+    policy_name: str,
+    steps_data: List[int],
+    train_loss_data: List[float],
+    val_loss_data: List[Tuple[int, float]],
+):
+    """
+    Renders the training & validation loss curves to a PNG image.
+    Prefers Matplotlib if installed; otherwise falls back cleanly to a built-in
+    OpenCV/PIL chart renderer so no extra package installation is mandatory.
+    """
+    if not steps_data or not train_loss_data:
+        return
+
+    # Option A: Use Matplotlib if available
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # Headless backend
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(9, 5), dpi=120)
+        plt.style.use("dark_background")
+
+        plt.plot(steps_data, train_loss_data, label="Train Loss", color="#38bdf8", alpha=0.85, linewidth=1.8)
+
+        if val_loss_data:
+            val_steps, val_losses = zip(*val_loss_data)
+            plt.plot(val_steps, val_losses, label="Val Loss", color="#f59e0b", marker="o", markersize=4, linewidth=2.0)
+
+        plt.title(f"UR5e Imitation Learning — {policy_name.upper()} Policy Training", fontsize=13, fontweight="bold", pad=12)
+        plt.xlabel("Optimization Step", fontsize=11)
+        plt.ylabel("Loss", fontsize=11)
+        plt.grid(True, linestyle="--", alpha=0.3, color="#475569")
+        plt.legend(loc="upper right", framealpha=0.8)
+        plt.tight_layout()
+        plt.savefig(output_png)
+        plt.close()
+        return
+    except ImportError:
+        pass
+
+    # Option B: Built-in OpenCV fallback renderer (always available in current environment)
+    try:
+        import cv2
+
+        w, h = 900, 500
+        canvas = np.full((h, w, 3), (30, 24, 15), dtype=np.uint8)  # Dark slate background #0f172a
+
+        margin_left, margin_right = 80, 50
+        margin_top, margin_bottom = 70, 70
+        plot_w = w - margin_left - margin_right
+        plot_h = h - margin_top - margin_bottom
+
+        # Filter valid finite losses
+        valid_losses = [l for l in train_loss_data if np.isfinite(l)]
+        if not valid_losses:
+            return
+
+        min_loss = max(0.0, min(valid_losses) * 0.9)
+        max_loss = max(valid_losses) * 1.1 if max(valid_losses) > min_loss else min_loss + 1.0
+        max_step = max(steps_data) if max(steps_data) > 0 else 1
+
+        # Draw grid
+        for i in range(5):
+            gy = int(margin_top + i * (plot_h / 4))
+            val_y = max_loss - i * ((max_loss - min_loss) / 4)
+            cv2.line(canvas, (margin_left, gy), (w - margin_right, gy), (50, 45, 35), 1)
+            cv2.putText(canvas, f"{val_y:.2f}", (10, gy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
+
+        # Draw Axes
+        cv2.line(canvas, (margin_left, margin_top), (margin_left, h - margin_bottom), (180, 180, 180), 2)
+        cv2.line(canvas, (margin_left, h - margin_bottom), (w - margin_right, h - margin_bottom), (180, 180, 180), 2)
+
+        # Plot training loss line
+        pts = []
+        for step, l in zip(steps_data, train_loss_data):
+            if not np.isfinite(l):
+                continue
+            px = int(margin_left + (step / max_step) * plot_w)
+            norm_y = (l - min_loss) / (max_loss - min_loss)
+            py = int((h - margin_bottom) - np.clip(norm_y, 0.0, 1.0) * plot_h)
+            pts.append([px, py])
+
+        if len(pts) > 1:
+            cv2.polylines(canvas, [np.array(pts, dtype=np.int32)], False, (248, 189, 56), 2, cv2.LINE_AA)
+
+        # Plot validation points if present
+        for v_step, v_loss in val_loss_data:
+            if not np.isfinite(v_loss):
+                continue
+            px = int(margin_left + (v_step / max_step) * plot_w)
+            norm_y = (v_loss - min_loss) / (max_loss - min_loss)
+            py = int((h - margin_bottom) - np.clip(norm_y, 0.0, 1.0) * plot_h)
+            cv2.circle(canvas, (px, py), 5, (11, 158, 245), -1, cv2.LINE_AA)
+
+        # Labels & Header
+        title = f"UR5e Policy Training: {policy_name.upper()} Loss Curve"
+        cv2.putText(canvas, title, (margin_left, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+        cv2.putText(canvas, f"Step (Total: {max_step})", (w // 2 - 50, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+        # Legend
+        cv2.line(canvas, (w - 280, 35), (w - 240, 35), (248, 189, 56), 2)
+        cv2.putText(canvas, "Train Loss", (w - 230, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        if val_loss_data:
+            cv2.circle(canvas, (w - 150, 35), 5, (11, 158, 245), -1)
+            cv2.putText(canvas, "Val Loss", (w - 140, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        cv2.imwrite(str(output_png), canvas)
+    except Exception as e:
+        print(f"[LOG] Note: Loss curve image generation skipped ({e}). Metrics saved in CSV.")
+
+
+# =============================================================================
+# 3. Modular RobotTrainer Class
+# =============================================================================
+
+class RobotTrainer:
+    """
+    Core imitation learning training manager for UR5e LeRobot datasets.
+    Can be invoked from CLI or embedded directly in a PyQt GUI QThread.
+    """
+
+    def __init__(
+        self,
+        dataset_path: str | Path,
+        policy_name: str = "act",
+        optimizer_name: str = "AdamW",
+        training_steps: int = 5000,
+        batch_size: int = 16,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-4,
+        grad_clip_norm: float = 10.0,
+        save_checkpoint_freq: int = 500,
+        log_freq: int = 10,
+        eval_freq: int = 250,
+        val_split_ratio: float = 0.1,
+        output_dir: str | Path = "outputs/train/ur5e_policy",
+        device: str = "cuda",
+        num_workers: int = 4,
+        seed: int = 42,
+        step_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ):
+        if not LEROBOT_AVAILABLE:
+            raise RuntimeError(f"LeRobot could not be loaded in this Python environment: {LEROBOT_IMPORT_ERROR}")
+
+        self.dataset_path = Path(dataset_path).resolve()
+        self.policy_name = policy_name.lower().strip()
+        self.optimizer_name = optimizer_name.strip()
+        self.training_steps = int(training_steps)
+        self.batch_size = int(batch_size)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.grad_clip_norm = float(grad_clip_norm)
+        self.save_checkpoint_freq = int(save_checkpoint_freq)
+        self.log_freq = int(log_freq)
+        self.eval_freq = int(eval_freq)
+        self.val_split_ratio = float(val_split_ratio)
+        self.output_dir = Path(output_dir).resolve()
+        self.device = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
+        self.num_workers = int(num_workers)
+        self.seed = int(seed)
+        self.step_callback = step_callback
+
+        # Internal state
+        self.is_aborted = False
+        self.checkpoint_dir = self.output_dir / "checkpoint"
+        self.log_csv_file = self.output_dir / "train_log.csv"
+        self.loss_plot_file = self.output_dir / "loss_curve.png"
+
+        # History tracking
+        self.history_steps: List[int] = []
+        self.history_train_loss: List[float] = []
+        self.history_val_loss: List[Tuple[int, float]] = []
+
+    def abort(self):
+        """Signals the training loop to safely stop early."""
+        self.is_aborted = True
+
+    def _validate_dataset(self) -> LeRobotDatasetMetadata:
+        """Verifies existence of dataset metadata, files, and camera features."""
+        if not self.dataset_path.exists():
+            raise FileNotFoundError(
+                f"Dataset directory not found at: {self.dataset_path}\n"
+                f"Please ensure you record demonstrations using 'python gui_recorder.py' first."
+            )
+
+        info_file = self.dataset_path / "meta" / "info.json"
+        if not info_file.exists():
+            raise FileNotFoundError(
+                f"Missing 'meta/info.json' at {self.dataset_path}.\n"
+                f"The folder does not appear to be a valid finalized LeRobot dataset."
+            )
+
+        repo_id = f"local/{self.dataset_path.name}"
+        meta = LeRobotDatasetMetadata(repo_id, root=self.dataset_path)
+
+        if meta.total_episodes <= 0 or meta.total_frames <= 0:
+            raise ValueError(f"Dataset '{self.dataset_path.name}' has 0 episodes or frames recorded.")
+
+        return meta
+
+    def _build_policy_config(self, meta: LeRobotDatasetMetadata) -> Tuple[Any, Any, Any]:
+        """Constructs policy configuration, policy model, and pre/post processors."""
+        features = dataset_to_policy_features(meta.features)
+        output_features = {k: ft for k, ft in features.items() if ft.type is FeatureType.ACTION}
+        input_features = {k: ft for k, ft in features.items() if k not in output_features}
+
+        print(f"[POLICY] Identified Input Features:  {list(input_features.keys())}")
+        print(f"[POLICY] Identified Output Features: {list(output_features.keys())}")
+
+        if self.policy_name == "act":
+            cfg = ACTConfig(input_features=input_features, output_features=output_features)
+            policy = ACTPolicy(cfg)
+        elif self.policy_name == "diffusion":
+            try:
+                from lerobot.policies.diffusion import DiffusionConfig, DiffusionPolicy
+            except ImportError as err:
+                raise ImportError(
+                    "Diffusion Policy requires the 'diffusers' library.\n"
+                    "Install it in your environment using: pip install diffusers\n"
+                    f"Original error: {err}"
+                )
+            cfg = DiffusionConfig(input_features=input_features, output_features=output_features)
+            policy = DiffusionPolicy(cfg)
+        elif self.policy_name == "vqbet":
+            try:
+                from lerobot.policies.vqbet import VQBeTConfig, VQBeTPolicy
+            except ImportError as err:
+                raise ImportError(
+                    f"VQ-BeT Policy dependencies missing: {err}\n"
+                    "Ensure torchvision and transformers are up to date."
+                )
+            cfg = VQBeTConfig(input_features=input_features, output_features=output_features)
+            policy = VQBeTPolicy(cfg)
+        else:
+            raise ValueError(
+                f"Unsupported policy '{self.policy_name}'. Choose from: {AVAILABLE_POLICIES}"
+            )
+
+        preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=meta.stats)
+        return cfg, policy, (preprocessor, postprocessor)
+
+    def _build_optimizer(self, policy: nn.Module) -> torch.optim.Optimizer:
+        """Instantiates the selected PyTorch optimizer."""
+        params = [p for p in policy.parameters() if p.requires_grad]
+
+        opt_name = self.optimizer_name.upper()
+        if opt_name == "ADAMW":
+            return torch.optim.AdamW(params, lr=self.learning_rate, weight_decay=self.weight_decay)
+        elif opt_name == "ADAM":
+            return torch.optim.Adam(params, lr=self.learning_rate, weight_decay=self.weight_decay)
+        elif opt_name == "SGD":
+            return torch.optim.SGD(params, lr=self.learning_rate, momentum=0.9, weight_decay=self.weight_decay)
+        else:
+            print(f"[WARNING] Unknown optimizer '{self.optimizer_name}'. Defaulting to AdamW.")
+            return torch.optim.AdamW(params, lr=self.learning_rate, weight_decay=self.weight_decay)
+
+    def _save_checkpoint(self, policy: Any, preprocessor: Any, postprocessor: Any, step: int):
+        """
+        Saves the model weights and processors to disk.
+        Overwrites the same directory every time to minimize disk consumption.
+        """
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n[CHECKPOINT] Saving latest policy weights to: {self.checkpoint_dir} (Step {step})")
+
+        # Save model and normalization processors
+        policy.save_pretrained(self.checkpoint_dir)
+        preprocessor.save_pretrained(self.checkpoint_dir)
+        postprocessor.save_pretrained(self.checkpoint_dir)
+
+        # Save metadata info file
+        info_dict = {
+            "policy_type": self.policy_name,
+            "step": step,
+            "training_steps": self.training_steps,
+            "dataset": str(self.dataset_path.name),
+            "updated_at": datetime.datetime.now().isoformat(),
+        }
+        with open(self.checkpoint_dir / "training_info.json", "w") as f:
+            json.dump(info_dict, f, indent=2)
+
+        # Update visual loss curve plot
+        plot_loss_curve(
+            self.log_csv_file,
+            self.loss_plot_file,
+            self.policy_name,
+            self.history_steps,
+            self.history_train_loss,
+            self.history_val_loss,
+        )
+        print(f"[CHECKPOINT] ✔ In-place checkpoint & loss plot saved ({self.loss_plot_file.name}).")
+
+    def run_training(self) -> Dict[str, Any]:
+        """Executes the complete offline imitation learning training loop."""
+        set_seed(self.seed)
+        start_time = time.time()
+
+        print("\n" + "=" * 70)
+        print("  UR5e LeRobot Imitation Learning Training Engine")
+        print("=" * 70)
+        print(f"  • Dataset:           {self.dataset_path}")
+        print(f"  • Selected Policy:   {self.policy_name.upper()}")
+        print(f"  • Optimizer:         {self.optimizer_name} (lr={self.learning_rate}, wd={self.weight_decay})")
+        print(f"  • Total Steps:       {self.training_steps:,}")
+        print(f"  • Batch Size:        {self.batch_size}")
+        print(f"  • Device:            {self.device} ({torch.cuda.get_device_name(0) if self.device.type == 'cuda' else 'CPU'})")
+        print(f"  • Save Interval:     Every {self.save_checkpoint_freq} steps (In-place overwrite)")
+        print(f"  • Output Directory:  {self.output_dir}")
+        print("=" * 70 + "\n")
+
+        # 1. Dataset Verification
+        meta = self._validate_dataset()
+        print(f"[DATASET] Loaded '{self.dataset_path.name}': {meta.total_episodes} episodes, {meta.total_frames} frames @ {meta.fps} FPS")
+
+        # 2. Policy Setup
+        cfg, policy, (preprocessor, postprocessor) = self._build_policy_config(meta)
+        policy.to(self.device)
+        policy.train()
+        total_params = sum(p.numel() for p in policy.parameters())
+        trainable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+        print(f"[MODEL] Policy initialized. Total parameters: {total_params:,} (Trainable: {trainable_params:,})")
+
+        # 3. Delta Timestamps Alignment
+        delta_timestamps = {
+            "action": make_delta_timestamps(getattr(cfg, "action_delta_indices", None), meta.fps),
+        }
+        if hasattr(cfg, "image_features") and cfg.image_features:
+            for k in cfg.image_features:
+                delta_timestamps[k] = make_delta_timestamps(getattr(cfg, "observation_delta_indices", None), meta.fps)
+
+        # 4. Instantiate LeRobotDataset
+        repo_id = f"local/{self.dataset_path.name}"
+        dataset = LeRobotDataset(repo_id, root=self.dataset_path, delta_timestamps=delta_timestamps)
+        total_samples = len(dataset)
+        print(f"[DATASET] Ready with {total_samples} temporal-aligned samples.")
+
+        # 5. Train / Validation Split
+        indices = list(range(total_samples))
+        random.shuffle(indices)
+        num_val = int(total_samples * self.val_split_ratio) if self.val_split_ratio > 0 and total_samples > 10 else 0
+
+        val_dataset = None
+        if num_val > 0:
+            val_indices = indices[:num_val]
+            train_indices = indices[num_val:]
+            train_dataset = Subset(dataset, train_indices)
+            val_dataset = Subset(dataset, val_indices)
+            print(f"[SPLIT] Train samples: {len(train_dataset)} | Validation samples: {len(val_dataset)}")
+        else:
+            train_dataset = dataset
+            print(f"[SPLIT] Using all {len(train_dataset)} samples for training.")
+
+        # 6. DataLoaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=(self.device.type == "cuda"),
+            drop_last=(len(train_dataset) > self.batch_size),
+        )
+
+        val_loader = None
+        if val_dataset is not None:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=max(0, min(2, self.num_workers)),
+                pin_memory=(self.device.type == "cuda"),
+                drop_last=False,
+            )
+
+        # 7. Optimizer Setup
+        optimizer = self._build_optimizer(policy)
+
+        # 8. Setup Output Logging Directory & CSV
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.log_csv_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "train_loss", "val_loss", "learning_rate", "elapsed_sec", "steps_per_sec"])
+
+        # 9. Main Optimization Loop
+        print("\n[TRAIN] >>> Commencing Optimization Steps <<<")
+        step = 0
+        running_loss = 0.0
+        log_window_steps = 0
+        step_start_time = time.time()
+        train_iter = iter(train_loader)
+
+        while step < self.training_steps and not self.is_aborted:
+            step += 1
+
+            # Fetch next batch (loop dataloader infinitely across epochs)
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
+
+            # Preprocess (normalization & tensor device transfer)
+            batch = preprocessor(batch)
+            batch = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+            # Forward & Backward Pass
+            optimizer.zero_grad()
+            loss, _ = policy.forward(batch)
+            loss_val = loss.item()
+            loss.backward()
+
+            # Gradient Clipping & Optimizer Step
+            if self.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), self.grad_clip_norm)
+            optimizer.step()
+
+            running_loss += loss_val
+            log_window_steps += 1
+
+            # Periodic Validation Check
+            val_loss_scalar: Optional[float] = None
+            if val_loader is not None and (step % self.eval_freq == 0 or step == self.training_steps):
+                policy.eval()
+                val_losses = []
+                with torch.no_grad():
+                    for v_batch in val_loader:
+                        v_batch = preprocessor(v_batch)
+                        v_batch = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in v_batch.items()}
+                        v_loss, _ = policy.forward(v_batch)
+                        val_losses.append(v_loss.item())
+                if val_losses:
+                    val_loss_scalar = float(np.mean(val_losses))
+                    self.history_val_loss.append((step, val_loss_scalar))
+                policy.train()
+
+            # Logging & Progress Display
+            if step % self.log_freq == 0 or step == self.training_steps:
+                avg_train_loss = running_loss / max(1, log_window_steps)
+                self.history_steps.append(step)
+                self.history_train_loss.append(avg_train_loss)
+
+                now = time.time()
+                elapsed = now - start_time
+                steps_per_sec = log_window_steps / max(1e-5, (now - step_start_time))
+                remaining_steps = self.training_steps - step
+                eta_sec = remaining_steps / max(1e-5, steps_per_sec)
+                eta_str = str(datetime.timedelta(seconds=int(eta_sec)))
+
+                # Write to CSV log
+                with open(self.log_csv_file, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        step,
+                        f"{avg_train_loss:.5f}",
+                        f"{val_loss_scalar:.5f}" if val_loss_scalar is not None else "",
+                        f"{self.learning_rate:.6e}",
+                        f"{elapsed:.1f}",
+                        f"{steps_per_sec:.2f}",
+                    ])
+
+                # Console line
+                val_text = f" | val_loss: {val_loss_scalar:.4f}" if val_loss_scalar is not None else ""
+                print(
+                    f"[Step {step:5d}/{self.training_steps}] "
+                    f"train_loss: {avg_train_loss:.4f}{val_text} | "
+                    f"Speed: {steps_per_sec:.1f} steps/s | "
+                    f"ETA: {eta_str}"
+                )
+
+                if self.step_callback is not None:
+                    self.step_callback({
+                        "step": step,
+                        "total_steps": self.training_steps,
+                        "train_loss": avg_train_loss,
+                        "val_loss": val_loss_scalar,
+                        "steps_per_sec": steps_per_sec,
+                        "eta_sec": eta_sec,
+                    })
+
+                running_loss = 0.0
+                log_window_steps = 0
+                step_start_time = time.time()
+
+            # In-Place Periodic Checkpointing
+            if step % self.save_checkpoint_freq == 0 or step == self.training_steps:
+                self._save_checkpoint(policy, preprocessor, postprocessor, step)
+
+        total_time = time.time() - start_time
+        status = "ABORTED" if self.is_aborted else "COMPLETED"
+        print("\n" + "=" * 70)
+        print(f"  Training {status} in {datetime.timedelta(seconds=int(total_time))}")
+        print(f"  • Final Model Saved: {self.checkpoint_dir}")
+        print(f"  • Loss Curve:        {self.loss_plot_file}")
+        print(f"  • CSV Metrics Log:   {self.log_csv_file}")
+        print("=" * 70 + "\n")
+
+        return {
+            "status": status,
+            "steps_completed": step,
+            "final_checkpoint": str(self.checkpoint_dir),
+            "loss_plot": str(self.loss_plot_file),
+            "csv_log": str(self.log_csv_file),
+            "total_time_s": total_time,
+        }
+
+
+# =============================================================================
+# 4. Command Line Interface (CLI) & Script Entrypoint
+# =============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train UR5e Imitation Learning Policy (LeRobot)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--dataset", type=str, default=DATASET_PATH, help="Path to local LeRobot dataset folder")
+    parser.add_argument(
+        "--policy",
+        type=str,
+        default=AVAILABLE_POLICIES[SELECTED_POLICY_INDEX],
+        choices=AVAILABLE_POLICIES,
+        help=f"Policy architecture to train (options: {AVAILABLE_POLICIES})",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default=AVAILABLE_OPTIMIZERS[SELECTED_OPTIMIZER_INDEX],
+        choices=AVAILABLE_OPTIMIZERS,
+        help=f"Optimizer to use (options: {AVAILABLE_OPTIMIZERS})",
+    )
+    parser.add_argument("--steps", type=int, default=TRAINING_STEPS, help="Number of training optimization steps")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size per training step")
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="Learning rate")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="L2 weight decay")
+    parser.add_argument("--save-freq", type=int, default=SAVE_CHECKPOINT_FREQ, help="Checkpoint save step frequency (in-place overwrite)")
+    parser.add_argument("--log-freq", type=int, default=LOG_FREQ, help="Console logging interval")
+    parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR, help="Output directory for model weights and loss curves")
+    parser.add_argument("--device", type=str, default=DEVICE, help="Execution device (cuda or cpu)")
+    parser.add_argument("--workers", type=int, default=NUM_WORKERS, help="DataLoader subprocess workers")
+    parser.add_argument("--seed", type=int, default=SEED, help="Random seed for reproducibility")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    trainer = RobotTrainer(
+        dataset_path=args.dataset,
+        policy_name=args.policy,
+        optimizer_name=args.optimizer,
+        training_steps=args.steps,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        save_checkpoint_freq=args.save_freq,
+        log_freq=args.log_freq,
+        output_dir=args.output_dir,
+        device=args.device,
+        num_workers=args.workers,
+        seed=args.seed,
+    )
+
+    try:
+        trainer.run_training()
+    except KeyboardInterrupt:
+        print("\n[TRAIN] Training interrupted by user (Ctrl+C). Saving emergency checkpoint...")
+        trainer.abort()
+
+
+if __name__ == "__main__":
+    main()
+

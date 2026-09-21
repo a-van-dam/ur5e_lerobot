@@ -15,6 +15,7 @@ import argparse
 import csv
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -45,8 +46,10 @@ except ImportError as e:
 # 1. User Configuration & Hyperparameters (Adjust freely here)
 # =============================================================================
 
+PROJECT_NAME = "object_detection_test"
+
 # Path to local dataset folder (relative to this script or absolute)
-DATASET_PATH = "datasets/object_detection_test"
+DATASET_PATH = "datasets/" + PROJECT_NAME
 
 # Available Policy Architectures
 AVAILABLE_POLICIES = [
@@ -65,23 +68,27 @@ AVAILABLE_OPTIMIZERS = [
 SELECTED_OPTIMIZER_INDEX = 0  # <--- Select optimizer by index (0: AdamW, 1: Adam, 2: SGD)
 
 # Training Hyperparameters
-TRAINING_STEPS = 5000         # Total optimization steps
-BATCH_SIZE = 16               # Samples per training batch (RTX 3080 16GB handles 16-64 easily)
-LEARNING_RATE = 1e-4          # Initial optimizer learning rate
+TRAINING_STEPS = 30000        # Total optimization steps (increased for robust task mastery)
+BATCH_SIZE = 64               # Samples per training batch (RTX 3080 16GB handles 16-64 easily)
+LEARNING_RATE = 1e-4          # Initial optimizer learning rate for transformer heads
+LR_BACKBONE = 1e-5            # Differential learning rate for pretrained ResNet vision backbone
+LR_MIN = 1e-6                 # Minimum learning rate at end of Cosine Annealing schedule
+WARMUP_STEPS = 1000           # Linear warmup steps to stabilize transformer attention layers
 WEIGHT_DECAY = 1e-4           # L2 regularization weight decay
 GRAD_CLIP_NORM = 10.0         # Gradient clipping max norm to prevent exploding gradients
+USE_AUGMENTATION = True       # Apply mild visual jitter to prevent overfitting to lighting
 
 # Checkpoint & Disk Space Management
 # Overwrites the same folder every save to prevent gigabytes of redundant copies
-SAVE_CHECKPOINT_FREQ = 500    # Save policy weights every N steps
-OUTPUT_DIR = "outputs/train/ur5e_policy"  # Directory for model checkpoint, logs, and plots
+SAVE_CHECKPOINT_FREQ = 2500   # Save policy weights every N steps
+OUTPUT_DIR = "outputs/train/" + PROJECT_NAME  # Directory for model checkpoint, logs, and plots
 
 # Validation & Evaluation
 VAL_SPLIT_RATIO = 0.1         # Reserve 10% of frames/episodes for validation
-EVAL_FREQ = 250               # Compute validation loss every N steps
+EVAL_FREQ = 1000              # Compute validation loss every N steps
 
 # Logging & Hardware
-LOG_FREQ = 10                 # Console progress print interval (in steps)
+LOG_FREQ = 20                 # Console progress print interval (in steps)
 NUM_WORKERS = 4               # DataLoader background subprocess workers (0 for single-thread)
 SEED = 42                     # Random seed for reproducibility
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -236,19 +243,23 @@ class RobotTrainer:
         dataset_path: str | Path,
         policy_name: str = "act",
         optimizer_name: str = "AdamW",
-        training_steps: int = 5000,
-        batch_size: int = 16,
-        learning_rate: float = 1e-4,
-        weight_decay: float = 1e-4,
-        grad_clip_norm: float = 10.0,
-        save_checkpoint_freq: int = 500,
-        log_freq: int = 10,
-        eval_freq: int = 250,
-        val_split_ratio: float = 0.1,
-        output_dir: str | Path = "outputs/train/ur5e_policy",
-        device: str = "cuda",
-        num_workers: int = 4,
-        seed: int = 42,
+        training_steps: int = TRAINING_STEPS,
+        batch_size: int = BATCH_SIZE,
+        learning_rate: float = LEARNING_RATE,
+        lr_backbone: float = LR_BACKBONE,
+        lr_min: float = LR_MIN,
+        warmup_steps: int = WARMUP_STEPS,
+        weight_decay: float = WEIGHT_DECAY,
+        grad_clip_norm: float = GRAD_CLIP_NORM,
+        use_augmentation: bool = USE_AUGMENTATION,
+        save_checkpoint_freq: int = SAVE_CHECKPOINT_FREQ,
+        log_freq: int = LOG_FREQ,
+        eval_freq: int = EVAL_FREQ,
+        val_split_ratio: float = VAL_SPLIT_RATIO,
+        output_dir: str | Path = OUTPUT_DIR,
+        device: str = DEVICE,
+        num_workers: int = NUM_WORKERS,
+        seed: int = SEED,
         step_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         if not LEROBOT_AVAILABLE:
@@ -260,8 +271,12 @@ class RobotTrainer:
         self.training_steps = int(training_steps)
         self.batch_size = int(batch_size)
         self.learning_rate = float(learning_rate)
+        self.lr_backbone = float(lr_backbone)
+        self.lr_min = float(lr_min)
+        self.warmup_steps = int(warmup_steps)
         self.weight_decay = float(weight_decay)
         self.grad_clip_norm = float(grad_clip_norm)
+        self.use_augmentation = bool(use_augmentation)
         self.save_checkpoint_freq = int(save_checkpoint_freq)
         self.log_freq = int(log_freq)
         self.eval_freq = int(eval_freq)
@@ -352,19 +367,39 @@ class RobotTrainer:
         return cfg, policy, (preprocessor, postprocessor)
 
     def _build_optimizer(self, policy: nn.Module) -> torch.optim.Optimizer:
-        """Instantiates the selected PyTorch optimizer."""
-        params = [p for p in policy.parameters() if p.requires_grad]
+        """Instantiates the selected PyTorch optimizer with differential learning rates."""
+        backbone_params = []
+        transformer_params = []
+
+        for name, param in policy.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "backbone" in name:
+                backbone_params.append(param)
+            else:
+                transformer_params.append(param)
+
+        if backbone_params and self.policy_name == "act":
+            print(f"[OPTIMIZER] Using differential learning rates:")
+            print(f"            • Vision Backbone (ResNet): {self.lr_backbone:.1e}")
+            print(f"            • Policy Heads/Transformer: {self.learning_rate:.1e}")
+            param_groups = [
+                {"params": transformer_params, "lr": self.learning_rate, "weight_decay": self.weight_decay},
+                {"params": backbone_params, "lr": self.lr_backbone, "weight_decay": self.weight_decay},
+            ]
+        else:
+            param_groups = [{"params": [p for p in policy.parameters() if p.requires_grad], "lr": self.learning_rate, "weight_decay": self.weight_decay}]
 
         opt_name = self.optimizer_name.upper()
         if opt_name == "ADAMW":
-            return torch.optim.AdamW(params, lr=self.learning_rate, weight_decay=self.weight_decay)
+            return torch.optim.AdamW(param_groups)
         elif opt_name == "ADAM":
-            return torch.optim.Adam(params, lr=self.learning_rate, weight_decay=self.weight_decay)
+            return torch.optim.Adam(param_groups)
         elif opt_name == "SGD":
-            return torch.optim.SGD(params, lr=self.learning_rate, momentum=0.9, weight_decay=self.weight_decay)
+            return torch.optim.SGD(param_groups, momentum=0.9)
         else:
             print(f"[WARNING] Unknown optimizer '{self.optimizer_name}'. Defaulting to AdamW.")
-            return torch.optim.AdamW(params, lr=self.learning_rate, weight_decay=self.weight_decay)
+            return torch.optim.AdamW(param_groups)
 
     def _save_checkpoint(self, policy: Any, preprocessor: Any, postprocessor: Any, step: int):
         """
@@ -482,8 +517,21 @@ class RobotTrainer:
                 drop_last=False,
             )
 
-        # 7. Optimizer Setup
+        # 7. Optimizer & Learning Rate Scheduler Setup
         optimizer = self._build_optimizer(policy)
+
+        # Cosine Annealing Learning Rate Scheduler with Linear Warmup
+        def lr_lambda(current_step: int):
+            if current_step < self.warmup_steps:
+                return float(current_step) / float(max(1, self.warmup_steps))
+            progress = float(current_step - self.warmup_steps) / float(max(1, self.training_steps - self.warmup_steps))
+            cos_mult = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(self.lr_min / self.learning_rate, cos_mult)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        print(f"[SCHEDULER] Cosine Annealing initialized: {self.warmup_steps} warmup steps -> min lr {self.lr_min:.1e}")
+        if self.use_augmentation:
+            print("[AUGMENT] Visual data augmentation active (mild randomized brightness/contrast jitter on GPU).")
 
         # 8. Setup Output Logging Directory & CSV
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -513,6 +561,17 @@ class RobotTrainer:
             batch = preprocessor(batch)
             batch = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
+            # Visual Data Augmentation (mild random brightness/contrast on images)
+            if self.use_augmentation:
+                for k in batch:
+                    if "image" in k and isinstance(batch[k], torch.Tensor) and batch[k].ndim == 4:
+                        bright = 1.0 + (torch.rand(batch[k].shape[0], 1, 1, 1, device=batch[k].device) - 0.5) * 0.25
+                        contrast = 1.0 + (torch.rand(batch[k].shape[0], 1, 1, 1, device=batch[k].device) - 0.5) * 0.25
+                        img = batch[k] * bright
+                        mean = img.mean(dim=(-2, -1), keepdim=True)
+                        img = (img - mean) * contrast + mean
+                        batch[k] = torch.clamp(img, 0.0, 1.0)
+
             # Forward & Backward Pass
             optimizer.zero_grad()
             loss, _ = policy.forward(batch)
@@ -523,6 +582,7 @@ class RobotTrainer:
             if self.grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), self.grad_clip_norm)
             optimizer.step()
+            scheduler.step()
 
             running_loss += loss_val
             log_window_steps += 1
@@ -555,6 +615,7 @@ class RobotTrainer:
                 remaining_steps = self.training_steps - step
                 eta_sec = remaining_steps / max(1e-5, steps_per_sec)
                 eta_str = str(datetime.timedelta(seconds=int(eta_sec)))
+                current_lr = optimizer.param_groups[0]["lr"]
 
                 # Write to CSV log
                 with open(self.log_csv_file, "a", newline="") as f:
@@ -563,7 +624,7 @@ class RobotTrainer:
                         step,
                         f"{avg_train_loss:.5f}",
                         f"{val_loss_scalar:.5f}" if val_loss_scalar is not None else "",
-                        f"{self.learning_rate:.6e}",
+                        f"{current_lr:.6e}",
                         f"{elapsed:.1f}",
                         f"{steps_per_sec:.2f}",
                     ])
@@ -573,6 +634,7 @@ class RobotTrainer:
                 print(
                     f"[Step {step:5d}/{self.training_steps}] "
                     f"train_loss: {avg_train_loss:.4f}{val_text} | "
+                    f"lr: {current_lr:.2e} | "
                     f"Speed: {steps_per_sec:.1f} steps/s | "
                     f"ETA: {eta_str}"
                 )
@@ -640,7 +702,10 @@ def parse_args():
     )
     parser.add_argument("--steps", type=int, default=TRAINING_STEPS, help="Number of training optimization steps")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size per training step")
-    parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="Learning rate for policy heads/transformer")
+    parser.add_argument("--lr-backbone", type=float, default=LR_BACKBONE, help="Learning rate for ResNet vision backbone")
+    parser.add_argument("--warmup-steps", type=int, default=WARMUP_STEPS, help="Linear warmup steps for scheduler")
+    parser.add_argument("--no-aug", action="store_true", help="Disable visual data augmentation")
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="L2 weight decay")
     parser.add_argument("--save-freq", type=int, default=SAVE_CHECKPOINT_FREQ, help="Checkpoint save step frequency (in-place overwrite)")
     parser.add_argument("--log-freq", type=int, default=LOG_FREQ, help="Console logging interval")
@@ -661,6 +726,9 @@ def main():
         training_steps=args.steps,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        lr_backbone=args.lr_backbone,
+        warmup_steps=args.warmup_steps,
+        use_augmentation=not args.no_aug,
         weight_decay=args.weight_decay,
         save_checkpoint_freq=args.save_freq,
         log_freq=args.log_freq,

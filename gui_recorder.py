@@ -115,6 +115,17 @@ UR5E_JOINTS = [
     "wrist_3",
 ]
 
+# Canonical UR5e Ready/Home Pose: [0°, -90°, 90°, -90°, -90°, 0°]
+HOME_JOINTS = [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
+HOME_JOINTS_DICT = {
+    "shoulder_pan": 0.0,
+    "shoulder_lift": -90.0,
+    "elbow": 90.0,
+    "wrist_1": -90.0,
+    "wrist_2": -90.0,
+    "wrist_3": 0.0,
+}
+
 
 def detect_available_cameras() -> List[Tuple[int, str]]:
     """
@@ -370,6 +381,13 @@ class RobotRTDEWorker(QThread):
         self._cmd_disconnect = False
         self._cmd_target_pose: Optional[Dict[str, float]] = None
 
+        # Commanded motion state & automatic freedrive restoration
+        self._motion_in_progress = False
+        self._motion_restore_freedrive = False
+        self._motion_target_q = [0.0] * 6
+        self._motion_start_time = 0.0
+        self._motion_timeout = 5.0
+
         # Latest joint states (radians)
         self._latest_q = {j: 0.0 for j in UR5E_JOINTS}
 
@@ -437,6 +455,7 @@ class RobotRTDEWorker(QThread):
                     break
                 if self._cmd_toggle_freedrive:
                     self._cmd_toggle_freedrive = False
+                    self._motion_restore_freedrive = False  # User manually toggled freedrive
                     new_state = not self._freedrive_active
                     try:
                         if self._robot and hasattr(self._robot, "enable_freedrive"):
@@ -451,16 +470,35 @@ class RobotRTDEWorker(QThread):
                 if self._cmd_target_pose is not None:
                     target_pose = self._cmd_target_pose
                     self._cmd_target_pose = None
-                    if self._robot and not self._freedrive_active:
+
+                    # Check if freedrive was active (or already marked for restoration)
+                    was_freedrive = self._freedrive_active or self._motion_restore_freedrive
+                    if self._freedrive_active:
+                        try:
+                            if self._robot and hasattr(self._robot, "disable_freedrive"):
+                                self._robot.disable_freedrive()
+                            self._freedrive_active = False
+                            self.freedrive_state_changed.emit(False)
+                            print("[MOTION] Freedrive temporarily paused for commanded motion.")
+                        except Exception as err:
+                            print(f"[ERROR] Failed to disable Freedrive before motion: {err}")
+
+                    self._motion_restore_freedrive = was_freedrive
+                    self._motion_target_q = [float(target_pose[f"{j}.pos"]) for j in UR5E_JOINTS]
+                    self._motion_in_progress = True
+                    self._motion_start_time = time.perf_counter()
+
+                    # Dynamic timeout based on maximum angular joint displacement
+                    max_disp = max(abs(self._latest_q[j] - target_pose[f"{j}.pos"]) for j in UR5E_JOINTS)
+                    self._motion_timeout = max(3.0, (max_disp / 0.5) + 2.0)
+
+                    if self._robot and hasattr(self._robot, "send_action"):
                         try:
                             self._robot.send_action(target_pose)
                         except Exception as err:
                             print(f"[ERROR] Motion command failed: {err}")
-                    elif self.mock:
-                        for idx, j_name in enumerate(UR5E_JOINTS):
-                            key = f"{j_name}.pos"
-                            if key in target_pose:
-                                mock_angles[idx] = float(target_pose[key])
+                            self._motion_in_progress = False
+                            self._motion_restore_freedrive = False
 
             # Telemetry acquisition
             if not self.mock and self._robot and self._robot.rx:
@@ -470,10 +508,48 @@ class RobotRTDEWorker(QThread):
                         self._latest_q[j_name] = float(q_list[idx])
                 except Exception as err:
                     print(f"[WARNING] RTDE read exception: {err}")
+
+                # Monitor motion completion on physical arm
+                if self._motion_in_progress:
+                    current_disp = max(abs(self._latest_q[j] - self._motion_target_q[idx]) for idx, j in enumerate(UR5E_JOINTS))
+                    elapsed = time.perf_counter() - self._motion_start_time
+                    if current_disp < 0.02 or elapsed >= self._motion_timeout:
+                        self._motion_in_progress = False
+                        if elapsed >= self._motion_timeout and current_disp >= 0.02:
+                            print(f"[WARNING] Motion wait timed out after {elapsed:.1f}s (max joint err: {math.degrees(current_disp):.1f}°).")
+                        else:
+                            print(f"[MOTION] Target position reached in {elapsed:.2f}s.")
+                        if self._motion_restore_freedrive:
+                            self._motion_restore_freedrive = False
+                            try:
+                                if hasattr(self._robot, "enable_freedrive"):
+                                    self._robot.enable_freedrive()
+                                self._freedrive_active = True
+                                self.freedrive_state_changed.emit(True)
+                                print("[MOTION] Freedrive automatically restored after motion completion.")
+                            except Exception as err:
+                                print(f"[ERROR] Failed to restore Freedrive: {err}")
             else:
                 # Synthetic realistic UR5e telemetry
                 sim_t += target_period
-                if self._freedrive_active:
+                if self._motion_in_progress:
+                    # Smoothly step mock angles towards target_q at ~1.5 rad/s
+                    max_err = 0.0
+                    for idx in range(6):
+                        err = self._motion_target_q[idx] - mock_angles[idx]
+                        max_err = max(max_err, abs(err))
+                        step = math.copysign(min(abs(err), 1.5 * target_period), err)
+                        mock_angles[idx] += step
+                    elapsed = time.perf_counter() - self._motion_start_time
+                    if max_err < 0.005 or elapsed >= self._motion_timeout:
+                        self._motion_in_progress = False
+                        print(f"[MOTION] Mock target motion reached ({elapsed:.2f}s).")
+                        if self._motion_restore_freedrive:
+                            self._motion_restore_freedrive = False
+                            self._freedrive_active = True
+                            self.freedrive_state_changed.emit(True)
+                            print("[MOTION] Freedrive automatically restored after motion completion.")
+                elif self._freedrive_active:
                     # In freedrive, arm drifts or simulates compliance
                     noise = 0.002 * math.sin(sim_t * 5)
                     for i in range(6):
@@ -751,6 +827,15 @@ class UR5eRecorderStudio(QMainWindow):
         self.resize(1380, 980)
         self.setMinimumSize(1100, 800)
         self._user_dragging_joint: Optional[str] = None
+
+        # Custom Start Position (defaults to canonical HOME_JOINTS)
+        self.start_position: Dict[str, float] = dict(HOME_JOINTS_DICT)
+        self.jog_sliders: Dict[str, QSlider] = {}
+        self.jog_inputs: Dict[str, QLineEdit] = {}
+        self.jog_move_buttons: Dict[str, QPushButton] = {}
+        self.jog_labels: Dict[str, QLineEdit] = self.jog_inputs
+        self._user_modified_joints: set[str] = set()
+        self._user_targets: Dict[str, float] = {}
 
         self.camera_width = 320
         self.camera_height = 240
@@ -1369,44 +1454,141 @@ class UR5eRecorderStudio(QMainWindow):
         telem_layout.addLayout(grid_joints)
         right_column.addWidget(telem_box, stretch=2)
 
-        # 6. Manual Axis Control & Jogging Panel (Active when Freedrive is LOCKED)
+        # 6. Manual Axis Control & Jogging Panel
         jog_box = QGroupBox("MANUAL AXIS CONTROL & JOGGING")
         self.jog_group = jog_box
         jog_layout = QVBoxLayout(jog_box)
         jog_layout.setContentsMargins(10, 10, 10, 10)
         jog_layout.setSpacing(6)
 
+        # Status & Navigation Toolbar
         jog_header = QHBoxLayout()
         self.lbl_jog_notice = QLabel("Freedrive LOCKED — Manual jogging active")
         self.lbl_jog_notice.setStyleSheet("color: #4ade80; font-size: 10px; font-weight: bold;")
         jog_header.addWidget(self.lbl_jog_notice, stretch=1)
 
-        self.btn_move_home = QPushButton("⌂ Move to Home Pose")
+        # Home Pose Button
+        self.btn_move_home = QPushButton("⌂ Home")
+        self.btn_move_home.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_move_home.setStyleSheet("""
             QPushButton {
                 background-color: #0284c7;
                 color: #ffffff;
-                font-size: 11px;
+                font-size: 10px;
                 font-weight: bold;
-                padding: 4px 10px;
+                padding: 3px 7px;
                 border-radius: 4px;
                 border: 1px solid #38bdf8;
             }
             QPushButton:hover {
                 background-color: #0369a1;
             }
-            QPushButton:disabled {
-                background-color: #1e293b;
-                color: #64748b;
-                border: 1px solid #334155;
-            }
         """)
+        self.btn_move_home.setToolTip("Command arm to move to default Home Pose [0°, -90°, 90°, -90°, -90°, 0°]")
         self.btn_move_home.clicked.connect(self.move_to_home_pose)
         jog_header.addWidget(self.btn_move_home)
+
+        # Go to Start Position Button
+        self.btn_go_start = QPushButton("▶ Go to Start")
+        self.btn_go_start.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_go_start.setStyleSheet("""
+            QPushButton {
+                background-color: #16a34a;
+                color: #ffffff;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 3px 7px;
+                border-radius: 4px;
+                border: 1px solid #22c55e;
+            }
+            QPushButton:hover {
+                background-color: #15803d;
+            }
+        """)
+        self.btn_go_start.setToolTip("Command arm to move to stored Custom Start Position")
+        self.btn_go_start.clicked.connect(self.move_to_start_pose)
+        jog_header.addWidget(self.btn_go_start)
+
+        # Set Start Position Button
+        self.btn_set_start = QPushButton("💾 Set Start")
+        self.btn_set_start.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_set_start.setStyleSheet("""
+            QPushButton {
+                background-color: #334155;
+                color: #f1f5f9;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 3px 7px;
+                border-radius: 4px;
+                border: 1px solid #64748b;
+            }
+            QPushButton:hover {
+                background-color: #475569;
+            }
+        """)
+        self.btn_set_start.setToolTip("Save robot's current 6 joint coordinates as the active Start Position")
+        self.btn_set_start.clicked.connect(self.set_current_as_start_position)
+        jog_header.addWidget(self.btn_set_start)
+
+        # Move to Target Button (moves all joints to entered values)
+        self.btn_move_target = QPushButton("🎯 Move to Target")
+        self.btn_move_target.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_move_target.setStyleSheet("""
+            QPushButton {
+                background-color: #4f46e5;
+                color: #ffffff;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 3px 7px;
+                border-radius: 4px;
+                border: 1px solid #818cf8;
+            }
+            QPushButton:hover {
+                background-color: #4338ca;
+            }
+        """)
+        self.btn_move_target.setToolTip("Command arm to move all joints to the currently specified numeric target values")
+        self.btn_move_target.clicked.connect(self.move_to_all_targets)
+        jog_header.addWidget(self.btn_move_target)
+
+        # Sync to Robot Button (discards staged target angles and snaps inputs back to current robot position)
+        self.btn_sync_targets = QPushButton("⟳ Sync")
+        self.btn_sync_targets.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_sync_targets.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #94a3b8;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 3px 7px;
+                border-radius: 4px;
+                border: 1px solid #475569;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #f1f5f9;
+            }
+        """)
+        self.btn_sync_targets.setToolTip("Reset all jog input fields to match current robot joint telemetry")
+        self.btn_sync_targets.clicked.connect(self.sync_jog_to_robot)
+        jog_header.addWidget(self.btn_sync_targets)
+
         jog_layout.addLayout(jog_header)
 
-        self.jog_sliders: Dict[str, QSlider] = {}
-        self.jog_labels: Dict[str, QLabel] = {}
+        # Start Position Display Banner
+        self.lbl_start_pose_info = QLabel()
+        self.lbl_start_pose_info.setStyleSheet("""
+            background-color: #0b1120;
+            color: #38bdf8;
+            border: 1px solid #1e293b;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-family: monospace;
+            font-size: 10px;
+            font-weight: bold;
+        """)
+        jog_layout.addWidget(self.lbl_start_pose_info)
+        self.update_start_pose_display()
 
         grid_jog = QGridLayout()
         grid_jog.setSpacing(4)
@@ -1414,10 +1596,11 @@ class UR5eRecorderStudio(QMainWindow):
         for idx, j_name in enumerate(UR5E_JOINTS):
             name_lbl = QLabel(j_name.replace("_", " ").title())
             name_lbl.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: 500;")
+            name_lbl.setMinimumWidth(80)
 
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(-360, 360)
-            slider.setValue(0)
+            slider.setValue(int(round(self.start_position.get(j_name, 0.0))))
             slider.setFixedHeight(18)
             slider.setStyleSheet("""
                 QSlider::groove:horizontal {
@@ -1438,21 +1621,67 @@ class UR5eRecorderStudio(QMainWindow):
                 }
             """)
 
-            val_lbl = QLabel("+0.0°")
-            val_lbl.setFixedWidth(48)
-            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            val_lbl.setStyleSheet("color: #f1f5f9; font-family: monospace; font-size: 10px; font-weight: bold;")
+            # Direct Numeric Input Field
+            input_box = QLineEdit(f"{self.start_position.get(j_name, 0.0):+.1f}")
+            input_box.setFixedWidth(56)
+            input_box.setFixedHeight(22)
+            input_box.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            input_box.setStyleSheet("""
+                QLineEdit {
+                    background-color: #0b1120;
+                    color: #f1f5f9;
+                    font-family: monospace;
+                    font-size: 10px;
+                    font-weight: bold;
+                    border: 1px solid #334155;
+                    border-radius: 3px;
+                    padding: 1px 3px;
+                }
+                QLineEdit:focus {
+                    border: 1px solid #38bdf8;
+                    background-color: #0f172a;
+                }
+            """)
+            input_box.setToolTip(f"Type target angle in degrees for {j_name} and press Enter (or click Move)")
+
+            # Adjacent Move to Target Button for this joint
+            btn_move_joint = QPushButton("Move")
+            btn_move_joint.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn_move_joint.setFixedWidth(46)
+            btn_move_joint.setFixedHeight(22)
+            btn_move_joint.setStyleSheet("""
+                QPushButton {
+                    background-color: #0284c7;
+                    color: #ffffff;
+                    font-size: 10px;
+                    font-weight: bold;
+                    border-radius: 3px;
+                    border: 1px solid #38bdf8;
+                    padding: 1px 4px;
+                }
+                QPushButton:hover {
+                    background-color: #0369a1;
+                }
+            """)
+            btn_move_joint.setToolTip(f"Move {j_name} to the entered target angle")
 
             self.jog_sliders[j_name] = slider
-            self.jog_labels[j_name] = val_lbl
+            self.jog_inputs[j_name] = input_box
+            self.jog_move_buttons[j_name] = btn_move_joint
 
+            # Synchronize slider and numeric input
             slider.sliderPressed.connect(lambda j=j_name: self.on_jog_slider_pressed(j))
             slider.valueChanged.connect(lambda val, j=j_name: self.on_jog_slider_value_changed(j, val))
             slider.sliderReleased.connect(lambda j=j_name: self.on_jog_slider_released(j))
 
+            input_box.textEdited.connect(lambda text, j=j_name: self.on_jog_input_edited(j, text))
+            input_box.returnPressed.connect(lambda j=j_name: self.on_jog_input_committed(j))
+            btn_move_joint.clicked.connect(lambda _, j=j_name: self.on_jog_input_committed(j))
+
             grid_jog.addWidget(name_lbl, idx, 0)
             grid_jog.addWidget(slider, idx, 1)
-            grid_jog.addWidget(val_lbl, idx, 2)
+            grid_jog.addWidget(input_box, idx, 2)
+            grid_jog.addWidget(btn_move_joint, idx, 3)
 
         jog_layout.addLayout(grid_jog)
         right_column.addWidget(jog_box, stretch=3)
@@ -1745,8 +1974,7 @@ class UR5eRecorderStudio(QMainWindow):
     @pyqtSlot(bool)
     def on_freedrive_state_changed(self, active: bool):
         self.freedrive_active = active
-        if hasattr(self, "jog_group"):
-            self.jog_group.setEnabled(not active)
+        # Keep jog controls accessible; commanded motion automatically interrupts and restores freedrive
         if active:
             self.lbl_fd_status.setText("ROBOT STATE: FREEDRIVE ACTIVE (Hand-Guiding)")
             self.lbl_fd_status.setStyleSheet("""
@@ -1772,7 +2000,7 @@ class UR5eRecorderStudio(QMainWindow):
                 }
             """)
             if hasattr(self, "lbl_jog_notice"):
-                self.lbl_jog_notice.setText("Freedrive ACTIVE — Manual jogging locked")
+                self.lbl_jog_notice.setText("Freedrive ACTIVE — Commanded motion will pause & restore freedrive")
                 self.lbl_jog_notice.setStyleSheet("color: #f59e0b; font-size: 10px; font-weight: bold;")
             print("[INFO] Freedrive ENABLED — Robot arm is now compliant for hand demonstration.")
         else:
@@ -1819,43 +2047,152 @@ class UR5eRecorderStudio(QMainWindow):
                 self.joint_labels[j_name].setText(f"{deg_val:+6.1f}°")
                 self.joint_bars[j_name].setValue(int(deg_val))
 
-            # Sync jog sliders if user is not currently interacting with them
-            if self._user_dragging_joint != j_name and hasattr(self, "jog_sliders") and j_name in self.jog_sliders:
-                slider = self.jog_sliders[j_name]
-                slider.blockSignals(True)
-                slider.setValue(int(round(deg_val)))
-                slider.blockSignals(False)
-                if j_name in self.jog_labels:
-                    self.jog_labels[j_name].setText(f"{deg_val:+5.1f}°")
+            # Only sync jog sliders and inputs if this joint has NOT been modified by the user,
+            # is not currently being dragged, and does not currently have keyboard focus
+            if j_name not in self._user_modified_joints and self._user_dragging_joint != j_name:
+                if hasattr(self, "jog_inputs") and j_name in self.jog_inputs:
+                    inp = self.jog_inputs[j_name]
+                    if not inp.hasFocus():
+                        inp.setText(f"{deg_val:+.1f}")
+                if hasattr(self, "jog_sliders") and j_name in self.jog_sliders:
+                    slider = self.jog_sliders[j_name]
+                    slider.blockSignals(True)
+                    slider.setValue(int(round(deg_val)))
+                    slider.blockSignals(False)
 
     def on_freedrive_button_clicked(self):
         self.robot_worker.request_toggle_freedrive()
 
     # -------------------------------------------------------------------------
-    # Manual Jogging & Home Pose Slots
+    # Manual Jogging, Start Pose & Home Pose Slots
     # -------------------------------------------------------------------------
+    def sync_jog_to_robot(self):
+        self._user_modified_joints.clear()
+        self._user_targets.clear()
+        current_rads = self.robot_worker.get_latest_joints()
+        for j in UR5E_JOINTS:
+            deg_val = math.degrees(current_rads.get(j, 0.0))
+            if hasattr(self, "jog_inputs") and j in self.jog_inputs:
+                self.jog_inputs[j].setText(f"{deg_val:+.1f}")
+                self.jog_inputs[j].clearFocus()
+            if hasattr(self, "jog_sliders") and j in self.jog_sliders:
+                slider = self.jog_sliders[j]
+                slider.blockSignals(True)
+                slider.setValue(int(round(deg_val)))
+                slider.blockSignals(False)
+        print("[JOG] Synchronized all jog target fields to current robot position.")
+        self.status_bar.showMessage("Jog inputs synchronized to current robot position.", 3000)
+
+    def update_start_pose_display(self):
+        pose_str = ", ".join(f"{self.start_position.get(j, 0.0):+.1f}°" for j in UR5E_JOINTS)
+        if hasattr(self, "lbl_start_pose_info"):
+            self.lbl_start_pose_info.setText(f"Start Pose: [{pose_str}]")
+            lines = ["Stored Start Position:"]
+            for j in UR5E_JOINTS:
+                lines.append(f"  • {j.replace('_', ' ').title()}: {self.start_position.get(j, 0.0):+.1f}°")
+            self.lbl_start_pose_info.setToolTip("\n".join(lines))
+
+    def set_current_as_start_position(self):
+        current_rads = self.robot_worker.get_latest_joints()
+        for j in UR5E_JOINTS:
+            self.start_position[j] = round(math.degrees(current_rads.get(j, 0.0)), 1)
+        self.update_start_pose_display()
+        pose_str = ", ".join(f"{self.start_position[j]:+.1f}°" for j in UR5E_JOINTS)
+        print(f"[POSITION] Active Start Position set to: [{pose_str}]")
+        self.status_bar.showMessage(f"Active Start Position saved: [{pose_str}]", 4000)
+
+    def move_to_start_pose(self):
+        self._user_modified_joints.clear()
+        self._user_targets.clear()
+        action = {f"{j}.pos": math.radians(self.start_position.get(j, 0.0)) for j in UR5E_JOINTS}
+        pose_str = ", ".join(f"{self.start_position.get(j, 0.0):+.1f}°" for j in UR5E_JOINTS)
+        print(f"[MOTION] Commanding UR5e arm to Start Position [{pose_str}]...")
+        self.status_bar.showMessage("Moving arm to Start Position...", 4000)
+        self.robot_worker.request_move_pose(action)
+
+    def move_to_home_pose(self):
+        self._user_modified_joints.clear()
+        self._user_targets.clear()
+        home_action = {f"{j}.pos": math.radians(HOME_JOINTS_DICT[j]) for j in UR5E_JOINTS}
+        print("[MOTION] Commanding UR5e arm to Home position (0°, -90°, 90°, -90°, -90°, 0°)...")
+        self.status_bar.showMessage("Moving arm to Home position...", 4000)
+        self.robot_worker.request_move_pose(home_action)
+
+    def get_numeric_input_value(self, j_name: str) -> float:
+        # 1. First priority: if user explicitly entered a target in _user_targets
+        if j_name in self._user_targets:
+            return self._user_targets[j_name]
+        # 2. Second: read text currently in the input box
+        if hasattr(self, "jog_inputs") and j_name in self.jog_inputs:
+            text = self.jog_inputs[j_name].text().replace("°", "").strip()
+            try:
+                val = float(text)
+                return max(-360.0, min(360.0, val))
+            except ValueError:
+                pass
+        # 3. Third: slider position
+        if hasattr(self, "jog_sliders") and j_name in self.jog_sliders:
+            return float(self.jog_sliders[j_name].value())
+        return 0.0
+
+    def move_to_all_targets(self):
+        # 1. Harvest all typed texts into _user_targets first
+        for j in UR5E_JOINTS:
+            if hasattr(self, "jog_inputs") and j in self.jog_inputs:
+                text = self.jog_inputs[j].text().replace("°", "").strip()
+                try:
+                    self._user_targets[j] = max(-360.0, min(360.0, float(text)))
+                except ValueError:
+                    pass
+
+        target_rads = {}
+        for j in UR5E_JOINTS:
+            val_deg = self.get_numeric_input_value(j)
+            target_rads[f"{j}.pos"] = math.radians(val_deg)
+            if hasattr(self, "jog_inputs") and j in self.jog_inputs:
+                self.jog_inputs[j].setText(f"{val_deg:+.1f}")
+                self.jog_inputs[j].clearFocus()
+            if hasattr(self, "jog_sliders") and j in self.jog_sliders:
+                slider = self.jog_sliders[j]
+                slider.blockSignals(True)
+                slider.setValue(int(round(val_deg)))
+                slider.blockSignals(False)
+
+        # Clear staged target flags once motion is dispatched
+        self._user_modified_joints.clear()
+        self._user_targets.clear()
+
+        print("[MOTION] Commanding UR5e arm to all specified target joint positions...")
+        self.status_bar.showMessage("Moving arm to target joint positions...", 4000)
+        self.robot_worker.request_move_pose(target_rads)
+
     def on_jog_slider_pressed(self, j_name: str):
         self._user_dragging_joint = j_name
+        self._user_modified_joints.add(j_name)
 
     def on_jog_slider_value_changed(self, j_name: str, val: int):
-        if hasattr(self, "jog_labels") and j_name in self.jog_labels:
-            self.jog_labels[j_name].setText(f"{val:+5.1f}°")
+        if self._user_dragging_joint == j_name:
+            self._user_targets[j_name] = float(val)
+            self._user_modified_joints.add(j_name)
+        if hasattr(self, "jog_inputs") and j_name in self.jog_inputs:
+            self.jog_inputs[j_name].setText(f"{float(val):+.1f}")
 
     def on_jog_slider_released(self, j_name: str):
-        if self.freedrive_active or self.is_recording:
-            self._user_dragging_joint = None
-            return
-
         if not hasattr(self, "jog_sliders") or j_name not in self.jog_sliders:
             self._user_dragging_joint = None
             return
 
-        target_deg = self.jog_sliders[j_name].value()
+        target_deg = float(self.jog_sliders[j_name].value())
+        self._user_targets.pop(j_name, None)
+        self._user_modified_joints.discard(j_name)
         target_rad = math.radians(target_deg)
+
+        if hasattr(self, "jog_inputs") and j_name in self.jog_inputs:
+            self.jog_inputs[j_name].setText(f"{target_deg:+.1f}")
 
         # Build complete action dictionary preserving other current joint positions
         current_joints = self.robot_worker.get_latest_joints()
-        action = {f"{j}.pos": current_joints[j] for j in UR5E_JOINTS}
+        action = {f"{j}.pos": current_joints.get(j, 0.0) for j in UR5E_JOINTS}
         action[f"{j_name}.pos"] = target_rad
 
         print(f"[MOTION] Jogging {j_name} to {target_deg:+5.1f}° ({target_rad:+.4f} rad)...")
@@ -1863,28 +2200,51 @@ class UR5eRecorderStudio(QMainWindow):
         self.robot_worker.request_move_pose(action)
         self._user_dragging_joint = None
 
-    def move_to_home_pose(self):
-        if self.freedrive_active:
-            QMessageBox.warning(self, "Freedrive Active", "Cannot move to home position while Freedrive is active. Please lock joints first.")
-            return
-        if self.is_recording:
-            QMessageBox.warning(self, "Recording Active", "Cannot move to home position while recording an episode.")
-            return
+    def on_jog_input_edited(self, j_name: str, text: str):
+        clean_text = text.replace("°", "").strip()
+        try:
+            val = float(clean_text)
+            clamped = max(-360.0, min(360.0, val))
+            self._user_targets[j_name] = clamped
+            self._user_modified_joints.add(j_name)
+            if hasattr(self, "jog_sliders") and j_name in self.jog_sliders:
+                slider = self.jog_sliders[j_name]
+                slider.blockSignals(True)
+                slider.setValue(int(round(clamped)))
+                slider.blockSignals(False)
+        except ValueError:
+            pass
 
-        # Canonical UR5e Ready/Home Pose: [0°, -90°, 90°, -90°, -90°, 0°]
-        home_pose_deg = {
-            "shoulder_pan": 0.0,
-            "shoulder_lift": -90.0,
-            "elbow": 90.0,
-            "wrist_1": -90.0,
-            "wrist_2": -90.0,
-            "wrist_3": 0.0,
-        }
-        home_action = {f"{j}.pos": math.radians(deg) for j, deg in home_pose_deg.items()}
+    def on_jog_input_committed(self, j_name: str):
+        # Ensure any text currently typed in the box is captured into _user_targets
+        if hasattr(self, "jog_inputs") and j_name in self.jog_inputs:
+            text = self.jog_inputs[j_name].text().replace("°", "").strip()
+            try:
+                self._user_targets[j_name] = max(-360.0, min(360.0, float(text)))
+            except ValueError:
+                pass
 
-        print("[MOTION] Commanding UR5e arm to Home position (0°, -90°, 90°, -90°, -90°, 0°)...")
-        self.status_bar.showMessage("Moving arm to Home position...", 4000)
-        self.robot_worker.request_move_pose(home_action)
+        val_deg = self.get_numeric_input_value(j_name)
+        self._user_targets.pop(j_name, None)
+        self._user_modified_joints.discard(j_name)
+
+        if hasattr(self, "jog_inputs") and j_name in self.jog_inputs:
+            self.jog_inputs[j_name].setText(f"{val_deg:+.1f}")
+            self.jog_inputs[j_name].clearFocus()
+        if hasattr(self, "jog_sliders") and j_name in self.jog_sliders:
+            slider = self.jog_sliders[j_name]
+            slider.blockSignals(True)
+            slider.setValue(int(round(val_deg)))
+            slider.blockSignals(False)
+
+        target_rad = math.radians(val_deg)
+        current_joints = self.robot_worker.get_latest_joints()
+        action = {f"{j}.pos": current_joints.get(j, 0.0) for j in UR5E_JOINTS}
+        action[f"{j_name}.pos"] = target_rad
+
+        print(f"[MOTION] Jogging {j_name} to {val_deg:+5.1f}° ({target_rad:+.4f} rad)...")
+        self.status_bar.showMessage(f"Jogging {j_name} to {val_deg:+5.1f}°...", 3000)
+        self.robot_worker.request_move_pose(action)
 
     # -------------------------------------------------------------------------
     # Recording Workflow & Guard Logic
@@ -1902,18 +2262,11 @@ class UR5eRecorderStudio(QMainWindow):
             self.end_episode_and_save()
 
     def start_recording(self):
-        # Freedrive safety guard check
-        if not self.freedrive_active:
-            msg = "Robot must be in Freedrive mode to record! Please toggle Freedrive first."
-            print(f"[WARNING] {msg}")
-            self.status_bar.showMessage(msg, 5000)
-            QMessageBox.warning(
-                self,
-                "Freedrive Required",
-                "<b>Robot must be in Freedrive mode to record!</b><br><br>"
-                "Please click <b>'TOGGLE FREEDRIVE MODE'</b> to unlock the arm for hand guiding before starting an episode.",
-            )
-            return
+        # Demonstrations can be recorded via physical Freedrive hand-guiding
+        # OR via precision numeric inputs, sliders, Go to Start, Go to Home, and Move to Target.
+        mode_desc = "Freedrive Hand-Guiding" if self.freedrive_active else "Precision Axis Controls"
+        print(f"[RECORD] Starting demonstration episode recording ({mode_desc})...")
+        self.status_bar.showMessage(f"Recording episode active ({mode_desc}). Press Space to stop.", 5000)
 
         # Prepare dataset buffer
         self.is_recording = True

@@ -49,7 +49,7 @@ except ImportError as err:
 # 1. User Configuration & Safety Parameters (Adjust freely here)
 # =============================================================================
 
-PROJECT_NAME = "object_detection_test"
+PROJECT_NAME = "object_detection2"
 
 # Path to trained policy checkpoint directory
 DEFAULT_MODEL_PATH = "outputs/train/" + PROJECT_NAME + "/checkpoint"

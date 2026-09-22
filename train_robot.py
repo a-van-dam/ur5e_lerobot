@@ -46,7 +46,7 @@ except ImportError as e:
 # 1. User Configuration & Hyperparameters (Adjust freely here)
 # =============================================================================
 
-PROJECT_NAME = "object_detection_test"
+PROJECT_NAME = "object_detection2"
 
 # Path to local dataset folder (relative to this script or absolute)
 DATASET_PATH = "datasets/" + PROJECT_NAME
@@ -68,8 +68,8 @@ AVAILABLE_OPTIMIZERS = [
 SELECTED_OPTIMIZER_INDEX = 0  # <--- Select optimizer by index (0: AdamW, 1: Adam, 2: SGD)
 
 # Training Hyperparameters
-TRAINING_STEPS = 30000        # Total optimization steps (increased for robust task mastery)
-BATCH_SIZE = 64               # Samples per training batch (RTX 3080 16GB handles 16-64 easily)
+TRAINING_STEPS = 10000      # Total optimization steps (increased for robust task mastery)
+BATCH_SIZE = 32               # Samples per training batch (RTX 3080 16GB handles 16-64 easily)
 LEARNING_RATE = 1e-4          # Initial optimizer learning rate for transformer heads
 LR_BACKBONE = 1e-5            # Differential learning rate for pretrained ResNet vision backbone
 LR_MIN = 1e-6                 # Minimum learning rate at end of Cosine Annealing schedule

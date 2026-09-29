@@ -59,6 +59,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -96,6 +97,17 @@ try:
     LEROBOT_AVAILABLE = True
 except ImportError:
     LEROBOT_AVAILABLE = False
+
+# Gamepad Cartesian Teleoperation Controller
+try:
+    from gamepad_controller import GamepadConfig, UR5eGamepadTeleop, PYGAME_AVAILABLE
+    GAMEPAD_AVAILABLE = True
+except ImportError:
+    GAMEPAD_AVAILABLE = False
+    UR5eGamepadTeleop = None
+    GamepadConfig = None
+    PYGAME_AVAILABLE = False
+
 
 
 # Default Configuration
@@ -390,10 +402,20 @@ class RobotRTDEWorker(QThread):
 
         # Latest joint states (radians)
         self._latest_q = {j: 0.0 for j in UR5E_JOINTS}
+        self._mock_cartesian_v: List[float] = [0.0] * 6
 
     @property
     def is_freedrive_active(self) -> bool:
         return self._freedrive_active
+
+    @property
+    def is_motion_in_progress(self) -> bool:
+        return self._motion_in_progress
+
+    def apply_cartesian_velocity(self, v: List[float]):
+        """Applies Cartesian velocity updates to the simulated arm model."""
+        with QMutexLocker(self._cmd_lock):
+            self._mock_cartesian_v = list(v)
 
     def request_toggle_freedrive(self):
         with QMutexLocker(self._cmd_lock):
@@ -554,6 +576,21 @@ class RobotRTDEWorker(QThread):
                     noise = 0.002 * math.sin(sim_t * 5)
                     for i in range(6):
                         mock_angles[i] += 0.001 * math.sin(sim_t * (1 + i * 0.4))
+                elif self._mock_cartesian_v and any(abs(x) > 1e-4 for x in self._mock_cartesian_v):
+                    # Mock teleoperation velocity integration:
+                    # [vx, vy, vz, w_base, w_wrist2, w_wrist3]
+                    dt = target_period
+                    vx, vy, vz, w_base, w_wrist2, w_wrist3 = self._mock_cartesian_v
+                    theta_base = mock_angles[0]
+                    # Deconstruct base-frame velocity into arm's reach and swing plane
+                    vfwd = vx * math.cos(theta_base) + vy * math.sin(theta_base)
+                    vlat = -vx * math.sin(theta_base) + vy * math.cos(theta_base)
+                    mock_angles[0] += (vlat * 1.2 + w_base) * dt  # Base pan responds to swing & direct w_base
+                    mock_angles[1] += vfwd * dt * 1.2             # Shoulder extends in arm's forward direction
+                    mock_angles[2] -= vfwd * dt * 1.2             # Elbow compensates for reach
+                    mock_angles[1] -= vz * dt * 1.2               # Shoulder moves vertical vz
+                    mock_angles[4] += w_wrist2 * dt               # Wrist 2 rotates directly via shoulders
+                    mock_angles[5] += w_wrist3 * dt               # Wrist 3 rotates directly via triggers
                 for idx, j_name in enumerate(UR5E_JOINTS):
                     self._latest_q[j_name] = mock_angles[idx]
 
@@ -888,6 +925,27 @@ class UR5eRecorderStudio(QMainWindow):
         self.robot_worker.connection_state_changed.connect(self.on_robot_connection_status)
         self.robot_worker.start()
 
+        # Initialize Gamepad Teleoperation Worker
+        self.gamepad_teleop_active = False
+        if GAMEPAD_AVAILABLE and UR5eGamepadTeleop is not None:
+            self.gamepad_teleop = UR5eGamepadTeleop(
+                robot_ip=self.robot_ip,
+                mock=self.mock_mode,
+                parent=self,
+            )
+            self.gamepad_teleop.status_updated.connect(self.on_gamepad_status_updated)
+            self.gamepad_teleop.velocity_updated.connect(self.on_gamepad_velocity_updated)
+            self.gamepad_teleop.teleop_state_changed.connect(self.on_gamepad_state_changed)
+            # Provide live base motor angle (shoulder_pan) for heading-relative Cartesian control
+            self.gamepad_teleop.set_base_angle_provider(
+                lambda: self.robot_worker.get_latest_joints().get("shoulder_pan", 0.0)
+            )
+            if self.mock_mode:
+                self.gamepad_teleop.set_velocity_callback(self.robot_worker.apply_cartesian_velocity)
+            self.gamepad_teleop.start()
+        else:
+            self.gamepad_teleop = None
+
         # High-resolution UI Timer for recording stopwatch
         self.recording_timer = QTimer(self)
         self.recording_timer.setInterval(50)  # 20 Hz update rate for timer label
@@ -1154,6 +1212,157 @@ class UR5eRecorderStudio(QMainWindow):
 
         timer_row.addLayout(fd_status_box, stretch=1)
         rec_layout.addLayout(timer_row)
+
+        # Gamepad Cartesian Teleoperation Control Strip
+        gamepad_panel = QFrame()
+        gamepad_panel.setStyleSheet("""
+            QFrame {
+                background-color: #0b1120;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 2px;
+            }
+        """)
+        gamepad_layout = QHBoxLayout(gamepad_panel)
+        gamepad_layout.setContentsMargins(8, 5, 8, 5)
+        gamepad_layout.setSpacing(10)
+
+        # Toggle Button: "Enable Gamepad Teleop"
+        self.btn_toggle_gamepad = QPushButton("🎮 ENABLE GAMEPAD TELEOP")
+        self.btn_toggle_gamepad.setCheckable(True)
+        self.btn_toggle_gamepad.setMinimumHeight(36)
+        self.btn_toggle_gamepad.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #94a3b8;
+                font-size: 12px;
+                font-weight: bold;
+                border: 1px solid #334155;
+                border-radius: 5px;
+                padding: 4px 12px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #f1f5f9;
+            }
+            QPushButton:checked {
+                background-color: #0284c7;
+                color: #ffffff;
+                border: 1px solid #38bdf8;
+            }
+        """)
+        self.btn_toggle_gamepad.setToolTip(
+            "Toggle real-time Cartesian teleoperation & direct joint control via gamepad.\n"
+            "• Left Stick (XY): TCP Forward/Backward (+X/-X) and Left/Right (+Y/-Y)\n"
+            "• Right Stick (Y): TCP Vertical Up/Down (+Z/-Z)\n"
+            "• Right Stick (X): Direct Base Motor Rotation (shoulder_pan)\n"
+            "• Shoulders (LB/RB / L1/R1): Direct Wrist 2 Rotation\n"
+            "• Triggers (LT/RT): Direct Wrist 3 Rotation\n"
+            "• Neutral sticks/buttons: Immediate braking (0 drift)"
+        )
+        self.btn_toggle_gamepad.toggled.connect(self.on_gamepad_toggle_clicked)
+        gamepad_layout.addWidget(self.btn_toggle_gamepad)
+
+        # Gamepad Connection Status Badge
+        self.lbl_gamepad_badge = QLabel("🎮 No Gamepad Detected")
+        self.lbl_gamepad_badge.setStyleSheet("""
+            color: #64748b;
+            font-size: 11px;
+            font-weight: bold;
+            padding: 4px 8px;
+            background-color: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 4px;
+        """)
+        gamepad_layout.addWidget(self.lbl_gamepad_badge)
+
+        # Commanded TCP Velocity HUD Readout
+        self.lbl_gamepad_vel = QLabel("TCP: 0.00 m/s")
+        self.lbl_gamepad_vel.setStyleSheet("""
+            color: #38bdf8;
+            font-family: monospace;
+            font-size: 11px;
+            font-weight: bold;
+            padding: 4px 8px;
+            background-color: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 4px;
+        """)
+        gamepad_layout.addWidget(self.lbl_gamepad_vel)
+
+        # Invert Left Stick Horizontal (Lateral Translation) Checkbox
+        self.chk_invert_left_lr = QCheckBox("⇄ Invert Left Stick (L/R)")
+        self.chk_invert_left_lr.setChecked(False)
+        self.chk_invert_left_lr.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.chk_invert_left_lr.setStyleSheet("""
+            QCheckBox {
+                color: #cbd5e1;
+                font-size: 11px;
+                font-weight: bold;
+                spacing: 5px;
+            }
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border: 1px solid #475569;
+                border-radius: 3px;
+                background-color: #0f172a;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #0284c7;
+                border: 1px solid #38bdf8;
+            }
+            QCheckBox:hover {
+                color: #38bdf8;
+            }
+        """)
+        self.chk_invert_left_lr.setToolTip(
+            "Invert Left Stick lateral translation direction (Left/Right):\n"
+            "• Normal: Left Stick Right -> +Lateral (Right relative to arm heading)\n"
+            "• Inverted: Left Stick Right -> -Lateral (Left relative to arm heading)"
+        )
+        self.chk_invert_left_lr.toggled.connect(self.on_invert_left_lr_toggled)
+        gamepad_layout.addWidget(self.chk_invert_left_lr)
+
+        # Invert Right Stick Horizontal (Base Motor Rotation) Checkbox
+        self.chk_invert_right_lr = QCheckBox("⇄ Invert Right Stick (Base)")
+        self.chk_invert_right_lr.setChecked(False)
+        self.chk_invert_right_lr.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.chk_invert_right_lr.setStyleSheet("""
+            QCheckBox {
+                color: #cbd5e1;
+                font-size: 11px;
+                font-weight: bold;
+                spacing: 5px;
+            }
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border: 1px solid #475569;
+                border-radius: 3px;
+                background-color: #0f172a;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #0284c7;
+                border: 1px solid #38bdf8;
+            }
+            QCheckBox:hover {
+                color: #38bdf8;
+            }
+        """)
+        self.chk_invert_right_lr.setToolTip(
+            "Invert Right Stick horizontal base rotation direction (shoulder_pan):\n"
+            "• Normal: Right Stick Right -> +Base rotation\n"
+            "• Inverted: Right Stick Right -> -Base rotation"
+        )
+        self.chk_invert_right_lr.toggled.connect(self.on_invert_right_lr_toggled)
+        gamepad_layout.addWidget(self.chk_invert_right_lr)
+
+        # Backwards compatibility alias
+        self.chk_invert_lr = self.chk_invert_left_lr
+
+        gamepad_layout.addStretch()
+        rec_layout.addWidget(gamepad_panel)
 
         # Task Description Input
         task_row = QHBoxLayout()
@@ -2003,6 +2212,13 @@ class UR5eRecorderStudio(QMainWindow):
                 self.lbl_jog_notice.setText("Freedrive ACTIVE — Commanded motion will pause & restore freedrive")
                 self.lbl_jog_notice.setStyleSheet("color: #f59e0b; font-size: 10px; font-weight: bold;")
             print("[INFO] Freedrive ENABLED — Robot arm is now compliant for hand demonstration.")
+
+            # Safety Interlock: Inhibit gamepad teleoperation while Freedrive is physically active
+            if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():
+                self.gamepad_teleop.set_inhibited(True, "Freedrive active")
+                if hasattr(self, "lbl_gamepad_vel"):
+                    self.lbl_gamepad_vel.setText("PAUSED (Freedrive)")
+                print("[GAMEPAD] Gamepad teleoperation paused: Freedrive is active.")
         else:
             self.lbl_fd_status.setText("ROBOT STATE: LOCKED (Position Hold)")
             self.lbl_fd_status.setStyleSheet("""
@@ -2032,6 +2248,13 @@ class UR5eRecorderStudio(QMainWindow):
                 self.lbl_jog_notice.setStyleSheet("color: #4ade80; font-size: 10px; font-weight: bold;")
             print("[INFO] Freedrive DISABLED — Robot arm is re-locked in place.")
 
+            # Safety Interlock: Resume gamepad teleoperation if it was enabled
+            if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():
+                self.gamepad_teleop.set_inhibited(False)
+                if hasattr(self, "lbl_gamepad_vel"):
+                    self.lbl_gamepad_vel.setText("TCP: 0.00 m/s")
+                print("[GAMEPAD] Gamepad teleoperation resumed.")
+
     @pyqtSlot(dict)
     def on_telemetry_updated(self, telem: dict):
         joints = telem.get("joints", {})
@@ -2060,8 +2283,206 @@ class UR5eRecorderStudio(QMainWindow):
                     slider.setValue(int(round(deg_val)))
                     slider.blockSignals(False)
 
+        # Sync live base motor angle to gamepad teleop for heading-relative control
+        if "shoulder_pan" in joints and hasattr(self, "gamepad_teleop") and self.gamepad_teleop:
+            self.gamepad_teleop.set_base_angle(joints["shoulder_pan"])
+
+        # Safety Interlock: Check motion completion to un-inhibit gamepad teleoperation
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():
+            if not self.robot_worker.is_motion_in_progress and not self.freedrive_active:
+                if self.gamepad_teleop.is_inhibited() and "Trajectory" in self.gamepad_teleop.get_inhibition_reason():
+                    self.gamepad_teleop.set_inhibited(False)
+                    if hasattr(self, "lbl_gamepad_vel"):
+                        self.lbl_gamepad_vel.setText("TCP: 0.00 m/s")
+
     def on_freedrive_button_clicked(self):
         self.robot_worker.request_toggle_freedrive()
+
+    # -------------------------------------------------------------------------
+    # Gamepad Teleoperation Slots
+    # -------------------------------------------------------------------------
+    @pyqtSlot(bool, str)
+    def on_gamepad_status_updated(self, is_connected: bool, name: str):
+        if not hasattr(self, "lbl_gamepad_badge"):
+            return
+        if is_connected:
+            self.lbl_gamepad_badge.setText(f"🎮 Connected: {name}")
+            self.lbl_gamepad_badge.setStyleSheet("""
+                color: #4ade80;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 4px 8px;
+                background-color: #052e16;
+                border: 1px solid #166534;
+                border-radius: 4px;
+            """)
+        else:
+            self.lbl_gamepad_badge.setText("🎮 No Gamepad Detected")
+            self.lbl_gamepad_badge.setStyleSheet("""
+                color: #64748b;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 4px 8px;
+                background-color: #0f172a;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+            """)
+            if hasattr(self, "btn_toggle_gamepad") and self.btn_toggle_gamepad.isChecked():
+                self.btn_toggle_gamepad.setChecked(False)
+
+    @pyqtSlot(bool)
+    def on_gamepad_toggle_clicked(self, checked: bool):
+        if not hasattr(self, "gamepad_teleop") or self.gamepad_teleop is None:
+            QMessageBox.warning(
+                self,
+                "Gamepad Unavailable",
+                "Gamepad controller module is not available or pygame is missing.\n"
+                "Please run: pip install pygame"
+            )
+            if hasattr(self, "btn_toggle_gamepad"):
+                self.btn_toggle_gamepad.setChecked(False)
+            return
+
+        if checked:
+            if not self.gamepad_teleop.is_controller_connected():
+                QMessageBox.warning(
+                    self,
+                    "No Gamepad Detected",
+                    "No USB or Bluetooth gamepad is currently detected.\n\n"
+                    "Please connect a controller (Xbox, PlayStation, Logitech, etc.) and try again."
+                )
+                self.btn_toggle_gamepad.setChecked(False)
+                return
+
+            # Safety Interlock: Mutual exclusivity with Freedrive
+            if self.freedrive_active:
+                print("[GAMEPAD] Automatically disabling Freedrive mode to engage Gamepad Teleoperation.")
+                self.robot_worker.request_toggle_freedrive()
+
+            self.gamepad_teleop.set_enabled(True)
+            self.gamepad_teleop.set_inhibited(False)
+            self.gamepad_teleop_active = True
+            self.btn_toggle_gamepad.setText("🎮 GAMEPAD TELEOP: ACTIVE")
+            self.btn_toggle_gamepad.setStyleSheet("""
+                QPushButton {
+                    background-color: #0284c7;
+                    color: #ffffff;
+                    font-size: 12px;
+                    font-weight: bold;
+                    border: 2px solid #38bdf8;
+                    border-radius: 5px;
+                    padding: 4px 12px;
+                }
+                QPushButton:hover {
+                    background-color: #0369a1;
+                }
+            """)
+            print(f"[GAMEPAD] Cartesian Teleoperation ENABLED with {self.gamepad_teleop.get_controller_name()}.")
+            self.status_bar.showMessage(f"Gamepad Teleoperation Active ({self.gamepad_teleop.get_controller_name()}).", 5000)
+        else:
+            self.gamepad_teleop.set_enabled(False)
+            self.gamepad_teleop_active = False
+            self.btn_toggle_gamepad.setText("🎮 ENABLE GAMEPAD TELEOP")
+            self.btn_toggle_gamepad.setStyleSheet("""
+                QPushButton {
+                    background-color: #1e293b;
+                    color: #94a3b8;
+                    font-size: 12px;
+                    font-weight: bold;
+                    border: 1px solid #334155;
+                    border-radius: 5px;
+                    padding: 4px 12px;
+                }
+                QPushButton:hover {
+                    background-color: #334155;
+                    color: #f1f5f9;
+                }
+            """)
+            if hasattr(self, "lbl_gamepad_vel"):
+                self.lbl_gamepad_vel.setText("TCP: 0.00 m/s")
+            print("[GAMEPAD] Cartesian Teleoperation DISABLED.")
+            self.status_bar.showMessage("Gamepad Teleoperation Disabled.", 3000)
+
+    @pyqtSlot(list)
+    def on_gamepad_velocity_updated(self, v: list):
+        if not hasattr(self, "lbl_gamepad_vel"):
+            return
+        vx, vy, vz, w_base, w_w2, w_w3 = v
+        v_lin = math.sqrt(vx * vx + vy * vy + vz * vz)
+        has_joint = any(abs(x) > 1e-4 for x in (w_base, w_w2, w_w3))
+        has_cart = v_lin > 1e-4
+
+        if has_joint:
+            parts = []
+            if abs(w_base) > 1e-4:
+                theta_deg = math.degrees(self.gamepad_teleop.get_base_angle()) if hasattr(self, "gamepad_teleop") and self.gamepad_teleop else 0.0
+                parts.append(f"Base:{w_base:+5.2f} [{theta_deg:+.0f}°]")
+            if abs(w_w2) > 1e-4:
+                parts.append(f"W2:{w_w2:+5.2f}")
+            if abs(w_w3) > 1e-4:
+                parts.append(f"W3:{w_w3:+5.2f}")
+            self.lbl_gamepad_vel.setText(" | ".join(parts) + " rad/s")
+            self.lbl_gamepad_vel.setStyleSheet("""
+                color: #a855f7;
+                font-family: monospace;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 4px 8px;
+                background-color: #2e1065;
+                border: 1px solid #7e22ce;
+                border-radius: 4px;
+            """)
+        elif has_cart:
+            theta_deg = math.degrees(self.gamepad_teleop.get_base_angle()) if hasattr(self, "gamepad_teleop") and self.gamepad_teleop else 0.0
+            self.lbl_gamepad_vel.setText(f"Vx:{vx:+5.2f} Vy:{vy:+5.2f} Vz:{vz:+5.2f} | {v_lin:4.2f} m/s [Heading:{theta_deg:+.0f}°]")
+            self.lbl_gamepad_vel.setStyleSheet("""
+                color: #38bdf8;
+                font-family: monospace;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 4px 8px;
+                background-color: #082f49;
+                border: 1px solid #0284c7;
+                border-radius: 4px;
+            """)
+        else:
+            self.lbl_gamepad_vel.setText("TCP: 0.00 m/s")
+            self.lbl_gamepad_vel.setStyleSheet("""
+                color: #64748b;
+                font-family: monospace;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 4px 8px;
+                background-color: #0f172a;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+            """)
+
+    @pyqtSlot(bool, str)
+    def on_gamepad_state_changed(self, is_active: bool, message: str):
+        if hasattr(self, "lbl_gamepad_vel") and not is_active and hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():
+            self.lbl_gamepad_vel.setText(f"PAUSED ({message})")
+
+    @pyqtSlot(bool)
+    def on_invert_left_lr_toggled(self, checked: bool):
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop is not None:
+            self.gamepad_teleop.set_invert_left_horizontal(checked)
+            mode_str = "INVERTED" if checked else "NORMAL"
+            print(f"[GAMEPAD] Left Stick lateral control inverted: {checked} ({mode_str} mode)")
+            self.status_bar.showMessage(f"Gamepad Left Stick lateral: {mode_str}", 3000)
+
+    @pyqtSlot(bool)
+    def on_invert_right_lr_toggled(self, checked: bool):
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop is not None:
+            self.gamepad_teleop.set_invert_right_horizontal(checked)
+            mode_str = "INVERTED" if checked else "NORMAL"
+            print(f"[GAMEPAD] Right Stick base rotation inverted: {checked} ({mode_str} mode)")
+            self.status_bar.showMessage(f"Gamepad Right Stick base rotation: {mode_str}", 3000)
+
+    @pyqtSlot(bool)
+    def on_invert_lr_toggled(self, checked: bool):
+        self.on_invert_left_lr_toggled(checked)
+        self.on_invert_right_lr_toggled(checked)
 
     # -------------------------------------------------------------------------
     # Manual Jogging, Start Pose & Home Pose Slots
@@ -2102,6 +2523,9 @@ class UR5eRecorderStudio(QMainWindow):
         self.status_bar.showMessage(f"Active Start Position saved: [{pose_str}]", 4000)
 
     def move_to_start_pose(self):
+        # Inhibit gamepad teleoperation during discrete motion
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():
+            self.gamepad_teleop.set_inhibited(True, "Trajectory motion in progress")
         self._user_modified_joints.clear()
         self._user_targets.clear()
         action = {f"{j}.pos": math.radians(self.start_position.get(j, 0.0)) for j in UR5E_JOINTS}
@@ -2111,6 +2535,9 @@ class UR5eRecorderStudio(QMainWindow):
         self.robot_worker.request_move_pose(action)
 
     def move_to_home_pose(self):
+        # Inhibit gamepad teleoperation during discrete motion
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():
+            self.gamepad_teleop.set_inhibited(True, "Trajectory motion in progress")
         self._user_modified_joints.clear()
         self._user_targets.clear()
         home_action = {f"{j}.pos": math.radians(HOME_JOINTS_DICT[j]) for j in UR5E_JOINTS}
@@ -2136,6 +2563,10 @@ class UR5eRecorderStudio(QMainWindow):
         return 0.0
 
     def move_to_all_targets(self):
+        # Inhibit gamepad teleoperation during discrete motion
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():
+            self.gamepad_teleop.set_inhibited(True, "Trajectory motion in progress")
+
         # 1. Harvest all typed texts into _user_targets first
         for j in UR5E_JOINTS:
             if hasattr(self, "jog_inputs") and j in self.jog_inputs:
@@ -2167,6 +2598,8 @@ class UR5eRecorderStudio(QMainWindow):
         self.robot_worker.request_move_pose(target_rads)
 
     def on_jog_slider_pressed(self, j_name: str):
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():
+            self.gamepad_teleop.set_inhibited(True, "Jogging slider in progress")
         self._user_dragging_joint = j_name
         self._user_modified_joints.add(j_name)
 
@@ -2178,6 +2611,8 @@ class UR5eRecorderStudio(QMainWindow):
             self.jog_inputs[j_name].setText(f"{float(val):+.1f}")
 
     def on_jog_slider_released(self, j_name: str):
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():
+            self.gamepad_teleop.set_inhibited(True, "Trajectory motion in progress")
         if not hasattr(self, "jog_sliders") or j_name not in self.jog_sliders:
             self._user_dragging_joint = None
             return
@@ -2262,9 +2697,14 @@ class UR5eRecorderStudio(QMainWindow):
             self.end_episode_and_save()
 
     def start_recording(self):
-        # Demonstrations can be recorded via physical Freedrive hand-guiding
-        # OR via precision numeric inputs, sliders, Go to Start, Go to Home, and Move to Target.
-        mode_desc = "Freedrive Hand-Guiding" if self.freedrive_active else "Precision Axis Controls"
+        # Demonstrations can be recorded via Gamepad Cartesian Teleoperation,
+        # physical Freedrive hand-guiding, or precision axis controls.
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled() and not self.gamepad_teleop.is_inhibited():
+            mode_desc = f"Gamepad Teleoperation ({self.gamepad_teleop.get_controller_name()})"
+        elif self.freedrive_active:
+            mode_desc = "Freedrive Hand-Guiding"
+        else:
+            mode_desc = "Precision Axis Controls"
         print(f"[RECORD] Starting demonstration episode recording ({mode_desc})...")
         self.status_bar.showMessage(f"Recording episode active ({mode_desc}). Press Space to stop.", 5000)
 
@@ -2843,6 +3283,11 @@ class UR5eRecorderStudio(QMainWindow):
             self.diagnostic_worker.terminate_process()
 
         # Stop workers
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop is not None:
+            try:
+                self.gamepad_teleop.stop()
+            except Exception:
+                pass
         if self.camera_worker_1 is not None:
             self.camera_worker_1.stop()
         if self.camera_worker_2 is not None:

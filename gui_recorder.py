@@ -138,6 +138,17 @@ HOME_JOINTS_DICT = {
     "wrist_3": 0.0,
 }
 
+# Default Start Position: [-180°, -90°, 90°, 0°, 90°, -90°]
+DEFAULT_START_JOINTS = [-180.0, -90.0, 90.0, 0.0, 90.0, -90.0]
+DEFAULT_START_JOINTS_DICT = {
+    "shoulder_pan": -180.0,
+    "shoulder_lift": -90.0,
+    "elbow": 90.0,
+    "wrist_1": 0.0,
+    "wrist_2": 90.0,
+    "wrist_3": -90.0,
+}
+
 
 def detect_available_cameras() -> List[Tuple[int, str]]:
     """
@@ -865,8 +876,8 @@ class UR5eRecorderStudio(QMainWindow):
         self.setMinimumSize(1100, 800)
         self._user_dragging_joint: Optional[str] = None
 
-        # Custom Start Position (defaults to canonical HOME_JOINTS)
-        self.start_position: Dict[str, float] = dict(HOME_JOINTS_DICT)
+        # Custom Start Position (defaults to DEFAULT_START_JOINTS_DICT: -180°, -90°, 90°, 0°, 90°, -90°)
+        self.start_position: Dict[str, float] = dict(DEFAULT_START_JOINTS_DICT)
         self.jog_sliders: Dict[str, QSlider] = {}
         self.jog_inputs: Dict[str, QLineEdit] = {}
         self.jog_move_buttons: Dict[str, QPushButton] = {}

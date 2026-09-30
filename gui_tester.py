@@ -142,6 +142,17 @@ HOME_JOINTS_DICT = {
     "wrist_3": 0.0,
 }
 
+# Default Start Position: [-180°, -90°, 90°, 0°, 90°, -90°]
+DEFAULT_START_JOINTS = [-180.0, -90.0, 90.0, 0.0, 90.0, -90.0]
+DEFAULT_START_JOINTS_DICT = {
+    "shoulder_pan": -180.0,
+    "shoulder_lift": -90.0,
+    "elbow": 90.0,
+    "wrist_1": 0.0,
+    "wrist_2": 90.0,
+    "wrist_3": -90.0,
+}
+
 
 def detect_available_cameras() -> List[Tuple[int, str]]:
     """Scans Linux v4l2 device nodes and returns (index, name)."""
@@ -690,7 +701,7 @@ class PolicyRolloutWorker(QThread):
         self.max_jump_deg = max_jump_deg
         self.auto_freedrive_after = auto_freedrive_after
         self.return_start_after = return_start_after
-        self.start_pose_deg = start_pose_deg or HOME_JOINTS_DICT
+        self.start_pose_deg = start_pose_deg or DEFAULT_START_JOINTS_DICT
         self.device_name = device_name
         self.mock = mock
         self._abort_requested = False
@@ -947,8 +958,8 @@ class UR5ePolicyTesterStudio(QMainWindow):
             else:
                 self.active_model_path = Path(DEFAULT_MODEL_PATH).resolve() if "DEFAULT_MODEL_PATH" in globals() else (DEFAULT_TRAIN_DIR / "checkpoint")
 
-        # Custom Start Position (defaults to canonical HOME_JOINTS)
-        self.start_position: Dict[str, float] = dict(HOME_JOINTS_DICT)
+        # Custom Start Position (defaults to DEFAULT_START_JOINTS_DICT: -180°, -90°, 90°, 0°, 90°, -90°)
+        self.start_position: Dict[str, float] = dict(DEFAULT_START_JOINTS_DICT)
         self.freedrive_active: bool = False
         self._user_dragging_joint: Optional[str] = None
         self._user_modified_joints: set[str] = set()

@@ -243,6 +243,7 @@ class CameraWorker(QThread):
         self._running = False
         self._cap = None
         self._mutex = QMutex()
+        self._reconnect_requested = False
 
     def set_resolution(self, width: int, height: int):
         self._mutex.lock()
@@ -256,6 +257,12 @@ class CameraWorker(QThread):
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             except Exception:
                 pass
+
+    def request_reconnect(self):
+        """Requests the camera capture loop to cleanly release and reopen the video device."""
+        self._mutex.lock()
+        self._reconnect_requested = True
+        self._mutex.unlock()
 
     def run(self):
         self._running = True
@@ -287,19 +294,56 @@ class CameraWorker(QThread):
         fps_start = time.perf_counter()
 
         sim_t = 0.0
+        consecutive_failures = 0
 
         while self._running:
             t0 = time.perf_counter()
 
             self._mutex.lock()
             tw, th = self.target_width, self.target_height
+            reconnect_needed = self._reconnect_requested
+            self._reconnect_requested = False
             self._mutex.unlock()
+
+            if reconnect_needed and not self.mock:
+                if self._cap is not None:
+                    try:
+                        self._cap.release()
+                    except Exception:
+                        pass
+                    self._cap = None
+                time.sleep(0.05)
+                self._cap = cv2.VideoCapture(self.camera_id)
+                self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, tw)
+                self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, th)
+                self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+                consecutive_failures = 0
+                if self._cap.isOpened():
+                    self.status_signal.emit(
+                        self.camera_id,
+                        True,
+                        f"Camera /dev/video{self.camera_id} reconnected @ {self.target_fps} FPS"
+                    )
 
             if not self.mock and self._cap and self._cap.isOpened():
                 ret, frame = self._cap.read()
-                if not ret:
+                if not ret or frame is None:
+                    consecutive_failures += 1
+                    # Auto-recover if video frame acquisition stalls (e.g. V4L2 queue drops during disk save/h264 encode)
+                    if consecutive_failures >= 15:
+                        try:
+                            self._cap.release()
+                        except Exception:
+                            pass
+                        time.sleep(0.05)
+                        self._cap = cv2.VideoCapture(self.camera_id)
+                        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, tw)
+                        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, th)
+                        self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+                        consecutive_failures = 0
                     time.sleep(0.01)
                     continue
+                consecutive_failures = 0
                 # Resize to target resolution if different
                 if frame.shape[1] != tw or frame.shape[0] != th:
                     frame = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_AREA)
@@ -1174,6 +1218,13 @@ class UR5eRecorderStudio(QMainWindow):
         self.lbl_cam_info = QLabel("Format: 320x240 RGB @ 30 FPS")
         self.lbl_cam_info.setStyleSheet("color: #64748b; font-size: 10px; margin-left: 4px;")
         cam_ctrl_bar.addWidget(self.lbl_cam_info)
+
+        self.btn_refresh_cams = QPushButton("🔄 Refresh (F5)")
+        self.btn_refresh_cams.setStyleSheet("font-size: 11px; padding: 2px 8px; font-weight: bold;")
+        self.btn_refresh_cams.setToolTip("Reconnect camera streams if preview freezes (Shortcut: F5)")
+        self.btn_refresh_cams.clicked.connect(self.refresh_camera_streams)
+        cam_ctrl_bar.addWidget(self.btn_refresh_cams)
+
         cam_ctrl_bar.addStretch()
 
         left_column.addLayout(cam_ctrl_bar)
@@ -2079,6 +2130,10 @@ class UR5eRecorderStudio(QMainWindow):
         self.shortcut_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         self.shortcut_esc.activated.connect(self.stop_session)
 
+        # F5: Refresh Camera Streams
+        self.shortcut_f5 = QShortcut(QKeySequence(Qt.Key.Key_F5), self)
+        self.shortcut_f5.activated.connect(self.refresh_camera_streams)
+
     # -------------------------------------------------------------------------
     # Camera Slots & Multiplexing
     # -------------------------------------------------------------------------
@@ -2214,6 +2269,16 @@ class UR5eRecorderStudio(QMainWindow):
                 self.combo_resolution.addItem(custom_label)
                 self.combo_resolution.setCurrentIndex(self.combo_resolution.count() - 1)
             self.combo_resolution.blockSignals(False)
+
+    def refresh_camera_streams(self):
+        """Flushes and reconnects active camera capture workers to clear any V4L2 queue stall."""
+        print("[CAMERA] Refreshing camera streams...")
+        if hasattr(self, "camera_worker_1") and self.camera_worker_1:
+            self.camera_worker_1.request_reconnect()
+        if hasattr(self, "camera_worker_2") and self.camera_worker_2:
+            self.camera_worker_2.request_reconnect()
+        if hasattr(self, "status_bar"):
+            self.status_bar.showMessage("Camera streams refreshed.", 3000)
 
     def update_visualizer_command(self):
         clean_name = self.dataset_root.name
@@ -2881,6 +2946,9 @@ class UR5eRecorderStudio(QMainWindow):
         print(f"[RECORD] Starting demonstration episode recording ({mode_desc})...")
         self.status_bar.showMessage(f"Recording episode active ({mode_desc}). Press Space to stop.", 5000)
 
+        # Refresh camera streams on start to ensure clean driver buffers
+        self.refresh_camera_streams()
+
         # Prepare dataset buffer
         self.is_recording = True
         self.record_start_time = time.perf_counter()
@@ -3024,6 +3092,9 @@ class UR5eRecorderStudio(QMainWindow):
             self.status_bar.showMessage(f"Error saving episode: {e}", 8000)
             QMessageBox.critical(self, "Save Error", f"An error occurred while saving the demonstration:\n\n{e}")
         finally:
+            # Refresh camera streams to clear any V4L2 stalls caused by dataset disk I/O / ffmpeg encoding
+            self.refresh_camera_streams()
+
             # Re-enable controls and restore green start state
             self.btn_record.setEnabled(True)
             self.btn_stop_session.setEnabled(True)
@@ -3071,6 +3142,9 @@ class UR5eRecorderStudio(QMainWindow):
 
         discarded_count = len(self.current_episode_buffer)
         self.current_episode_buffer.clear()
+
+        # Refresh camera streams when canceling
+        self.refresh_camera_streams()
 
         # Reset timer and buttons
         self.lbl_timer.setText("00:00.0")

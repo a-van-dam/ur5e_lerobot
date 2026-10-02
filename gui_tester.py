@@ -1029,6 +1029,13 @@ class UR5ePolicyTesterStudio(QMainWindow):
                 self.gamepad_teleop.set_base_angle_provider(
                     lambda: self.robot_worker.get_latest_joints().get("shoulder_pan", 0.0)
                 )
+                self.gamepad_teleop.set_joint_positions_provider(
+                    lambda: self.robot_worker.get_latest_joints()
+                )
+                if hasattr(self, "slider_gamepad_speed"):
+                    self.gamepad_teleop.set_speed_percentage(self.slider_gamepad_speed.value())
+                if hasattr(self, "slider_gamepad_accel"):
+                    self.gamepad_teleop.set_accel_percentage(self.slider_gamepad_accel.value())
                 if self.mock_mode:
                     self.gamepad_teleop.set_velocity_callback(
                         lambda v: self.robot_worker.set_mock_cartesian_velocity(v)
@@ -1036,6 +1043,8 @@ class UR5ePolicyTesterStudio(QMainWindow):
                 self.gamepad_teleop.status_updated.connect(self.on_gamepad_status_updated)
                 self.gamepad_teleop.velocity_updated.connect(self.on_gamepad_velocity_updated)
                 self.gamepad_teleop.teleop_state_changed.connect(self.on_gamepad_state_changed)
+                self.gamepad_teleop.button_select_pressed.connect(self.on_gamepad_select_clicked)
+                self.gamepad_teleop.button_start_pressed.connect(self.on_gamepad_start_clicked)
                 self.gamepad_teleop.start()
             except Exception as e:
                 print(f"[GAMEPAD WARNING] Could not start Gamepad Teleoperation: {e}", file=sys.__stderr__)
@@ -1601,6 +1610,77 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.chk_invert_lr = self.chk_invert_left_lr
         gamepad_layout.addLayout(gamepad_row3)
 
+        # Row 4: Speed and Acceleration Sliders with Live Readouts
+        gamepad_row4 = QHBoxLayout()
+        gamepad_row4.setSpacing(8)
+
+        # Master Speed Slider
+        self.lbl_gamepad_speed = QLabel("⚡ Speed: 50%")
+        self.lbl_gamepad_speed.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold;")
+        self.slider_gamepad_speed = QSlider(Qt.Orientation.Horizontal)
+        self.slider_gamepad_speed.setRange(10, 100)
+        self.slider_gamepad_speed.setValue(50)
+        self.slider_gamepad_speed.setFixedWidth(110)
+        self.slider_gamepad_speed.setFixedHeight(18)
+        self.slider_gamepad_speed.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #334155;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #38bdf8;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #f1f5f9;
+                width: 12px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 6px;
+            }
+        """)
+        self.slider_gamepad_speed.setToolTip("Scale maximum gamepad teleoperation speed (10% to 100%).")
+        self.slider_gamepad_speed.valueChanged.connect(self.on_gamepad_speed_changed)
+        gamepad_row4.addWidget(self.lbl_gamepad_speed)
+        gamepad_row4.addWidget(self.slider_gamepad_speed)
+
+        gamepad_row4.addSpacing(8)
+
+        # Master Acceleration Slider
+        self.lbl_gamepad_accel = QLabel("🚀 Accel: 50%")
+        self.lbl_gamepad_accel.setStyleSheet("color: #4ade80; font-size: 11px; font-weight: bold;")
+        self.slider_gamepad_accel = QSlider(Qt.Orientation.Horizontal)
+        self.slider_gamepad_accel.setRange(10, 100)
+        self.slider_gamepad_accel.setValue(50)
+        self.slider_gamepad_accel.setFixedWidth(110)
+        self.slider_gamepad_accel.setFixedHeight(18)
+        self.slider_gamepad_accel.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #334155;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #4ade80;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #f1f5f9;
+                width: 12px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 6px;
+            }
+        """)
+        self.slider_gamepad_accel.setToolTip("Scale acceleration ramp rate (10% to 100%). Lower values prevent Wrist 1 protective stops.")
+        self.slider_gamepad_accel.valueChanged.connect(self.on_gamepad_accel_changed)
+        gamepad_row4.addWidget(self.lbl_gamepad_accel)
+        gamepad_row4.addWidget(self.slider_gamepad_accel)
+
+        gamepad_row4.addStretch()
+        gamepad_layout.addLayout(gamepad_row4)
+
         right_column.addWidget(gamepad_box)
 
         # 5. Real-Time 6-DoF Joint Telemetry HUD
@@ -2071,6 +2151,14 @@ class UR5ePolicyTesterStudio(QMainWindow):
         level = "INFO" if is_connected else "ERROR"
         print(f"[{level}] [UR5e] {message}")
         self.status_bar.showMessage(message, 5000)
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop:
+            if is_connected and hasattr(self.robot_worker, "_robot") and self.robot_worker._robot:
+                if hasattr(self.robot_worker._robot, "sock") and self.robot_worker._robot.sock:
+                    self.gamepad_teleop.set_external_socket(self.robot_worker._robot.sock)
+            elif not is_connected and "Mock" in message:
+                self.mock_mode = True
+                self.gamepad_teleop.mock = True
+                self.gamepad_teleop.set_velocity_callback(self.robot_worker.apply_cartesian_velocity)
 
     @pyqtSlot(bool)
     def on_freedrive_state_changed(self, active: bool):
@@ -2166,6 +2254,13 @@ class UR5ePolicyTesterStudio(QMainWindow):
                     slider.setValue(int(round(deg_val)))
                     slider.blockSignals(False)
 
+        # Sync live base motor angle and 6-DoF joint state to gamepad teleop
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop:
+            if "shoulder_pan" in joints:
+                self.gamepad_teleop.set_base_angle(joints["shoulder_pan"])
+            if len(joints) >= 6:
+                self.gamepad_teleop.set_joint_positions(joints)
+
     def on_freedrive_button_clicked(self):
         self.robot_worker.request_toggle_freedrive()
 
@@ -2229,6 +2324,11 @@ class UR5ePolicyTesterStudio(QMainWindow):
             if self.freedrive_active:
                 print("[GAMEPAD] Automatically disabling Freedrive mode to engage Gamepad Teleoperation.")
                 self.robot_worker.request_toggle_freedrive()
+
+            # Ensure shared socket is provided to gamepad worker
+            if hasattr(self.robot_worker, "_robot") and self.robot_worker._robot:
+                if hasattr(self.robot_worker._robot, "sock") and self.robot_worker._robot.sock:
+                    self.gamepad_teleop.set_external_socket(self.robot_worker._robot.sock)
 
             self.gamepad_teleop.set_enabled(True)
             self.gamepad_teleop.set_inhibited(False)
@@ -2354,6 +2454,42 @@ class UR5ePolicyTesterStudio(QMainWindow):
     def on_invert_lr_toggled(self, checked: bool):
         self.on_invert_left_lr_toggled(checked)
         self.on_invert_right_lr_toggled(checked)
+
+    @pyqtSlot(int)
+    def on_gamepad_speed_changed(self, value: int):
+        if hasattr(self, "lbl_gamepad_speed"):
+            self.lbl_gamepad_speed.setText(f"⚡ Speed: {value}%")
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop is not None:
+            self.gamepad_teleop.set_speed_percentage(value)
+
+    @pyqtSlot(int)
+    def on_gamepad_accel_changed(self, value: int):
+        if hasattr(self, "lbl_gamepad_accel"):
+            self.lbl_gamepad_accel.setText(f"🚀 Accel: {value}%")
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop is not None:
+            self.gamepad_teleop.set_accel_percentage(value)
+
+    @pyqtSlot()
+    def on_gamepad_select_clicked(self):
+        """Gamepad Select button pressed -> Trigger Go to Start / Home position."""
+        if hasattr(self, "policy_running") and self.policy_running:
+            print("[GAMEPAD] Cannot move to Start position while policy rollout is active.")
+            self.status_bar.showMessage("Cannot Go to Start while rollout is active.", 3000)
+            return
+        print("[GAMEPAD BUTTON] 'Select' pressed -> Triggering Go to Start Pose.")
+        if hasattr(self, "btn_go_start"):
+            self.btn_go_start.click()
+        else:
+            self.move_to_start_pose()
+
+    @pyqtSlot()
+    def on_gamepad_start_clicked(self):
+        """Gamepad Start button pressed -> Toggle Policy Evaluation (same as Enter)."""
+        print("[GAMEPAD BUTTON] 'Start' pressed -> Toggling Policy Evaluation.")
+        if hasattr(self, "btn_run_test"):
+            self.btn_run_test.click()
+        else:
+            self.start_policy_evaluation()
 
     # -------------------------------------------------------------------------
     # Manual Jogging, Start Pose & Home Navigation Slots

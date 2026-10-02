@@ -2,24 +2,25 @@
 """
 UR5e Gamepad Teleoperation Controller
 =====================================
-Dedicated module providing real-time Cartesian (TCP / end-effector) and direct joint
+Dedicated module providing real-time Cartesian (TCP / tool) and direct joint
 teleoperation for the Universal Robots UR5e arm using a standard USB/Bluetooth gamepad via Pygame.
 
 Movement Scheme:
-- Left Stick (X/Y)       : TCP Translation Forward/Backward (+X/-X) and Left/Right (+Y/-Y) via `speedl`
-- Right Stick (Y)        : TCP Translation Vertical Up/Down (+Z/-Z) via `speedl`
+- Left Stick (X/Y)       : Tool Translation Forward/Backward (+X/-X) and Left/Right (+Y/-Y) in robot heading frame via `speedl`
+- Right Stick (Y)        : Tool Translation Vertical Up/Down (+Z/-Z) via `speedl`
 - Right Stick (X)        : DIRECT Base motor rotation (joint 0 / shoulder_pan) via `speedj`
-- Shoulder Buttons (LB/RB: DIRECT Wrist 2 rotation (joint 4 / wrist_2) via `speedj`
+- Shoulder Buttons (LB/RB): DIRECT Wrist 2 rotation (joint 4 / wrist_2) via `speedj`
 - Triggers (LT/RT)       : DIRECT Wrist 3 rotation (joint 5 / wrist_3) via `speedj`
-- Neutral Sticks/Buttons : Instant `stopl` / `stopj` braking (zero drift)
+- Select / Back Button   : Go to Start / Home Position
+- Start / Options Button : Toggle Episode Demonstration Recording (Space)
+- Neutral Sticks/Buttons : Smooth software deceleration ramp -> `stopl` / `stopj` (zero drift)
 
 Features:
-- Configurable axis and button mapping dataclass with support for Xbox, PlayStation, and generic pads.
-- Analog deadzone filtering (10%) and smooth velocity curve scaling.
-- Seamless automatic switching between Cartesian tool translation (`speedl`) and direct joint rotation (`speedj`).
-- High-frequency background polling loop running at 20-50 Hz (default 35 Hz).
-- Thread-safe safety interlocks for integration into PyQt6 GUI recorder.
-- Standalone CLI runner for direct terminal diagnostics.
+- Decoupled Wrist 3: Tool positioning in space via sticks keeps Wrist 3 unaffected.
+- Smooth acceleration ramping (slew rate limiter) protecting Wrist 1 from protective stops.
+- Dynamic user scaling for Speed (10%-100%, default 50%) and Acceleration (10%-100%, default 50%).
+- Universal support for Xbox, PlayStation, and generic gamepads.
+- Standard default start pose: [-180, -90, 90, 0, 90, -90].
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import os
 import socket
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Enable background events in SDL before initializing Pygame so gamepads work without a focused window
 os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
@@ -41,6 +42,24 @@ try:
     PYGAME_AVAILABLE = True
 except ImportError:
     PYGAME_AVAILABLE = False
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+
+try:
+    from rtde_receive import RTDEReceiveInterface
+    RTDE_RX_AVAILABLE = True
+except ImportError:
+    try:
+        from ur_rtde import rtde_receive
+        RTDEReceiveInterface = rtde_receive.RTDEReceiveInterface
+        RTDE_RX_AVAILABLE = True
+    except ImportError:
+        RTDEReceiveInterface = None
+        RTDE_RX_AVAILABLE = False
 
 # Safe import of PyQt6 components with graceful fallback to standard threading
 try:
@@ -106,6 +125,19 @@ except ImportError:
             self.mutex.unlock()
 
 
+# Standard default start pose in degrees and radians: [-180, -90, 90, 0, 90, -90]
+DEFAULT_START_JOINTS_DEG = [-180.0, -90.0, 90.0, 0.0, 90.0, -90.0]
+DEFAULT_START_JOINTS_RAD = [math.radians(x) for x in DEFAULT_START_JOINTS_DEG]
+UR5E_JOINT_NAMES = [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow",
+    "wrist_1",
+    "wrist_2",
+    "wrist_3",
+]
+
+
 # =============================================================================
 # 1. Modular Gamepad Configuration Mapping
 # =============================================================================
@@ -115,14 +147,18 @@ class GamepadConfig:
     """
     Configurable hardware mappings, deadzones, and velocity scaling for UR5e teleoperation.
     Standard Xbox / SDL2 layout on Linux:
-      - Left Stick X (Axis 0)      : Left / Right TCP translation (-Y / +Y)
-      - Left Stick Y (Axis 1)      : Forward / Backward TCP translation (+X / -X)
+      - Left Stick X (Axis 0)      : Left / Right translation (-Y / +Y)
+      - Left Stick Y (Axis 1)      : Forward / Backward translation (+X / -X)
       - Right Stick X (Axis 3)     : Direct Base motor rotation (-shoulder_pan / +shoulder_pan)
-      - Right Stick Y (Axis 4)     : Up / Down vertical TCP translation (+Z / -Z)
-      - Shoulder Buttons (Btn 4/5) : Direct Wrist 2 rotation (LB = -wrist_2, RB = +wrist_2)
-      - Triggers (Axis 2/5)        : Direct Wrist 3 rotation (LT = -wrist_3, RT = +wrist_3)
+      - Right Stick Y (Axis 4)     : Vertical Up / Down translation (+Z / -Z)
+      - Left Trigger (Axis 2)      : Rotate Wrist 3 in negative direction (-wrist_3)
+      - Right Trigger (Axis 5)     : Rotate Wrist 3 in positive direction (+wrist_3)
+      - Left Shoulder (Button 4)   : Rotate Wrist 2 in negative direction (-wrist_2)
+      - Right Shoulder (Button 5)  : Rotate Wrist 2 in positive direction (+wrist_2)
+      - Select / Back (Button 6)   : Go to Start / Home Position
+      - Start / Options (Button 7) : Toggle Demonstration Recording (Space)
     """
-    # Analog axis channel assignments
+    # Axis indices
     axis_left_x: int = 0
     axis_left_y: int = 1
     axis_right_x: int = 3
@@ -130,40 +166,99 @@ class GamepadConfig:
     axis_trigger_left: int = 2
     axis_trigger_right: int = 5
 
-    # Button channel assignments (Shoulder bumpers / L1 & R1)
-    button_shoulder_left: int = 4   # LB / L1: Wrist 2 CCW
-    button_shoulder_right: int = 5  # RB / R1: Wrist 2 CW
+    # Button indices
+    button_shoulder_left: int = 4
+    button_shoulder_right: int = 5
+    button_select: int = 6
+    button_start: int = 7
 
-    # Inversions (1.0 or -1.0)
-    # Pygame returns -1.0 for pushing sticks UP/FORWARD; inverted to +1.0 for UR5e base frame
-    invert_x: float = -1.0          # Stick forward -> +X (TCP forward in robot base frame)
-    invert_y: float = 1.0           # Stick right -> +Y (TCP right in robot base frame)
-    invert_z: float = -1.0          # Stick up -> +Z (TCP upward)
-    invert_base: float = 1.0        # Right stick right -> +Base rotation
-    invert_wrist2: float = 1.0      # RB -> +Wrist 2 rotation, LB -> -Wrist 2 rotation
-    invert_wrist3: float = 1.0      # RT -> +Wrist 3 rotation, LT -> -Wrist 3 rotation
+    # Direction inversions (+1.0 normal, -1.0 inverted)
+    invert_x: float = -1.0
+    invert_y: float = 1.0
+    invert_z: float = -1.0
+    invert_base: float = 1.0
+    invert_wrist2: float = 1.0
+    invert_wrist3: float = 1.0
 
-    # Deadzones & Scaling
-    deadzone: float = 0.10             # Analog stick deadzone (10%)
-    trigger_deadzone: float = 0.05     # Trigger deadzone (5%)
-    max_linear_velocity: float = 0.15  # Max TCP translational speed (m/s) -> 15 cm/s
-    max_base_velocity: float = 0.50    # Max Base angular speed (rad/s) -> ~28.6 deg/s
-    max_wrist2_velocity: float = 0.50  # Max Wrist 2 angular speed (rad/s) -> ~28.6 deg/s
-    max_wrist3_velocity: float = 0.75  # Max Wrist 3 angular speed (rad/s) -> ~43.0 deg/s
-    velocity_curve_exponent: float = 1.0  # 1.0 = linear, 1.5-2.0 = exponential fine control
+    # User togglable direction inversions
+    invert_left_horizontal: bool = False
+    invert_right_horizontal: bool = False
 
-    # Orientation / Heading Frame settings
-    heading_relative: bool = True           # Left Stick moves relative to current arm base heading
-    heading_offset_rad: float = 0.0         # Angular calibration offset in radians (default 0.0)
-    invert_left_horizontal: bool = False    # Invert Left/Right lateral translation on Left Stick
-    invert_right_horizontal: bool = False   # Invert Left/Right base motor rotation on Right Stick
+    # Heading-relative transformation
+    heading_relative: bool = True
+    heading_offset_rad: float = 0.0
+
+    # Filtering & Response curve
+    deadzone: float = 0.10
+    trigger_deadzone: float = 0.05
+    velocity_curve_exponent: float = 1.0
+
+    # Master Scaling Factors (0.10 to 1.00, default 0.50 = 50%)
+    speed_scale: float = 0.50
+    accel_scale: float = 0.50
+
+    # Baseline Velocities at 100% scale
+    base_linear_velocity: float = 0.15      # m/s -> 0.075 m/s at 50%
+    base_base_velocity: float = 0.50        # rad/s -> 0.25 rad/s at 50%
+    base_wrist2_velocity: float = 0.50      # rad/s -> 0.25 rad/s at 50%
+    base_wrist3_velocity: float = 0.75      # rad/s -> 0.375 rad/s at 50%
+
+    # Baseline Accelerations at 100% scale (gentle defaults eliminate protective stops)
+    base_linear_acceleration: float = 0.35  # m/s^2 -> 0.175 m/s^2 at 50%
+    base_joint_acceleration: float = 0.60   # rad/s^2 -> 0.30 rad/s^2 at 50%
 
     # URScript execution parameters
-    linear_acceleration: float = 0.5   # Tool acceleration for speedl (m/s^2)
-    joint_acceleration: float = 1.2    # Joint acceleration for speedj (rad/s^2)
-    time_step: float = 0.08            # URScript watchdog duration (seconds)
-    poll_rate_hz: float = 35.0         # Gamepad poll & command stream frequency (Hz)
-    robot_port: int = 30002            # Secondary client interface port for URScript
+    time_step: float = 0.08                 # URScript watchdog duration (seconds)
+    poll_rate_hz: float = 35.0              # Gamepad poll & command stream frequency (Hz)
+    robot_port: int = 30002                 # Secondary client interface port for URScript
+
+    @property
+    def max_linear_velocity(self) -> float:
+        return self.base_linear_velocity * self.speed_scale
+
+    @max_linear_velocity.setter
+    def max_linear_velocity(self, val: float):
+        self.base_linear_velocity = val / max(1e-3, self.speed_scale)
+
+    @property
+    def max_base_velocity(self) -> float:
+        return self.base_base_velocity * self.speed_scale
+
+    @max_base_velocity.setter
+    def max_base_velocity(self, val: float):
+        self.base_base_velocity = val / max(1e-3, self.speed_scale)
+
+    @property
+    def max_wrist2_velocity(self) -> float:
+        return self.base_wrist2_velocity * self.speed_scale
+
+    @max_wrist2_velocity.setter
+    def max_wrist2_velocity(self, val: float):
+        self.base_wrist2_velocity = val / max(1e-3, self.speed_scale)
+
+    @property
+    def max_wrist3_velocity(self) -> float:
+        return self.base_wrist3_velocity * self.speed_scale
+
+    @max_wrist3_velocity.setter
+    def max_wrist3_velocity(self, val: float):
+        self.base_wrist3_velocity = val / max(1e-3, self.speed_scale)
+
+    @property
+    def linear_acceleration(self) -> float:
+        return max(0.05, self.base_linear_acceleration * self.accel_scale)
+
+    @linear_acceleration.setter
+    def linear_acceleration(self, val: float):
+        self.base_linear_acceleration = val / max(1e-3, self.accel_scale)
+
+    @property
+    def joint_acceleration(self) -> float:
+        return max(0.05, self.base_joint_acceleration * self.accel_scale)
+
+    @joint_acceleration.setter
+    def joint_acceleration(self, val: float):
+        self.base_joint_acceleration = val / max(1e-3, self.accel_scale)
 
 
 # Presets for popular controller families
@@ -172,6 +267,7 @@ XBOX_CONFIG = GamepadConfig(
     axis_right_x=3, axis_right_y=4,
     axis_trigger_left=2, axis_trigger_right=5,
     button_shoulder_left=4, button_shoulder_right=5,
+    button_select=6, button_start=7,
     invert_x=-1.0, invert_y=1.0, invert_z=-1.0,
     invert_base=1.0, invert_wrist2=1.0, invert_wrist3=1.0,
 )
@@ -181,6 +277,7 @@ PLAYSTATION_CONFIG = GamepadConfig(
     axis_right_x=2, axis_right_y=3,
     axis_trigger_left=4, axis_trigger_right=5,
     button_shoulder_left=4, button_shoulder_right=5,
+    button_select=8, button_start=9,
     invert_x=-1.0, invert_y=1.0, invert_z=-1.0,
     invert_base=1.0, invert_wrist2=1.0, invert_wrist3=1.0,
 )
@@ -195,19 +292,15 @@ def get_recommended_config_for_name(controller_name: str) -> GamepadConfig:
 
 
 # =============================================================================
-# 2. Mathematical Utilities for Filtering & Velocity Computation
+# 2. Mathematical Utilities & String Formatting
 # =============================================================================
 
 def apply_deadzone(value: float, deadzone: float, exponent: float = 1.0) -> float:
-    """
-    Applies linear or polynomial deadzone rescaling.
-    Ensures velocity smoothly starts at 0.0 as soon as the deadzone threshold is crossed.
-    """
+    """Applies linear or polynomial deadzone rescaling starting smoothly at 0.0."""
     abs_val = abs(value)
     if abs_val <= deadzone:
         return 0.0
 
-    # Rescale [deadzone, 1.0] -> [0.0, 1.0]
     scaled = (abs_val - deadzone) / (1.0 - deadzone)
     scaled = min(1.0, max(0.0, scaled))
 
@@ -217,25 +310,25 @@ def apply_deadzone(value: float, deadzone: float, exponent: float = 1.0) -> floa
     return math.copysign(scaled, value)
 
 
-def format_speedl(v: List[float], a: float = 0.5, t: float = 0.08) -> str:
-    """Formats a Cartesian TCP velocity command as a standard URScript string."""
+def format_speedl(v: List[float], a: float = 0.35, t: float = 0.08) -> str:
+    """Formats a Cartesian TCP velocity command as a standard URScript string ending with newline."""
     v_str = ", ".join(f"{val:.4f}" for val in v)
     return f"speedl([{v_str}], a={a:.2f}, t={t:.2f})\n"
 
 
-def format_speedj(qd: List[float], a: float = 1.2, t: float = 0.08) -> str:
-    """Formats a joint velocity command as a standard URScript string."""
+def format_speedj(qd: List[float], a: float = 0.60, t: float = 0.08) -> str:
+    """Formats a joint velocity command as a standard URScript string ending with newline."""
     qd_str = ", ".join(f"{val:.4f}" for val in qd)
     return f"speedj([{qd_str}], a={a:.2f}, t={t:.2f})\n"
 
 
-def format_stopl(a: float = 0.5) -> str:
-    """Formats a URScript Cartesian stop command to smoothly decelerate to rest."""
+def format_stopl(a: float = 0.35) -> str:
+    """Formats a URScript Cartesian stop command to smoothly decelerate to rest ending with newline."""
     return f"stopl({a:.2f})\n"
 
 
-def format_stopj(a: float = 1.5) -> str:
-    """Formats a URScript joint stop command to smoothly decelerate to rest."""
+def format_stopj(a: float = 0.60) -> str:
+    """Formats a URScript joint stop command to smoothly decelerate to rest ending with newline."""
     return f"stopj({a:.2f})\n"
 
 
@@ -246,13 +339,25 @@ def format_stopj(a: float = 1.5) -> str:
 class UR5eGamepadTeleop(QThread):
     """
     High-frequency background worker thread for UR5e teleoperation.
-    Supports Cartesian translation (`speedl`) and direct joint rotations (`speedj`).
+    Features:
+      - Tool 3D position translation in space (`speedl`) with Wrist 3 strictly decoupled
+      - Direct Base pan via Right Stick X (`speedj`) with inversion toggle
+      - Direct Wrist 2 rotation via Shoulder buttons (`speedj`)
+      - Direct Wrist 3 rotation via Triggers (`speedj`)
+      - Select button: Go to Start / Home Position signal
+      - Start button: Start / End Episode Recording (Space) signal
+      - Acceleration slew-rate limiting preventing Wrist 1 protective stops
+      - User-configurable speed and acceleration scaling (10% to 100%)
     """
     # Qt Signals for GUI integration
     status_updated = pyqtSignal(bool, str)        # (is_connected, controller_name)
     velocity_updated = pyqtSignal(list)           # [vx, vy, vz, w_base, w_wrist2, w_wrist3]
     teleop_state_changed = pyqtSignal(bool, str)  # (is_active, status_message)
     command_sent = pyqtSignal(str)                # URScript command string
+    speed_scale_changed = pyqtSignal(float)       # speed_scale (0.10 to 1.00)
+    accel_scale_changed = pyqtSignal(float)       # accel_scale (0.10 to 1.00)
+    button_select_pressed = pyqtSignal()          # Trigger Go to Start position
+    button_start_pressed = pyqtSignal()           # Trigger Start/End demonstration recording
 
     def __init__(
         self,
@@ -275,11 +380,12 @@ class UR5eGamepadTeleop(QThread):
         self._inhibited = False        # Safety interlock (Freedrive, discrete moves)
         self._inhibition_reason = ""
         self._is_moving = False        # True while non-zero velocity commands are active
-        self._active_mode: Optional[str] = None  # "cartesian", "joint", or None
+        self._active_mode: Optional[str] = None
 
         # Hardware connection & Gamepad state
         self._socket: Optional[socket.socket] = None
         self._external_socket: Optional[socket.socket] = None
+        self._rtde_rx: Optional[Any] = None
         self._velocity_callback: Optional[Callable[[List[float]], None]] = None
         self._joystick: Optional[pygame.joystick.Joystick] = None
         self._controller_name: str = "No Gamepad Detected"
@@ -289,24 +395,94 @@ class UR5eGamepadTeleop(QThread):
         self._lt_activated = False
         self._rt_activated = False
 
-        # Latest combined telemetry vector: [vx, vy, vz, w_base, w_wrist2, w_wrist3]
+        # Edge detectors for Select and Start buttons
+        self._prev_btn_select = False
+        self._prev_btn_start = False
+
+        # Commanded velocity state for smooth software slew-rate limiting
+        self._current_commanded_cart: List[float] = [0.0] * 6
+        self._current_commanded_joint: List[float] = [0.0] * 6
         self._latest_state: List[float] = [0.0] * 6
 
+        # Active robot joint angles (radians)
+        self._current_joints: List[float] = list(DEFAULT_START_JOINTS_RAD)
+        self._joint_positions_provider: Optional[Callable[[], List[float] | Dict[str, float]]] = None
+
         # Base orientation tracking for heading-relative Cartesian control (radians)
-        self._current_base_angle: float = 0.0
+        self._current_base_angle: float = self._current_joints[0]
         self._base_angle_provider: Optional[Callable[[], float]] = None
 
     # -------------------------------------------------------------------------
     # Public Control & Configuration API
     # -------------------------------------------------------------------------
 
+    def set_speed_scale(self, scale: float):
+        """Sets master speed scale (0.10 to 1.00)."""
+        with QMutexLocker(self._lock):
+            self.config.speed_scale = max(0.05, min(1.0, float(scale)))
+        self.speed_scale_changed.emit(self.config.speed_scale)
+
+    def get_speed_scale(self) -> float:
+        with QMutexLocker(self._lock):
+            return self.config.speed_scale
+
+    def set_speed_percentage(self, pct: int):
+        self.set_speed_scale(float(pct) / 100.0)
+
+    def get_speed_percentage(self) -> int:
+        return int(round(self.get_speed_scale() * 100.0))
+
+    def set_accel_scale(self, scale: float):
+        """Sets master acceleration scale (0.10 to 1.00)."""
+        with QMutexLocker(self._lock):
+            self.config.accel_scale = max(0.05, min(1.0, float(scale)))
+        self.accel_scale_changed.emit(self.config.accel_scale)
+
+    def get_accel_scale(self) -> float:
+        with QMutexLocker(self._lock):
+            return self.config.accel_scale
+
+    def set_accel_percentage(self, pct: int):
+        self.set_accel_scale(float(pct) / 100.0)
+
+    def get_accel_percentage(self) -> int:
+        return int(round(self.get_accel_scale() * 100.0))
+
+    def set_joint_positions(self, joints: Dict[str, float] | List[float]):
+        """Updates internal joint position state from live robot telemetry."""
+        with QMutexLocker(self._lock):
+            if isinstance(joints, dict):
+                if all(k in joints for k in UR5E_JOINT_NAMES):
+                    self._current_joints = [float(joints[k]) for k in UR5E_JOINT_NAMES]
+                    self._current_base_angle = self._current_joints[0]
+            elif isinstance(joints, (list, tuple)) and len(joints) >= 6:
+                self._current_joints = [float(x) for x in joints[:6]]
+                self._current_base_angle = self._current_joints[0]
+
+    def set_joint_positions_provider(self, provider_fn: Callable[[], List[float] | Dict[str, float]]):
+        with QMutexLocker(self._lock):
+            self._joint_positions_provider = provider_fn
+
+    def get_joint_positions(self) -> List[float]:
+        with QMutexLocker(self._lock):
+            if self._joint_positions_provider is not None:
+                try:
+                    val = self._joint_positions_provider()
+                    if isinstance(val, dict):
+                        if all(k in val for k in UR5E_JOINT_NAMES):
+                            return [float(val[k]) for k in UR5E_JOINT_NAMES]
+                    elif isinstance(val, (list, tuple)) and len(val) >= 6:
+                        return [float(x) for x in val[:6]]
+                except Exception:
+                    pass
+            return list(self._current_joints)
+
     def set_base_angle(self, angle_rad: float):
-        """Updates the current base motor angle (shoulder_pan) in radians."""
         with QMutexLocker(self._lock):
             self._current_base_angle = float(angle_rad)
+            self._current_joints[0] = float(angle_rad)
 
     def get_base_angle(self) -> float:
-        """Returns the active base motor angle (shoulder_pan) in radians."""
         with QMutexLocker(self._lock):
             if self._base_angle_provider is not None:
                 try:
@@ -316,43 +492,35 @@ class UR5eGamepadTeleop(QThread):
             return self._current_base_angle
 
     def set_base_angle_provider(self, provider_fn: Callable[[], float]):
-        """Registers a callable returning the live robot base joint angle in radians."""
         with QMutexLocker(self._lock):
             self._base_angle_provider = provider_fn
 
     def set_invert_left_horizontal(self, invert: bool):
-        """Toggles direction inversion for Left Stick lateral movement (Left/Right)."""
         with QMutexLocker(self._lock):
             self.config.invert_left_horizontal = bool(invert)
 
     def is_invert_left_horizontal(self) -> bool:
-        """Returns True if Left Stick lateral movement is inverted."""
         with QMutexLocker(self._lock):
             return self.config.invert_left_horizontal
 
     def set_invert_right_horizontal(self, invert: bool):
-        """Toggles direction inversion for Right Stick base motor rotation."""
         with QMutexLocker(self._lock):
             self.config.invert_right_horizontal = bool(invert)
 
     def is_invert_right_horizontal(self) -> bool:
-        """Returns True if Right Stick base rotation is inverted."""
         with QMutexLocker(self._lock):
             return self.config.invert_right_horizontal
 
     def set_invert_horizontal(self, invert: bool):
-        """Toggles direction inversion for left-to-right movement on BOTH analog sticks."""
         with QMutexLocker(self._lock):
             self.config.invert_left_horizontal = bool(invert)
             self.config.invert_right_horizontal = bool(invert)
 
     def is_invert_horizontal(self) -> bool:
-        """Returns True if left-to-right movement is inverted on both sticks."""
         with QMutexLocker(self._lock):
             return self.config.invert_left_horizontal and self.config.invert_right_horizontal
 
     def set_enabled(self, enabled: bool):
-        """Enables or disables teleoperation streaming."""
         with QMutexLocker(self._lock):
             self._enabled = enabled
             if not enabled and self._is_moving:
@@ -364,10 +532,6 @@ class UR5eGamepadTeleop(QThread):
             return self._enabled
 
     def set_inhibited(self, inhibited: bool, reason: str = ""):
-        """
-        Temporarily silences gamepad commands during safety-critical events
-        (e.g., active Freedrive mode or discrete Go to Start/Home motions).
-        """
         with QMutexLocker(self._lock):
             self._inhibited = inhibited
             self._inhibition_reason = reason
@@ -392,22 +556,18 @@ class UR5eGamepadTeleop(QThread):
             return self._controller_name
 
     def set_velocity_callback(self, cb: Optional[Callable[[List[float]], None]]):
-        """Optional callback invoked on every velocity update (useful for mock simulation)."""
         with QMutexLocker(self._lock):
             self._velocity_callback = cb
 
     def set_external_socket(self, sock: Optional[socket.socket]):
-        """Allows sharing an existing robot command socket instead of creating a new one."""
         with QMutexLocker(self._lock):
             self._external_socket = sock
 
     def emergency_stop(self):
-        """Immediately halts motion on the robot."""
         with QMutexLocker(self._lock):
             self._send_stop()
 
     def stop(self):
-        """Cleanly halts teleoperation thread and releases network resources."""
         self._running = False
         with QMutexLocker(self._lock):
             self._send_stop()
@@ -433,10 +593,13 @@ class UR5eGamepadTeleop(QThread):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2.0)
             sock.connect((self.robot_ip, self.config.robot_port))
-            sock.setblocking(False)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(0.5)
             self._socket = sock
+            print(f"[GAMEPAD] Connected to robot command socket at {self.robot_ip}:{self.config.robot_port}")
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[GAMEPAD ERROR] Failed to connect to robot at {self.robot_ip}:{self.config.robot_port} - {e}")
             self._socket = None
             return False
 
@@ -450,6 +613,9 @@ class UR5eGamepadTeleop(QThread):
 
     def _send_urscript(self, script: str):
         """Sends raw URScript text to the robot command socket."""
+        if not script.endswith("\n"):
+            script += "\n"
+
         if self.mock:
             self.command_sent.emit(script.strip())
             return
@@ -458,16 +624,18 @@ class UR5eGamepadTeleop(QThread):
         if sock is None:
             if not self._ensure_socket_connected():
                 return
-            sock = self._socket
+            sock = self._external_socket if self._external_socket is not None else self._socket
 
         try:
             sock.sendall(script.encode("utf-8"))
             self.command_sent.emit(script.strip())
-        except (socket.error, BrokenPipeError, ConnectionResetError):
-            self._disconnect_socket()
+        except (socket.error, BrokenPipeError, ConnectionResetError) as e:
+            print(f"[GAMEPAD ERROR] URScript transmission failed: {e}")
+            if self._socket is not None and sock is self._socket:
+                self._disconnect_socket()
 
     def _send_stop(self):
-        """Issues appropriate stop command based on active mode."""
+        """Issues smooth stop command based on active mode."""
         if self._active_mode == "joint":
             cmd = format_stopj(self.config.joint_acceleration)
         else:
@@ -477,6 +645,8 @@ class UR5eGamepadTeleop(QThread):
         self._is_moving = False
         self._active_mode = None
         self._latest_state = [0.0] * 6
+        self._current_commanded_cart = [0.0] * 6
+        self._current_commanded_joint = [0.0] * 6
         self.velocity_updated.emit([0.0] * 6)
 
     def _emit_teleop_state(self):
@@ -517,7 +687,6 @@ class UR5eGamepadTeleop(QThread):
                     self._joystick = js
                     self._controller_name = js.get_name().strip()
                     self._is_controller_connected = True
-                    # Auto-pick configuration preset if using generic defaults
                     if self.config == XBOX_CONFIG:
                         self.config = get_recommended_config_for_name(self._controller_name)
                     self.status_updated.emit(True, self._controller_name)
@@ -541,10 +710,6 @@ class UR5eGamepadTeleop(QThread):
             return False
 
     def _read_trigger(self, axis_idx: int, is_left: bool) -> float:
-        """
-        Reads and normalizes an analog trigger axis (range 0.0 unpressed to 1.0 fully pressed).
-        Safeguards against the SDL quirk where unpressed triggers initially report 0.0 before first touch.
-        """
         if self._joystick is None:
             return 0.0
 
@@ -572,10 +737,10 @@ class UR5eGamepadTeleop(QThread):
 
     def _read_all_inputs(self) -> Tuple[List[float], List[float], List[float]]:
         """
-        Polls all sticks, bumpers, and triggers.
+        Polls all sticks, bumpers, triggers, and special buttons (Select / Start).
         Returns:
-          - cart_vel:  [vx, vy, vz, 0, 0, 0]
-          - joint_vel: [w_base, 0, 0, 0, w_wrist2, w_wrist3]
+          - cart_vel:  [vx, vy, vz, 0, 0, 0] (Tool 3D linear positioning velocity in space)
+          - joint_vel: [w_base, 0, 0, 0, w_wrist2, w_wrist3] (Direct joint commands)
           - combined:  [vx, vy, vz, w_base, w_wrist2, w_wrist3]
         """
         if self._joystick is None:
@@ -583,6 +748,27 @@ class UR5eGamepadTeleop(QThread):
 
         num_axes = self._joystick.get_numaxes()
         num_buttons = self._joystick.get_numbuttons()
+
+        # ---------------------------------------------------------------------
+        # 0. Edge Detection for Select (Go to Start) & Start (Toggle Record)
+        # ---------------------------------------------------------------------
+        btn_sel_now = (
+            (self.config.button_select < num_buttons and bool(self._joystick.get_button(self.config.button_select)))
+            or (6 < num_buttons and bool(self._joystick.get_button(6)))
+            or (8 < num_buttons and bool(self._joystick.get_button(8)))
+        )
+        if btn_sel_now and not self._prev_btn_select:
+            self.button_select_pressed.emit()
+        self._prev_btn_select = btn_sel_now
+
+        btn_start_now = (
+            (self.config.button_start < num_buttons and bool(self._joystick.get_button(self.config.button_start)))
+            or (7 < num_buttons and bool(self._joystick.get_button(7)))
+            or (9 < num_buttons and bool(self._joystick.get_button(9)))
+        )
+        if btn_start_now and not self._prev_btn_start:
+            self.button_start_pressed.emit()
+        self._prev_btn_start = btn_start_now
 
         # ---------------------------------------------------------------------
         # 1. Cartesian Translation: Left Stick (X/Y) & Right Stick (Z)
@@ -653,7 +839,10 @@ class UR5eGamepadTeleop(QThread):
     def run(self):
         """
         Background loop streaming commands at 20-50 Hz (default 35 Hz).
-        Automatically chooses between `speedl` (Cartesian) and `speedj` (direct joint).
+        Features:
+          - Tool 3D Cartesian translation in space via `speedl` with Wrist 3 decoupled
+          - Direct Joint Rotations (Base, Wrist 2, Wrist 3) via `speedj`
+          - Software acceleration slew-rate limiting protecting Wrist 1
         """
         self._running = True
 
@@ -702,7 +891,6 @@ class UR5eGamepadTeleop(QThread):
 
                 if can_stream:
                     if has_joint or has_cart:
-                        # Determine dominant motion mode
                         norm_joint = max(
                             abs(joint_vel[0]) / max(1e-4, self.config.max_base_velocity),
                             abs(joint_vel[4]) / max(1e-4, self.config.max_wrist2_velocity),
@@ -715,9 +903,19 @@ class UR5eGamepadTeleop(QThread):
                         )
 
                         if norm_joint >= norm_cart:
-                            # Mode: Direct Joint Rotation (`speedj`)
+                            next_mode = "joint"
+                            if self._active_mode is not None and self._active_mode != next_mode:
+                                self._send_stop()
+
+                            # Apply acceleration slew-rate limiting on joint velocities
+                            max_dj = self.config.joint_acceleration * poll_period
+                            for i in range(6):
+                                delta = joint_vel[i] - self._current_commanded_joint[i]
+                                delta = max(-max_dj, min(max_dj, delta))
+                                self._current_commanded_joint[i] += delta
+
                             cmd = format_speedj(
-                                joint_vel,
+                                self._current_commanded_joint,
                                 a=self.config.joint_acceleration,
                                 t=self.config.time_step,
                             )
@@ -725,9 +923,19 @@ class UR5eGamepadTeleop(QThread):
                             self._active_mode = "joint"
                             self._is_moving = True
                         else:
-                            # Mode: Cartesian Translation (`speedl`)
+                            next_mode = "cartesian"
+                            if self._active_mode is not None and self._active_mode != next_mode:
+                                self._send_stop()
+
+                            # Apply acceleration slew-rate limiting on Cartesian velocities
+                            max_dc = self.config.linear_acceleration * poll_period
+                            for i in range(3):
+                                delta = cart_vel[i] - self._current_commanded_cart[i]
+                                delta = max(-max_dc, min(max_dc, delta))
+                                self._current_commanded_cart[i] += delta
+
                             cmd = format_speedl(
-                                cart_vel,
+                                self._current_commanded_cart,
                                 a=self.config.linear_acceleration,
                                 t=self.config.time_step,
                             )
@@ -736,7 +944,6 @@ class UR5eGamepadTeleop(QThread):
                             self._is_moving = True
 
                         self.velocity_updated.emit(combined)
-
                         if self._velocity_callback is not None:
                             self._velocity_callback(combined)
                     else:
@@ -766,14 +973,12 @@ class UR5eGamepadTeleop(QThread):
 # =============================================================================
 
 def run_standalone():
-    """Terminal diagnostic runner to verify gamepad axes and URScript speedl/speedj streaming."""
+    """Terminal diagnostic runner to verify gamepad axes, buttons, and URScript streaming."""
     parser = argparse.ArgumentParser(description="UR5e Gamepad Teleoperation Diagnostic Runner")
     parser.add_argument("--robot-ip", type=str, default="192.168.1.102", help="UR5e Robot IP address")
     parser.add_argument("--mock", action="store_true", help="Run in mock simulation mode without hardware")
-    parser.add_argument("--max-lin", type=float, default=0.15, help="Max linear speed (m/s)")
-    parser.add_argument("--max-base", type=float, default=0.50, help="Max Base angular speed (rad/s)")
-    parser.add_argument("--max-w2", type=float, default=0.50, help="Max Wrist 2 angular speed (rad/s)")
-    parser.add_argument("--max-w3", type=float, default=0.75, help="Max Wrist 3 angular speed (rad/s)")
+    parser.add_argument("--speed", type=int, default=50, help="Master speed scale percentage (10 to 100)")
+    parser.add_argument("--accel", type=int, default=50, help="Master acceleration scale percentage (10 to 100)")
     parser.add_argument("--invert-left-lr", action="store_true", help="Invert left/right lateral movement on Left Stick")
     parser.add_argument("--invert-right-lr", action="store_true", help="Invert left/right base motor rotation on Right Stick")
     parser.add_argument("--invert-lr", action="store_true", help="Invert left/right movement on BOTH analog sticks")
@@ -782,31 +987,32 @@ def run_standalone():
     inv_left = args.invert_left_lr or args.invert_lr
     inv_right = args.invert_right_lr or args.invert_lr
 
-    print("=" * 75)
-    print("🎮  UR5e Real-Time Teleoperation: Cartesian Translation & Direct Joint Control")
-    print("=" * 75)
-    print(f"Target Robot IP: {args.robot_ip} (Mock Mode: {args.mock})")
-    print(f"Speed Limits: Linear = {args.max_lin} m/s | Base = {args.max_base} rad/s")
-    print(f"              Wrist 2 = {args.max_w2} rad/s | Wrist 3 = {args.max_w3} rad/s")
-    print(f"L/R Inversion: Left Stick={inv_left} | Right Stick={inv_right}")
-    print("-" * 75)
-    print("Controls:")
-    print("  • Left Stick (XY)       : TCP Forward / Backward (+X/-X) and Left / Right (+Y/-Y)")
-    print("  • Right Stick (Y)      : TCP Vertical Up / Down (+Z/-Z)")
-    print("  • Right Stick (X)      : DIRECT Base Motor Rotation (shoulder_pan)")
-    print("  • Shoulders (LB/RB)    : DIRECT Wrist 2 Rotation")
-    print("  • Triggers (LT/RT)     : DIRECT Wrist 3 Rotation")
-    print("  • Neutral Sticks/Btns  : Instant Braking (0 drift)")
-    print("=" * 75)
-
     config = GamepadConfig(
-        max_linear_velocity=args.max_lin,
-        max_base_velocity=args.max_base,
-        max_wrist2_velocity=args.max_w2,
-        max_wrist3_velocity=args.max_w3,
+        speed_scale=max(0.10, min(1.0, args.speed / 100.0)),
+        accel_scale=max(0.10, min(1.0, args.accel / 100.0)),
         invert_left_horizontal=inv_left,
         invert_right_horizontal=inv_right,
     )
+
+    print("=" * 80)
+    print("🎮  UR5e Real-Time Gamepad Teleoperation Controller")
+    print("=" * 80)
+    print(f"Target Robot IP : {args.robot_ip} (Mock Mode: {args.mock})")
+    print(f"Speed Setting   : {config.speed_scale*100:.0f}% (Max Linear: {config.max_linear_velocity*100:.1f} cm/s)")
+    print(f"Accel Setting   : {config.accel_scale*100:.0f}% (Linear Accel: {config.linear_acceleration:.2f} m/s², Joint Accel: {config.joint_acceleration:.2f} rad/s²)")
+    print(f"L/R Inversion   : Left Stick={inv_left} | Right Stick={inv_right}")
+    print("-" * 80)
+    print("Controls:")
+    print("  • Left Stick (XY)     : Tool Position Forward/Backward (+X/-X) and Left/Right (+Y/-Y) in arm heading")
+    print("  • Right Stick (Y)     : Tool Position Vertical Up/Down (+Z/-Z)")
+    print("  • Right Stick (X)     : DIRECT Base Motor Rotation (shoulder_pan)")
+    print("  • Shoulders (LB/RB)   : DIRECT Wrist 2 Rotation")
+    print("  • Triggers (LT/RT)    : DIRECT Wrist 3 Rotation")
+    print("  • Select Button       : Go to Start / Home Position")
+    print("  • Start Button        : Start / End Episode Recording (Space)")
+    print("  • Note                : Wrist 3 is strictly decoupled from analog stick movement")
+    print("  • Neutral Sticks/Btns : Smooth deceleration ramping -> stopl/stopj (0 drift)")
+    print("=" * 80)
 
     teleop = UR5eGamepadTeleop(robot_ip=args.robot_ip, config=config, mock=args.mock)
     teleop.set_enabled(True)
@@ -827,8 +1033,16 @@ def run_standalone():
                 flush=True,
             )
 
+    def on_select():
+        print("\n[GAMEPAD BUTTON] 'Select' pressed -> Trigger Go to Start Pose")
+
+    def on_start_btn():
+        print("\n[GAMEPAD BUTTON] 'Start' pressed -> Trigger Episode Recording Toggle")
+
     teleop.status_updated.connect(on_status)
     teleop.velocity_updated.connect(on_vel)
+    teleop.button_select_pressed.connect(on_select)
+    teleop.button_start_pressed.connect(on_start_btn)
 
     teleop.start()
 

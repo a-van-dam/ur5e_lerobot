@@ -454,6 +454,8 @@ class RobotRTDEWorker(QThread):
         self._motion_target_q = [0.0] * 6
         self._motion_start_time = 0.0
         self._motion_timeout = 5.0
+        self._motion_last_disp = 999.0
+        self._motion_last_progress_time = 0.0
 
         # Latest joint states (radians)
         self._latest_q = {j: 0.0 for j in UR5E_JOINTS}
@@ -564,10 +566,13 @@ class RobotRTDEWorker(QThread):
                     self._motion_target_q = [float(target_pose[f"{j}.pos"]) for j in UR5E_JOINTS]
                     self._motion_in_progress = True
                     self._motion_start_time = time.perf_counter()
+                    self._motion_last_progress_time = self._motion_start_time
 
-                    # Dynamic timeout based on maximum angular joint displacement
+                    # Timeout based on actual UR5e velocity (0.2 rad/s) with generous headroom
                     max_disp = max(abs(self._latest_q[j] - target_pose[f"{j}.pos"]) for j in UR5E_JOINTS)
-                    self._motion_timeout = max(3.0, (max_disp / 0.5) + 2.0)
+                    self._motion_last_disp = max_disp
+                    cmd_v = getattr(getattr(self._robot, "config", None), "velocity", 0.2) or 0.2
+                    self._motion_timeout = max(15.0, (max_disp / max(0.08, cmd_v * 0.6)) + 8.0)
 
                     if self._robot and hasattr(self._robot, "send_action"):
                         try:
@@ -589,13 +594,19 @@ class RobotRTDEWorker(QThread):
                 # Monitor motion completion on physical arm
                 if self._motion_in_progress:
                     current_disp = max(abs(self._latest_q[j] - self._motion_target_q[idx]) for idx, j in enumerate(UR5E_JOINTS))
-                    elapsed = time.perf_counter() - self._motion_start_time
-                    if current_disp < 0.02 or elapsed >= self._motion_timeout:
+                    now = time.perf_counter()
+                    elapsed = now - self._motion_start_time
+
+                    # Refresh progress timestamp whenever the arm moves closer by >= 0.003 rad (~0.17°)
+                    if current_disp < self._motion_last_disp - 0.003:
+                        self._motion_last_disp = current_disp
+                        self._motion_last_progress_time = now
+
+                    time_since_progress = now - self._motion_last_progress_time
+
+                    if current_disp < 0.02:
                         self._motion_in_progress = False
-                        if elapsed >= self._motion_timeout and current_disp >= 0.02:
-                            print(f"[WARNING] Motion wait timed out after {elapsed:.1f}s (max joint err: {math.degrees(current_disp):.1f}°).")
-                        else:
-                            print(f"[MOTION] Target position reached in {elapsed:.2f}s.")
+                        print(f"[MOTION] Target position reached in {elapsed:.2f}s.")
                         if self._motion_restore_freedrive:
                             self._motion_restore_freedrive = False
                             try:
@@ -606,6 +617,11 @@ class RobotRTDEWorker(QThread):
                                 print("[MOTION] Freedrive automatically restored after motion completion.")
                             except Exception as err:
                                 print(f"[ERROR] Failed to restore Freedrive: {err}")
+                    elif elapsed >= self._motion_timeout and time_since_progress >= 4.0:
+                        # Only time out if total timeout expired AND no progress made for 4.0 seconds
+                        self._motion_in_progress = False
+                        self._motion_restore_freedrive = False
+                        print(f"[WARNING] Motion wait timed out after {elapsed:.1f}s without progress (max joint err: {math.degrees(current_disp):.1f}°).")
             else:
                 # Synthetic realistic UR5e telemetry
                 sim_t += target_period
@@ -618,7 +634,7 @@ class RobotRTDEWorker(QThread):
                         step = math.copysign(min(abs(err), 1.5 * target_period), err)
                         mock_angles[idx] += step
                     elapsed = time.perf_counter() - self._motion_start_time
-                    if max_err < 0.005 or elapsed >= self._motion_timeout:
+                    if max_err < 0.005:
                         self._motion_in_progress = False
                         print(f"[MOTION] Mock target motion reached ({elapsed:.2f}s).")
                         if self._motion_restore_freedrive:
@@ -626,6 +642,10 @@ class RobotRTDEWorker(QThread):
                             self._freedrive_active = True
                             self.freedrive_state_changed.emit(True)
                             print("[MOTION] Freedrive automatically restored after motion completion.")
+                    elif elapsed >= self._motion_timeout:
+                        self._motion_in_progress = False
+                        self._motion_restore_freedrive = False
+                        print(f"[WARNING] Mock motion timed out after {elapsed:.1f}s.")
                 elif self._freedrive_active:
                     # In freedrive, arm drifts or simulates compliance
                     noise = 0.002 * math.sin(sim_t * 5)

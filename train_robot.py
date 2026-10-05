@@ -31,12 +31,17 @@ from torch.utils.data import DataLoader, Subset
 # Try importing LeRobot components
 try:
     import lerobot
+    import lerobot.utils.import_utils
+    # Force PyAV backend to avoid conda torchcodec C++ glib symbol mismatch
+    lerobot.utils.import_utils.get_safe_default_video_backend = lambda: "pyav"
+
     from lerobot.configs import FeatureType
     from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
     from lerobot.policies import make_pre_post_processors
     from lerobot.policies.act import ACTConfig, ACTPolicy
     from lerobot.utils.feature_utils import dataset_to_policy_features
     LEROBOT_AVAILABLE = True
+    LEROBOT_IMPORT_ERROR = None
 except ImportError as e:
     LEROBOT_AVAILABLE = False
     LEROBOT_IMPORT_ERROR = str(e)
@@ -46,7 +51,7 @@ except ImportError as e:
 # 1. User Configuration & Hyperparameters (Adjust freely here)
 # =============================================================================
 
-PROJECT_NAME = "object_detection2"
+PROJECT_NAME = "move_to_red_cube"
 
 # Path to local dataset folder (relative to this script or absolute)
 DATASET_PATH = "datasets/" + PROJECT_NAME
@@ -68,7 +73,7 @@ AVAILABLE_OPTIMIZERS = [
 SELECTED_OPTIMIZER_INDEX = 0  # <--- Select optimizer by index (0: AdamW, 1: Adam, 2: SGD)
 
 # Training Hyperparameters
-TRAINING_STEPS = 10000      # Total optimization steps (increased for robust task mastery)
+TRAINING_STEPS = 15000      # Total optimization steps (increased for robust task mastery)
 BATCH_SIZE = 32               # Samples per training batch (RTX 3080 16GB handles 16-64 easily)
 LEARNING_RATE = 1e-4          # Initial optimizer learning rate for transformer heads
 LR_BACKBONE = 1e-5            # Differential learning rate for pretrained ResNet vision backbone
@@ -228,6 +233,275 @@ def plot_loss_curve(
         print(f"[LOG] Note: Loss curve image generation skipped ({e}). Metrics saved in CSV.")
 
 
+def generate_html_dashboard(
+    output_html: Path,
+    model_name: str,
+    policy_name: str,
+    dataset_name: str,
+    current_step: int,
+    total_steps: int,
+    train_loss: float,
+    val_loss: Optional[float],
+    steps_per_sec: float,
+    elapsed_sec: float,
+    eta_sec: float,
+    learning_rate: float,
+    device_name: str,
+    status: str,
+    history_steps: List[int],
+    history_train_loss: List[float],
+    history_val_loss: List[Tuple[int, float]],
+):
+    """Generates a standalone, beautiful HTML dashboard with interactive Chart.js graphs."""
+    val_steps_dict = {s: l for s, l in history_val_loss}
+    val_loss_series = [val_steps_dict.get(s, None) for s in history_steps]
+
+    pct = min(100.0, (current_step / max(1, total_steps)) * 100.0)
+    elapsed_str = str(datetime.timedelta(seconds=int(elapsed_sec)))
+    eta_str = str(datetime.timedelta(seconds=int(eta_sec))) if eta_sec > 0 else "00:00:00"
+    val_loss_str = f"{val_loss:.4f}" if val_loss is not None else "N/A"
+
+    badge_color = "#10b981" if status == "COMPLETED" else ("#38bdf8" if status == "TRAINING" else "#f59e0b")
+
+    html_code = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Training Monitor — {model_name}</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background-color: #0b1120;
+            color: #f8fafc;
+            padding: 24px;
+        }}
+        .header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #1e293b;
+            padding-bottom: 16px;
+            margin-bottom: 24px;
+        }}
+        .title-group h1 {{
+            font-size: 24px;
+            font-weight: 800;
+            color: #ffffff;
+            letter-spacing: -0.5px;
+        }}
+        .title-group p {{
+            color: #94a3b8;
+            font-size: 13px;
+            margin-top: 4px;
+        }}
+        .badge {{
+            padding: 6px 14px;
+            border-radius: 9999px;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            background-color: {badge_color}20;
+            color: {badge_color};
+            border: 1px solid {badge_color}60;
+        }}
+        .metrics-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }}
+        .metric-card {{
+            background: #111827;
+            border: 1px solid #1f2937;
+            border-radius: 12px;
+            padding: 16px;
+        }}
+        .metric-label {{
+            font-size: 11px;
+            color: #9ca3af;
+            text-transform: uppercase;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+        }}
+        .metric-val {{
+            font-size: 26px;
+            font-weight: 800;
+            color: #f3f4f6;
+            margin-top: 6px;
+            font-family: 'SF Mono', Consolas, monospace;
+        }}
+        .progress-bar-container {{
+            background: #1f2937;
+            border-radius: 8px;
+            height: 12px;
+            overflow: hidden;
+            margin-bottom: 24px;
+        }}
+        .progress-fill {{
+            height: 100%;
+            background: linear-gradient(90deg, #0284c7, #38bdf8);
+            width: {pct:.1f}%;
+            transition: width 0.3s ease;
+        }}
+        .chart-box {{
+            background: #111827;
+            border: 1px solid #1f2937;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 24px;
+        }}
+        .chart-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }}
+        .chart-title {{
+            font-size: 16px;
+            font-weight: 700;
+            color: #e5e7eb;
+        }}
+        .refresh-toggle {{
+            font-size: 12px;
+            color: #94a3b8;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title-group">
+            <h1>UR5e LeRobot Training Dashboard</h1>
+            <p>Model: <strong>{model_name}</strong> | Policy: <strong>{policy_name.upper()}</strong> | Dataset: <strong>{dataset_name}</strong></p>
+        </div>
+        <div class="badge">{status}</div>
+    </div>
+
+    <div class="metrics-grid">
+        <div class="metric-card">
+            <div class="metric-label">Step Progress</div>
+            <div class="metric-val">{current_step:,} <span style="font-size: 14px; color: #94a3b8;">/ {total_steps:,}</span></div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Train Loss</div>
+            <div class="metric-val" style="color: #38bdf8;">{train_loss:.4f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Val Loss</div>
+            <div class="metric-val" style="color: #f59e0b;">{val_loss_str}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Speed</div>
+            <div class="metric-val">{steps_per_sec:.1f} <span style="font-size: 13px; color: #94a3b8;">steps/s</span></div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">ETA / Elapsed</div>
+            <div class="metric-val" style="font-size: 19px;">{eta_str} <span style="font-size: 12px; color: #94a3b8;">({elapsed_str})</span></div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Learning Rate</div>
+            <div class="metric-val" style="font-size: 19px;">{learning_rate:.2e}</div>
+        </div>
+    </div>
+
+    <div class="progress-bar-container">
+        <div class="progress-fill"></div>
+    </div>
+
+    <div class="chart-box">
+        <div class="chart-header">
+            <div class="chart-title">Loss Convergence Curves</div>
+            <label class="refresh-toggle">
+                <input type="checkbox" id="autoRefresh" {"checked" if status == "TRAINING" else ""}> Auto-refresh (5s)
+            </label>
+        </div>
+        <div style="position: relative; height: 420px; width: 100%;">
+            <canvas id="lossChart"></canvas>
+        </div>
+    </div>
+
+    <script>
+        const ctx = document.getElementById('lossChart').getContext('2d');
+        const steps = {json.dumps(history_steps[-600:])};
+        const trainLoss = {json.dumps([round(x, 5) for x in history_train_loss[-600:]])};
+        const valLoss = {json.dumps([round(x, 5) if x is not None else None for x in val_loss_series[-600:]])};
+
+        new Chart(ctx, {{
+            type: 'line',
+            data: {{
+                labels: steps,
+                datasets: [
+                    {{
+                        label: 'Training Loss',
+                        data: trainLoss,
+                        borderColor: '#38bdf8',
+                        backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        tension: 0.2,
+                        fill: true
+                    }},
+                    {{
+                        label: 'Validation Loss',
+                        data: valLoss,
+                        borderColor: '#f59e0b',
+                        backgroundColor: 'rgba(245, 158, 11, 0.2)',
+                        borderWidth: 2.5,
+                        pointRadius: 4,
+                        pointHoverRadius: 6,
+                        showLine: true,
+                        spanGaps: true
+                    }}
+                ]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {{ intersect: false, mode: 'index' }},
+                scales: {{
+                    x: {{
+                        title: {{ display: true, text: 'Optimization Step', color: '#94a3b8' }},
+                        grid: {{ color: '#1e293b' }},
+                        ticks: {{ color: '#64748b' }}
+                    }},
+                    y: {{
+                        title: {{ display: true, text: 'Loss', color: '#94a3b8' }},
+                        grid: {{ color: '#1e293b' }},
+                        ticks: {{ color: '#64748b' }}
+                    }}
+                }},
+                plugins: {{
+                    legend: {{ labels: {{ color: '#e2e8f0', font: {{ weight: 'bold' }} }} }}
+                }}
+            }}
+        }});
+
+        const autoRefreshCheckbox = document.getElementById('autoRefresh');
+        if (autoRefreshCheckbox) {{
+            setInterval(() => {{
+                if (autoRefreshCheckbox.checked) {{
+                    window.location.reload();
+                }}
+            }}, 5000);
+        }}
+    </script>
+</body>
+</html>
+"""
+    try:
+        output_html.parent.mkdir(parents=True, exist_ok=True)
+        output_html.write_text(html_code, encoding="utf-8")
+    except Exception as err:
+        print(f"[DASHBOARD] Warning: Failed to write HTML dashboard: {err}")
+
+
+
 # =============================================================================
 # 3. Modular RobotTrainer Class
 # =============================================================================
@@ -261,6 +535,11 @@ class RobotTrainer:
         num_workers: int = NUM_WORKERS,
         seed: int = SEED,
         step_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        resume_checkpoint: Optional[str | Path] = None,
+        chunk_size: Optional[int] = None,
+        n_action_steps: Optional[int] = None,
+        kl_weight: Optional[float] = None,
+        dropout: Optional[float] = None,
     ):
         if not LEROBOT_AVAILABLE:
             raise RuntimeError(f"LeRobot could not be loaded in this Python environment: {LEROBOT_IMPORT_ERROR}")
@@ -292,6 +571,12 @@ class RobotTrainer:
         self.checkpoint_dir = self.output_dir / "checkpoint"
         self.log_csv_file = self.output_dir / "train_log.csv"
         self.loss_plot_file = self.output_dir / "loss_curve.png"
+        self.dashboard_html_file = self.output_dir / "training_dashboard.html"
+        self.resume_checkpoint = Path(resume_checkpoint).resolve() if resume_checkpoint else None
+        self.chunk_size = int(chunk_size) if chunk_size is not None else None
+        self.n_action_steps = int(n_action_steps) if n_action_steps is not None else None
+        self.kl_weight = float(kl_weight) if kl_weight is not None else None
+        self.dropout = float(dropout) if dropout is not None else None
 
         # History tracking
         self.history_steps: List[int] = []
@@ -335,8 +620,24 @@ class RobotTrainer:
         print(f"[POLICY] Identified Output Features: {list(output_features.keys())}")
 
         if self.policy_name == "act":
-            cfg = ACTConfig(input_features=input_features, output_features=output_features)
-            policy = ACTPolicy(cfg)
+            kwargs = {}
+            if self.chunk_size is not None:
+                kwargs["chunk_size"] = self.chunk_size
+            if self.n_action_steps is not None:
+                kwargs["n_action_steps"] = self.n_action_steps
+            if self.kl_weight is not None:
+                kwargs["kl_weight"] = self.kl_weight
+            if self.dropout is not None:
+                kwargs["dropout"] = self.dropout
+            cfg = ACTConfig(input_features=input_features, output_features=output_features, **kwargs)
+            if self.resume_checkpoint:
+                resume_p = self.resume_checkpoint
+                if (resume_p / "checkpoint").exists():
+                    resume_p = resume_p / "checkpoint"
+                print(f"[RESUME] Loading pretrained ACT weights from: {resume_p}")
+                policy = ACTPolicy.from_pretrained(resume_p)
+            else:
+                policy = ACTPolicy(cfg)
         elif self.policy_name == "diffusion":
             try:
                 from lerobot.policies.diffusion import DiffusionConfig, DiffusionPolicy
@@ -346,8 +647,18 @@ class RobotTrainer:
                     "Install it in your environment using: pip install diffusers\n"
                     f"Original error: {err}"
                 )
-            cfg = DiffusionConfig(input_features=input_features, output_features=output_features)
-            policy = DiffusionPolicy(cfg)
+            kwargs = {}
+            if self.n_action_steps is not None:
+                kwargs["n_action_steps"] = self.n_action_steps
+            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, **kwargs)
+            if self.resume_checkpoint:
+                resume_p = self.resume_checkpoint
+                if (resume_p / "checkpoint").exists():
+                    resume_p = resume_p / "checkpoint"
+                print(f"[RESUME] Loading pretrained Diffusion weights from: {resume_p}")
+                policy = DiffusionPolicy.from_pretrained(resume_p)
+            else:
+                policy = DiffusionPolicy(cfg)
         elif self.policy_name == "vqbet":
             try:
                 from lerobot.policies.vqbet import VQBeTConfig, VQBeTPolicy
@@ -434,7 +745,30 @@ class RobotTrainer:
             self.history_train_loss,
             self.history_val_loss,
         )
-        print(f"[CHECKPOINT] ✔ In-place checkpoint & loss plot saved ({self.loss_plot_file.name}).")
+
+        # Generate live HTML browser dashboard
+        latest_t_loss = self.history_train_loss[-1] if self.history_train_loss else 0.0
+        latest_v_loss = self.history_val_loss[-1][1] if self.history_val_loss else None
+        generate_html_dashboard(
+            output_html=self.dashboard_html_file,
+            model_name=self.output_dir.name,
+            policy_name=self.policy_name,
+            dataset_name=self.dataset_path.name,
+            current_step=step,
+            total_steps=self.training_steps,
+            train_loss=latest_t_loss,
+            val_loss=latest_v_loss,
+            steps_per_sec=0.0,
+            elapsed_sec=0.0,
+            eta_sec=0.0,
+            learning_rate=0.0,
+            device_name=str(self.device),
+            status="COMPLETED" if step >= self.training_steps else ("ABORTED" if self.is_aborted else "TRAINING"),
+            history_steps=self.history_steps,
+            history_train_loss=self.history_train_loss,
+            history_val_loss=self.history_val_loss,
+        )
+        print(f"[CHECKPOINT] ✔ Checkpoint, loss plot & HTML dashboard updated ({self.dashboard_html_file.name}).")
 
     def run_training(self) -> Dict[str, Any]:
         """Executes the complete offline imitation learning training loop."""
@@ -476,7 +810,7 @@ class RobotTrainer:
 
         # 4. Instantiate LeRobotDataset
         repo_id = f"local/{self.dataset_path.name}"
-        dataset = LeRobotDataset(repo_id, root=self.dataset_path, delta_timestamps=delta_timestamps)
+        dataset = LeRobotDataset(repo_id, root=self.dataset_path, delta_timestamps=delta_timestamps, video_backend="pyav")
         total_samples = len(dataset)
         print(f"[DATASET] Ready with {total_samples} temporal-aligned samples.")
 
@@ -533,15 +867,38 @@ class RobotTrainer:
         if self.use_augmentation:
             print("[AUGMENT] Visual data augmentation active (mild randomized brightness/contrast jitter on GPU).")
 
+        # Check for starting step if resuming
+        start_step = 0
+        if self.resume_checkpoint:
+            resume_p = self.resume_checkpoint
+            if (resume_p / "checkpoint").exists():
+                resume_p = resume_p / "checkpoint"
+            info_f = resume_p / "training_info.json"
+            if info_f.exists():
+                try:
+                    with open(info_f, "r") as f:
+                        info_data = json.load(f)
+                    start_step = int(info_data.get("step", 0))
+                    print(f"[RESUME] Found prior training record at step {start_step:,}.")
+                except Exception as err:
+                    print(f"[RESUME] Note: Could not read training_info.json: {err}")
+
+        if self.training_steps <= start_step:
+            print(f"[RESUME] Specified training_steps ({self.training_steps}) <= start_step ({start_step}).")
+            self.training_steps = start_step + 5000
+            print(f"[RESUME] Automatically adjusted target to {self.training_steps:,} steps.")
+
         # 8. Setup Output Logging Directory & CSV
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.log_csv_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["step", "train_loss", "val_loss", "learning_rate", "elapsed_sec", "steps_per_sec"])
+        csv_mode = "a" if (self.resume_checkpoint and self.log_csv_file.exists()) else "w"
+        if csv_mode == "w":
+            with open(self.log_csv_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["step", "train_loss", "val_loss", "learning_rate", "elapsed_sec", "steps_per_sec"])
 
         # 9. Main Optimization Loop
         print("\n[TRAIN] >>> Commencing Optimization Steps <<<")
-        step = 0
+        step = start_step
         running_loss = 0.0
         log_window_steps = 0
         step_start_time = time.time()
@@ -593,11 +950,13 @@ class RobotTrainer:
                 policy.eval()
                 val_losses = []
                 with torch.no_grad():
-                    for v_batch in val_loader:
+                    for v_idx, v_batch in enumerate(val_loader):
                         v_batch = preprocessor(v_batch)
                         v_batch = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in v_batch.items()}
                         v_loss, _ = policy.forward(v_batch)
                         val_losses.append(v_loss.item())
+                        if v_idx >= 30:  # Evaluate up to 30 batches for rapid, non-blocking evaluation
+                            break
                 if val_losses:
                     val_loss_scalar = float(np.mean(val_losses))
                     self.history_val_loss.append((step, val_loss_scalar))

@@ -600,6 +600,17 @@ class RobotTrainer:
         else:
             self.is_grayscale = detect_dataset_grayscale(self.dataset_path)
 
+        # Extract native dataset FPS
+        self.dataset_fps = 30
+        for info_c in [self.dataset_path / "meta" / "info.json", self.dataset_path / "meta" / "recording_config.json"]:
+            if info_c.exists():
+                try:
+                    with open(info_c, "r") as f_meta:
+                        self.dataset_fps = int(json.load(f_meta).get("fps", 30))
+                        break
+                except Exception:
+                    pass
+
         # History tracking
         self.history_steps: List[int] = []
         self.history_train_loss: List[float] = []
@@ -748,11 +759,19 @@ class RobotTrainer:
         postprocessor.save_pretrained(self.checkpoint_dir)
 
         # Save metadata info file
+        eff_chunk = getattr(policy.config, "chunk_size", self.chunk_size or 100)
+        eff_n_actions = getattr(policy.config, "n_action_steps", self.n_action_steps or (50 if self.policy_name == 'act' else 10))
+        dec_interval = float(eff_n_actions / max(1, self.dataset_fps))
+
         info_dict = {
             "policy_type": self.policy_name,
             "step": step,
             "training_steps": self.training_steps,
             "dataset": str(self.dataset_path.name),
+            "fps": self.dataset_fps,
+            "chunk_size": eff_chunk,
+            "n_action_steps": eff_n_actions,
+            "decision_interval_s": dec_interval,
             "grayscale": self.is_grayscale,
             "image_channels": 1 if self.is_grayscale else 3,
             "updated_at": datetime.datetime.now().isoformat(),
@@ -806,6 +825,9 @@ class RobotTrainer:
         print(f"  • Selected Policy:   {self.policy_name.upper()}")
         print(f"  • Optimizer:         {self.optimizer_name} (lr={self.learning_rate}, wd={self.weight_decay})")
         print(f"  • Image Mode:        {'Grayscale (1-Ch luminance)' if self.is_grayscale else 'RGB (3-Ch color)'}")
+        print(f"  • Dataset Frequency: {self.dataset_fps} FPS (dt = {1.0/max(1, self.dataset_fps):.3f}s)")
+        eff_steps = self.n_action_steps or (50 if self.policy_name == 'act' else 10)
+        print(f"  • Decision Horizon:  Chunk={self.chunk_size or 100}, Execution={eff_steps} steps ({eff_steps/max(1, self.dataset_fps):.2f}s interval)")
         print(f"  • Total Steps:       {self.training_steps:,}")
         print(f"  • Batch Size:        {self.batch_size}")
         print(f"  • Device:            {self.device} ({torch.cuda.get_device_name(0) if self.device.type == 'cuda' else 'CPU'})")
@@ -1116,6 +1138,8 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=NUM_WORKERS, help="DataLoader subprocess workers")
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed for reproducibility")
     parser.add_argument("--grayscale", action="store_true", default=None, help="Train policy on single-channel Grayscale imagery")
+    parser.add_argument("--chunk-size", type=int, default=None, help="Action prediction horizon steps")
+    parser.add_argument("--n-action-steps", type=int, default=None, help="Action execution steps before re-querying visual observation")
     return parser.parse_args()
 
 
@@ -1140,6 +1164,8 @@ def main():
         num_workers=args.workers,
         seed=args.seed,
         grayscale=args.grayscale,
+        chunk_size=args.chunk_size,
+        n_action_steps=args.n_action_steps,
     )
 
     try:

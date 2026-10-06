@@ -191,6 +191,7 @@ def run_policy_rollout(
     safe_velocity: float = SAFE_VELOCITY,
     safe_acceleration: float = SAFE_ACCELERATION,
     max_jump_deg: float = MAX_ALLOWED_JUMP_DEG,
+    n_action_steps: Optional[int] = None,
     auto_execute: bool = AUTO_EXECUTE,
     single_step: bool = False,
     mock: bool = False,
@@ -270,6 +271,29 @@ def run_policy_rollout(
         print("      • Vision Input Mode:  Grayscale (1-Ch luminance -> live frames converted)")
     else:
         print("      • Vision Input Mode:  RGB (3-Ch color)")
+
+    # Inspect decision horizon and execution steps
+    model_fps = 30
+    default_n_steps = getattr(policy.config, "n_action_steps", 10)
+    for info_candidate in [model_dir / "training_info.json", model_dir.parent / "training_info.json"]:
+        if info_candidate.exists():
+            try:
+                with open(info_candidate, "r") as f_info:
+                    t_info = json.load(f_info)
+                    model_fps = int(t_info.get("fps", 30))
+                    default_n_steps = int(t_info.get("n_action_steps", default_n_steps))
+                    break
+            except Exception:
+                pass
+
+    exec_steps = n_action_steps if n_action_steps is not None else default_n_steps
+    if hasattr(policy.config, "n_action_steps"):
+        policy.config.n_action_steps = int(exec_steps)
+    if hasattr(policy, "drop_queued_actions"):
+        policy.drop_queued_actions()
+
+    dt_decision = exec_steps / max(1, model_fps)
+    print(f"      • Replanning Horizon: {exec_steps} steps ({dt_decision:.2f}s / {int(dt_decision*1000)}ms @ {model_fps} FPS)")
 
     # ─────────────────────────────────────────────────────────────────
     # Phase 2: Connect Robot & Camera Sensors
@@ -574,6 +598,7 @@ def parse_args():
     parser.add_argument("--single-step", action="store_true", help="Execute only a single action step instead of full rollout")
     parser.add_argument("--yes", action="store_true", help="Auto-execute movement without terminal confirmation prompt")
     parser.add_argument("--mock", action="store_true", help="Run in Simulation/Mock mode without physical robot")
+    parser.add_argument("--n-action-steps", type=int, default=None, help="Action execution steps before re-querying camera observations")
     parser.add_argument("--device", type=str, default=DEVICE, help="Compute device (cuda or cpu)")
     return parser.parse_args()
 
@@ -589,6 +614,7 @@ def main():
         safe_velocity=args.safe_vel,
         safe_acceleration=args.safe_acc,
         max_jump_deg=args.max_jump,
+        n_action_steps=args.n_action_steps,
         auto_execute=args.yes,
         single_step=args.single_step,
         mock=args.mock,

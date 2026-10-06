@@ -732,6 +732,7 @@ class PolicyRolloutWorker(QThread):
         duration_s: float = 10.0,
         control_fps: int = 30,
         max_jump_deg: float = 45.0,
+        n_action_steps: Optional[int] = None,
         auto_freedrive_after: bool = True,
         return_start_after: bool = False,
         start_pose_deg: Optional[Dict[str, float]] = None,
@@ -747,6 +748,7 @@ class PolicyRolloutWorker(QThread):
         self.duration_s = duration_s
         self.control_fps = control_fps
         self.max_jump_deg = max_jump_deg
+        self.n_action_steps = n_action_steps
         self.auto_freedrive_after = auto_freedrive_after
         self.return_start_after = return_start_after
         self.start_pose_deg = start_pose_deg or DEFAULT_START_JOINTS_DICT
@@ -776,6 +778,14 @@ class PolicyRolloutWorker(QThread):
             policy.reset()
             preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=self.model_path)
             print(f"      ✔ Policy loaded: {policy.__class__.__name__} on {device}")
+            if self.n_action_steps is not None and hasattr(policy.config, "n_action_steps"):
+                policy.config.n_action_steps = int(self.n_action_steps)
+            if hasattr(policy, "drop_queued_actions"):
+                policy.drop_queued_actions()
+
+            curr_steps = getattr(policy.config, "n_action_steps", 10)
+            dt_dec = curr_steps / max(1, self.control_fps)
+            print(f"  • Replanning Horizon: {curr_steps} steps ({dt_dec:.2f}s / {int(dt_dec*1000)}ms @ {self.control_fps} FPS)")
         except Exception as err:
             msg = f"Failed to load policy checkpoint: {err}"
             print(f"[ERROR] {msg}")
@@ -1406,6 +1416,43 @@ class UR5ePolicyTesterStudio(QMainWindow):
         opts_row.addWidget(self.chk_return_start)
 
         eval_layout.addLayout(opts_row)
+
+        # Decision Interval & Action Steps Horizon Row
+        interval_row = QHBoxLayout()
+        lbl_steps = QLabel("Re-plan Interval:")
+        lbl_steps.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px;")
+        interval_row.addWidget(lbl_steps)
+
+        self.slider_action_steps = QSlider(Qt.Orientation.Horizontal)
+        self.slider_action_steps.setRange(1, 50)
+        self.slider_action_steps.setValue(10)
+        self.slider_action_steps.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #1e293b;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #38bdf8;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #0284c7;
+                border: 1px solid #38bdf8;
+                width: 14px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 7px;
+            }
+        """)
+        self.slider_action_steps.valueChanged.connect(self.on_action_steps_changed)
+        interval_row.addWidget(self.slider_action_steps, stretch=2)
+
+        self.lbl_interval_hud = QLabel("10 steps (0.33s / 333ms)")
+        self.lbl_interval_hud.setStyleSheet("color: #38bdf8; font-weight: bold; font-family: monospace; font-size: 11px; min-width: 220px;")
+        interval_row.addWidget(self.lbl_interval_hud)
+
+        eval_layout.addLayout(interval_row)
 
         # Rollout Progress Bar
         self.progress_bar = QProgressBar()
@@ -2186,6 +2233,26 @@ class UR5ePolicyTesterStudio(QMainWindow):
 
             self.set_grayscale_mode(is_model_grayscale)
             mode_badge = "Grayscale (1-Ch)" if is_model_grayscale else "RGB (3-Ch)"
+
+            # Check for trained FPS and decision horizon
+            model_fps = 30
+            trained_n_steps = 10
+            for info_p in [p / "training_info.json", p.parent / "training_info.json"]:
+                if info_p.exists():
+                    try:
+                        with open(info_p, "r") as f_info:
+                            t_info = json.load(f_info)
+                            model_fps = int(t_info.get("fps", 30))
+                            trained_n_steps = int(t_info.get("n_action_steps", 10))
+                            break
+                    except Exception:
+                        pass
+            self.model_fps = model_fps
+            if hasattr(self, "slider_action_steps"):
+                self.slider_action_steps.blockSignals(True)
+                self.slider_action_steps.setValue(trained_n_steps)
+                self.slider_action_steps.blockSignals(False)
+                self.on_action_steps_changed(trained_n_steps)
             info_text = f"✔ {policy_type.upper()} | Cams: {cam_str} | Mode: {mode_badge} | Device: {device_str} | Checkpoint: {p.parent.name}"
             self.lbl_model_info.setText(info_text)
             self.lbl_model_info.setStyleSheet("background-color: #0b1120; color: #4ade80; border: 1px solid #166534; font-weight: bold;")
@@ -2217,6 +2284,12 @@ class UR5ePolicyTesterStudio(QMainWindow):
             self.cam_widget_1.set_grayscale(enabled)
         if hasattr(self, "cam_widget_2"):
             self.cam_widget_2.set_grayscale(enabled)
+
+    def on_action_steps_changed(self, steps: int):
+        fps = getattr(self, "model_fps", 30)
+        dt = steps / max(1, fps)
+        if hasattr(self, "lbl_interval_hud"):
+            self.lbl_interval_hud.setText(f"{steps} steps ({dt:.2f}s / {int(dt*1000)}ms @ {fps} FPS)")
 
     def toggle_dual_cameras(self):
         self.set_dual_cameras_enabled(not self.enable_dual_cameras)
@@ -2827,14 +2900,16 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.status_bar.showMessage("Executing autonomous policy evaluation rollout...", 10000)
 
         # Launch background rollout thread
+        n_steps = self.slider_action_steps.value() if hasattr(self, "slider_action_steps") else 10
         self.rollout_worker = PolicyRolloutWorker(
             model_path=self.active_model_path,
             robot_worker=self.robot_worker,
             camera_worker_1=self.camera_worker_1,
             camera_worker_2=self.camera_worker_2,
             duration_s=duration,
-            control_fps=30,
+            control_fps=getattr(self, "model_fps", 30),
             max_jump_deg=max_jump,
+            n_action_steps=n_steps,
             auto_freedrive_after=auto_fd,
             return_start_after=return_start,
             start_pose_deg=self.start_position,

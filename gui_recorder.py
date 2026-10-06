@@ -1308,6 +1308,20 @@ class UR5eRecorderStudio(QMainWindow):
         self.chk_grayscale.toggled.connect(self.on_grayscale_toggled)
         cam_ctrl_bar.addWidget(self.chk_grayscale)
 
+        lbl_fps_tag = QLabel("Rate:")
+        lbl_fps_tag.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px; margin-left: 6px;")
+        cam_ctrl_bar.addWidget(lbl_fps_tag)
+
+        self.FPS_PRESETS = [30, 20, 15, 10]
+        self.combo_fps = QComboBox()
+        for f_val in self.FPS_PRESETS:
+            self.combo_fps.addItem(f"{f_val} FPS", f_val)
+        self.combo_fps.setCurrentIndex(0)
+        self.combo_fps.setStyleSheet("font-size: 11px; padding: 2px 4px;")
+        self.combo_fps.setToolTip("Observation and control rate (FPS). Standard for UR5e imitation learning is 30 FPS.")
+        self.combo_fps.currentIndexChanged.connect(self.on_fps_changed)
+        cam_ctrl_bar.addWidget(self.combo_fps)
+
         self.lbl_dual_badge = QLabel("○ 1-Cam Mode")
         self.lbl_dual_badge.setStyleSheet("color: #64748b; font-size: 10px; margin-left: 6px;")
         cam_ctrl_bar.addWidget(self.lbl_dual_badge)
@@ -2334,6 +2348,22 @@ class UR5eRecorderStudio(QMainWindow):
             self.status_bar.showMessage(f"Camera mode set to {ch_desc}.", 3000)
         # Invalidate active dataset handle so any new recording starts with matching format
         self.active_dataset = None
+
+    def on_fps_changed(self, index: int):
+        val = self.combo_fps.itemData(index)
+        if val is not None and val != self.target_fps:
+            self.target_fps = int(val)
+            if self.camera_worker_1 is not None:
+                self.camera_worker_1.target_fps = self.target_fps
+            if self.camera_worker_2 is not None:
+                self.camera_worker_2.target_fps = self.target_fps
+            interval_ms = int(1000.0 / max(1, self.target_fps))
+            if hasattr(self, "dataset_frame_timer"):
+                self.dataset_frame_timer.setInterval(interval_ms)
+            ch_desc = "GRAY (1-Ch)" if self.is_grayscale else "RGB (3-Ch)"
+            self.lbl_cam_info.setText(f"Format: {self.camera_width}x{self.camera_height} {ch_desc} @ {self.target_fps} FPS")
+            print(f"[DATASET] Recording sampling rate updated to {self.target_fps} FPS (dt = {1.0/self.target_fps:.3f}s)")
+            self.active_dataset = None
 
     def on_cam1_device_changed(self, index: int):
         cam_id = self.combo_cam1.itemData(index)
@@ -3390,10 +3420,13 @@ class UR5eRecorderStudio(QMainWindow):
         self.lbl_dataset_path.setText(f"Path: datasets/{clean_name}")
         self.list_episodes.clear()
 
-        # Unlock grayscale toggle for the new dataset
+        # Unlock grayscale toggle and FPS selector for the new dataset
         if hasattr(self, "chk_grayscale"):
             self.chk_grayscale.setEnabled(True)
             self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
+        if hasattr(self, "combo_fps"):
+            self.combo_fps.setEnabled(True)
+            self.combo_fps.setToolTip("Observation and control rate (FPS). Standard for UR5e imitation learning is 30 FPS.")
 
         print(f"[DATASET] Prepared fresh new dataset: '{clean_name}' (Path: datasets/{clean_name})")
         self.status_bar.showMessage(f"New dataset '{clean_name}' ready. Choose Grayscale or RGB mode.", 4000)
@@ -3492,6 +3525,48 @@ class UR5eRecorderStudio(QMainWindow):
                             break
                 except Exception as err:
                     print(f"[WARNING] Could not parse {cfg_candidate}: {err}")
+
+        # Sync and lock FPS selector based on dataset metadata
+        detected_fps = None
+        if meta_info_file.exists():
+            try:
+                with open(meta_info_file, "r") as f:
+                    detected_fps = json.load(f).get("fps")
+            except Exception:
+                pass
+        if detected_fps is None:
+            for cfg_c in [self.dataset_root / "meta" / "recording_config.json", self.dataset_root / "recording_config.json"]:
+                if cfg_c.exists():
+                    try:
+                        with open(cfg_c, "r") as cf:
+                            detected_fps = json.load(cf).get("fps")
+                            if detected_fps:
+                                break
+                    except Exception:
+                        pass
+
+        if hasattr(self, "combo_fps"):
+            if detected_fps is not None:
+                self.combo_fps.blockSignals(True)
+                fps_idx = self.combo_fps.findData(int(detected_fps))
+                if fps_idx >= 0:
+                    self.combo_fps.setCurrentIndex(fps_idx)
+                else:
+                    self.combo_fps.addItem(f"{detected_fps} FPS", int(detected_fps))
+                    self.combo_fps.setCurrentIndex(self.combo_fps.count() - 1)
+                self.target_fps = int(detected_fps)
+                self.combo_fps.blockSignals(False)
+
+                if total_episodes > 0:
+                    self.combo_fps.setEnabled(False)
+                    self.combo_fps.setToolTip(f"Dataset sampling rate locked to {detected_fps} FPS to match existing episodes.")
+                else:
+                    self.combo_fps.setEnabled(True)
+            else:
+                if total_episodes > 0:
+                    self.combo_fps.setEnabled(False)
+                else:
+                    self.combo_fps.setEnabled(True)
 
         if hasattr(self, "chk_grayscale"):
             if detected_grayscale is not None:

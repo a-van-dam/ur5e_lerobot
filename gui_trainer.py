@@ -873,30 +873,43 @@ class UR5eTrainerStudio(QMainWindow):
 
         layout.addWidget(grp_hw)
 
-        # Policy Architecture Hyperparameters (ACT Specific)
-        grp_act = QGroupBox("ACT POLICY SPECIFIC TUNING")
+        # Policy Architecture Hyperparameters (Horizon & Interval Tuning)
+        grp_act = QGroupBox("POLICY HORIZON & RE-PLANNING INTERVAL")
         grid_act = QGridLayout(grp_act)
         grid_act.setSpacing(8)
 
-        grid_act.addWidget(QLabel("Chunk Size (Steps):"), 0, 0)
+        grid_act.addWidget(QLabel("Chunk Size (Horizon Steps):"), 0, 0)
         self.spin_chunk_size = QSpinBox()
         self.spin_chunk_size.setRange(10, 300)
         self.spin_chunk_size.setValue(100)
-        self.spin_chunk_size.setToolTip("Action horizon predicted at each inference snapshot")
+        self.spin_chunk_size.setToolTip("Total future action steps predicted at each neural network snapshot")
+        self.spin_chunk_size.valueChanged.connect(self.update_decision_interval)
         grid_act.addWidget(self.spin_chunk_size, 0, 1)
 
-        grid_act.addWidget(QLabel("KL Divergence Weight:"), 0, 2)
+        grid_act.addWidget(QLabel("Action Steps (Execution Chunk):"), 0, 2)
+        self.spin_n_action_steps = QSpinBox()
+        self.spin_n_action_steps.setRange(1, 100)
+        self.spin_n_action_steps.setValue(15)
+        self.spin_n_action_steps.setToolTip("How many action steps to execute before taking a new camera observation and re-planning")
+        self.spin_n_action_steps.valueChanged.connect(self.update_decision_interval)
+        grid_act.addWidget(self.spin_n_action_steps, 0, 3)
+
+        grid_act.addWidget(QLabel("KL Divergence Weight:"), 1, 0)
         self.spin_kl_weight = QDoubleSpinBox()
         self.spin_kl_weight.setRange(0.1, 100.0)
         self.spin_kl_weight.setValue(10.0)
-        grid_act.addWidget(self.spin_kl_weight, 0, 3)
+        grid_act.addWidget(self.spin_kl_weight, 1, 1)
 
-        grid_act.addWidget(QLabel("Transformer Dropout:"), 1, 0)
+        grid_act.addWidget(QLabel("Transformer Dropout:"), 1, 2)
         self.spin_dropout = QDoubleSpinBox()
         self.spin_dropout.setRange(0.0, 0.5)
         self.spin_dropout.setSingleStep(0.05)
         self.spin_dropout.setValue(0.1)
-        grid_act.addWidget(self.spin_dropout, 1, 1)
+        grid_act.addWidget(self.spin_dropout, 1, 3)
+
+        self.lbl_decision_interval = QLabel("Decision Interval: 0.50s (500 ms) @ 30 FPS")
+        self.lbl_decision_interval.setStyleSheet("color: #38bdf8; font-family: monospace; font-weight: bold; font-size: 11px; padding: 4px;")
+        grid_act.addWidget(self.lbl_decision_interval, 2, 0, 1, 4)
 
         layout.addWidget(grp_act)
         layout.addStretch()
@@ -1100,6 +1113,17 @@ class UR5eTrainerStudio(QMainWindow):
         else:
             self.lbl_resume_info.setText("No previous checkpoints found in outputs/train/.")
 
+    def update_decision_interval(self):
+        fps = getattr(self, "dataset_fps", 30)
+        steps = self.spin_n_action_steps.value() if hasattr(self, "spin_n_action_steps") else 15
+        dt = steps / max(1, fps)
+        chunk = self.spin_chunk_size.value() if hasattr(self, "spin_chunk_size") else 100
+        if hasattr(self, "lbl_decision_interval"):
+            self.lbl_decision_interval.setText(
+                f"Decision Interval: {dt:.2f}s ({int(dt*1000)}ms) @ {fps} FPS  |  "
+                f"Executes {steps} of {chunk} predicted horizon steps before observing camera"
+            )
+
     def on_dataset_selection_changed(self, index: int):
         ds_path_str = self.combo_dataset.currentData()
         if not ds_path_str:
@@ -1115,6 +1139,8 @@ class UR5eTrainerStudio(QMainWindow):
                 eps = data.get("total_episodes", "?")
                 frames = data.get("total_frames", "?")
                 fps = data.get("fps", 30)
+                self.dataset_fps = int(fps)
+                self.update_decision_interval()
                 meta_text = f"✔ {eps} Episodes | {frames:,} Total Frames | {fps} FPS | Root: {ds_path.name}"
             except Exception as e:
                 meta_text = f"✔ {ds_path.name} (Metadata: {e})"
@@ -1324,6 +1350,7 @@ class UR5eTrainerStudio(QMainWindow):
             "num_workers": self.spin_workers.value(),
             "seed": self.spin_seed.value(),
             "chunk_size": self.spin_chunk_size.value(),
+            "n_action_steps": self.spin_n_action_steps.value(),
             "kl_weight": self.spin_kl_weight.value(),
             "dropout": self.spin_dropout.value(),
             "grayscale": self.chk_grayscale.isChecked(),

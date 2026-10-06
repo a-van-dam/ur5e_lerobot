@@ -229,17 +229,22 @@ class CameraWorker(QThread):
     fps_updated = pyqtSignal(float)
     status_signal = pyqtSignal(int, bool, str)
 
-    def __init__(self, camera_index: int, target_fps: int = 30, width: int = 320, height: int = 240, mock: bool = False):
+    def __init__(self, camera_index: int, target_fps: int = 30, width: int = 320, height: int = 240, mock: bool = False, grayscale: bool = False):
         super().__init__()
         self.camera_index = camera_index
         self.target_fps = target_fps
         self.width = width
         self.height = height
         self.mock = mock
+        self._grayscale = grayscale
         self._running = False
         self._mutex = QMutex()
         self.cap: Optional[cv2.VideoCapture] = None
         self._latest_frame: Optional[np.ndarray] = None
+
+    def set_grayscale(self, enabled: bool):
+        with QMutexLocker(self._mutex):
+            self._grayscale = bool(enabled)
 
     def update_resolution(self, width: int, height: int):
         with QMutexLocker(self._mutex):
@@ -279,6 +284,11 @@ class CameraWorker(QThread):
                     if frame.shape[1] != cur_w or frame.shape[0] != cur_h:
                         frame = cv2.resize(frame, (cur_w, cur_h), interpolation=cv2.INTER_AREA)
                     with QMutexLocker(self._mutex):
+                        is_gray = self._grayscale
+                    if is_gray and len(frame.shape) == 3:
+                        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        frame = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+                    with QMutexLocker(self._mutex):
                         self._latest_frame = frame
                     self.frame_ready.emit(self.camera_index, frame)
                 else:
@@ -295,6 +305,11 @@ class CameraWorker(QThread):
                 cv2.circle(frame, (cx, cy), 18, (56, 189, 248), -1)
                 cv2.putText(frame, f"CAM {self.camera_index} [SIM]", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
+                with QMutexLocker(self._mutex):
+                    is_gray = self._grayscale
+                if is_gray and len(frame.shape) == 3:
+                    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    frame = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
                 with QMutexLocker(self._mutex):
                     self._latest_frame = frame
                 self.frame_ready.emit(self.camera_index, frame)
@@ -330,6 +345,7 @@ class VideoFeedWidget(QWidget):
         self._pixmap: Optional[QPixmap] = None
         self._fps: float = 0.0
         self._is_evaluating: bool = False
+        self._is_grayscale: bool = False
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(320, 240)
 
@@ -337,11 +353,20 @@ class VideoFeedWidget(QWidget):
         self._is_evaluating = active
         self.update()
 
+    def set_grayscale(self, enabled: bool):
+        self._is_grayscale = bool(enabled)
+        self.update()
+
     def update_frame(self, cam_id: int, frame: np.ndarray):
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_frame.shape
-        bytes_per_line = ch * w
-        q_img = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        if len(frame.shape) == 2:
+            h, w = frame.shape
+            bytes_per_line = w
+            q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_Grayscale8)
+        else:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_frame.shape
+            bytes_per_line = ch * w
+            q_img = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         self._pixmap = QPixmap.fromImage(q_img)
         self.update()
 
@@ -376,7 +401,8 @@ class VideoFeedWidget(QWidget):
         painter.fillRect(10, 10, hud_rect_w, hud_rect_h, QColor(15, 23, 42, 210))
         painter.setPen(QColor("#38bdf8"))
         painter.setFont(QFont("monospace", 10, QFont.Weight.Bold))
-        painter.drawText(18, 27, f"{self.title} | {self._fps:4.1f} FPS")
+        mode_str = "GRAY" if self._is_grayscale else "RGB"
+        painter.drawText(18, 27, f"{self.title} | {self._fps:4.1f} FPS [{mode_str}]")
 
         if self._is_evaluating:
             # Active Rollout Badge
@@ -756,6 +782,20 @@ class PolicyRolloutWorker(QThread):
             self.rollout_finished.emit(False, msg)
             return
 
+        # Check if model was trained in grayscale mode
+        is_model_grayscale = False
+        model_dir = Path(self.model_path)
+        for info_p in [model_dir / "training_info.json", model_dir.parent / "training_info.json"]:
+            if info_p.exists():
+                try:
+                    with open(info_p, "r") as f_info:
+                        t_info = json.load(f_info)
+                        if t_info.get("grayscale") is True or t_info.get("image_channels", 3) == 1:
+                            is_model_grayscale = True
+                            break
+                except Exception:
+                    pass
+
         # Inspect camera requirements
         img_features = getattr(policy.config, "image_features", {})
         has_wrist_cam = "observation.images.wrist" in img_features
@@ -772,6 +812,8 @@ class PolicyRolloutWorker(QThread):
             cam1_frame = np.zeros((req_h, req_w, 3), dtype=np.uint8)
         if cam1_frame.shape[1] != req_w or cam1_frame.shape[0] != req_h:
             cam1_frame = cv2.resize(cam1_frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
+        if is_model_grayscale and len(cam1_frame.shape) == 3:
+            cam1_frame = cv2.cvtColor(cv2.cvtColor(cam1_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
 
         current_joints = self.robot_worker.get_latest_joints()
         start_q_rad = [current_joints.get(j, 0.0) for j in UR5E_JOINTS]
@@ -791,6 +833,8 @@ class PolicyRolloutWorker(QThread):
             if cam2_frame is not None:
                 if cam2_frame.shape[1] != req_w or cam2_frame.shape[0] != req_h:
                     cam2_frame = cv2.resize(cam2_frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
+                if is_model_grayscale and len(cam2_frame.shape) == 3:
+                    cam2_frame = cv2.cvtColor(cv2.cvtColor(cam2_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
                 wrist_rgb = cv2.cvtColor(cam2_frame, cv2.COLOR_BGR2RGB)
                 batch["observation.images.wrist"] = torch.from_numpy(wrist_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
 
@@ -869,6 +913,8 @@ class PolicyRolloutWorker(QThread):
                 cur_q = [obs.get(j, 0.0) for j in UR5E_JOINTS]
 
                 # 3. Model inference
+                if is_model_grayscale and len(frame.shape) == 3:
+                    frame = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
                 img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img_t = torch.from_numpy(img_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
                 state_t = torch.from_numpy(np.array(cur_q, dtype=np.float32)).unsqueeze(0).to(device)
@@ -882,6 +928,8 @@ class PolicyRolloutWorker(QThread):
                     if w_frame is not None:
                         if w_frame.shape[1] != req_w or w_frame.shape[0] != req_h:
                             w_frame = cv2.resize(w_frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
+                        if is_model_grayscale and len(w_frame.shape) == 3:
+                            w_frame = cv2.cvtColor(cv2.cvtColor(w_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
                         step_batch["observation.images.wrist"] = torch.from_numpy(
                             cv2.cvtColor(w_frame, cv2.COLOR_BGR2RGB)
                         ).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
@@ -969,6 +1017,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.camera_1_index = DEFAULT_CAMERA_INDEX
         self.camera_2_index = DEFAULT_CAMERA_2_INDEX
         self.enable_dual_cameras = False
+        self.is_grayscale = False
 
         # Model Checkpoint Path
         if model_path:
@@ -1023,7 +1072,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.setup_shortcuts()
 
         # Start Camera Worker (Primary)
-        self.camera_worker_1 = CameraWorker(self.camera_1_index, self.target_fps, 320, 240, self.mock_mode)
+        self.camera_worker_1 = CameraWorker(self.camera_1_index, self.target_fps, 320, 240, self.mock_mode, self.is_grayscale)
         self.camera_worker_1.frame_ready.connect(self.cam_widget_1.update_frame)
         self.camera_worker_1.fps_updated.connect(self.cam_widget_1.update_fps)
         self.camera_worker_1.start()
@@ -1420,6 +1469,19 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.combo_cam2.setVisible(False)
         self.combo_cam2.currentIndexChanged.connect(self.on_cam2_device_changed)
         cam_ctrl_bar.addWidget(self.combo_cam2)
+
+        self.chk_grayscale = QCheckBox("Grayscale (1-Ch)")
+        self.chk_grayscale.setStyleSheet("""
+            QCheckBox {
+                color: #cbd5e1;
+                font-size: 11px;
+                font-weight: bold;
+                margin-left: 6px;
+            }
+        """)
+        self.chk_grayscale.setToolTip("Toggle Grayscale camera preview and tensor processing (auto-synced from model metadata)")
+        self.chk_grayscale.toggled.connect(self.on_grayscale_toggled)
+        cam_ctrl_bar.addWidget(self.chk_grayscale)
 
         cam_ctrl_bar.addStretch()
         left_column.addLayout(cam_ctrl_bar)
@@ -2108,7 +2170,23 @@ class UR5ePolicyTesterStudio(QMainWindow):
             cam_str = " + ".join(cams) if cams else "1-Cam"
 
             device_str = "CUDA (RTX)" if (torch and torch.cuda.is_available()) else "CPU"
-            info_text = f"✔ {policy_type.upper()} | Cams: {cam_str} | Device: {device_str} | Checkpoint: {p.parent.name}"
+
+            # Check if checkpoint was trained in grayscale mode
+            is_model_grayscale = False
+            for info_p in [p / "training_info.json", p.parent / "training_info.json"]:
+                if info_p.exists():
+                    try:
+                        with open(info_p, "r") as f_info:
+                            t_info = json.load(f_info)
+                            if t_info.get("grayscale") is True or t_info.get("image_channels", 3) == 1:
+                                is_model_grayscale = True
+                                break
+                    except Exception:
+                        pass
+
+            self.set_grayscale_mode(is_model_grayscale)
+            mode_badge = "Grayscale (1-Ch)" if is_model_grayscale else "RGB (3-Ch)"
+            info_text = f"✔ {policy_type.upper()} | Cams: {cam_str} | Mode: {mode_badge} | Device: {device_str} | Checkpoint: {p.parent.name}"
             self.lbl_model_info.setText(info_text)
             self.lbl_model_info.setStyleSheet("background-color: #0b1120; color: #4ade80; border: 1px solid #166534; font-weight: bold;")
             print(f"[MODEL] Inspected checkpoint: {info_text}")
@@ -2122,6 +2200,24 @@ class UR5ePolicyTesterStudio(QMainWindow):
     # -------------------------------------------------------------------------
     # Camera Controls & Devices
     # -------------------------------------------------------------------------
+    def on_grayscale_toggled(self, checked: bool):
+        self.set_grayscale_mode(checked)
+
+    def set_grayscale_mode(self, enabled: bool):
+        self.is_grayscale = enabled
+        if hasattr(self, "chk_grayscale"):
+            self.chk_grayscale.blockSignals(True)
+            self.chk_grayscale.setChecked(enabled)
+            self.chk_grayscale.blockSignals(False)
+        if self.camera_worker_1 is not None:
+            self.camera_worker_1.set_grayscale(enabled)
+        if self.camera_worker_2 is not None:
+            self.camera_worker_2.set_grayscale(enabled)
+        if hasattr(self, "cam_widget_1"):
+            self.cam_widget_1.set_grayscale(enabled)
+        if hasattr(self, "cam_widget_2"):
+            self.cam_widget_2.set_grayscale(enabled)
+
     def toggle_dual_cameras(self):
         self.set_dual_cameras_enabled(not self.enable_dual_cameras)
 
@@ -2134,7 +2230,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
         if enabled:
             self.btn_toggle_cam2.setText("✖ 1-Camera Mode")
             if self.camera_worker_2 is None:
-                self.camera_worker_2 = CameraWorker(self.camera_2_index, self.target_fps, 320, 240, self.mock_mode)
+                self.camera_worker_2 = CameraWorker(self.camera_2_index, self.target_fps, 320, 240, self.mock_mode, self.is_grayscale)
                 self.camera_worker_2.frame_ready.connect(self.cam_widget_2.update_frame)
                 self.camera_worker_2.fps_updated.connect(self.cam_widget_2.update_fps)
                 self.camera_worker_2.start()
@@ -2149,7 +2245,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
         if dev_idx is not None and dev_idx != self.camera_1_index:
             self.camera_1_index = dev_idx
             self.camera_worker_1.stop()
-            self.camera_worker_1 = CameraWorker(self.camera_1_index, self.target_fps, 320, 240, self.mock_mode)
+            self.camera_worker_1 = CameraWorker(self.camera_1_index, self.target_fps, 320, 240, self.mock_mode, self.is_grayscale)
             self.camera_worker_1.frame_ready.connect(self.cam_widget_1.update_frame)
             self.camera_worker_1.fps_updated.connect(self.cam_widget_1.update_fps)
             self.camera_worker_1.start()
@@ -2160,7 +2256,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
             self.camera_2_index = dev_idx
             if self.camera_worker_2:
                 self.camera_worker_2.stop()
-                self.camera_worker_2 = CameraWorker(self.camera_2_index, self.target_fps, 320, 240, self.mock_mode)
+                self.camera_worker_2 = CameraWorker(self.camera_2_index, self.target_fps, 320, 240, self.mock_mode, self.is_grayscale)
                 self.camera_worker_2.frame_ready.connect(self.cam_widget_2.update_frame)
                 self.camera_worker_2.fps_updated.connect(self.cam_widget_2.update_fps)
                 self.camera_worker_2.start()

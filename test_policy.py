@@ -253,6 +253,24 @@ def run_policy_rollout(
     if has_wrist_cam:
         print("      • Model utilizes secondary Wrist Camera ('observation.images.wrist').")
 
+    # Check if model was trained in grayscale mode
+    is_grayscale = False
+    for info_candidate in [model_dir / "training_info.json", model_dir.parent / "training_info.json"]:
+        if info_candidate.exists():
+            try:
+                with open(info_candidate, "r") as f_info:
+                    t_info = json.load(f_info)
+                    if t_info.get("grayscale") is True or t_info.get("image_channels", 3) == 1:
+                        is_grayscale = True
+                        break
+            except Exception:
+                pass
+
+    if is_grayscale:
+        print("      • Vision Input Mode:  Grayscale (1-Ch luminance -> live frames converted)")
+    else:
+        print("      • Vision Input Mode:  RGB (3-Ch color)")
+
     # ─────────────────────────────────────────────────────────────────
     # Phase 2: Connect Robot & Camera Sensors
     # ─────────────────────────────────────────────────────────────────
@@ -291,6 +309,9 @@ def run_policy_rollout(
         cv2.putText(initial_cam_frame, "Mock Camera Frame", (30, target_h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     else:
         initial_cam_frame = cam1_stream.read_frame()
+
+    if is_grayscale:
+        initial_cam_frame = cv2.cvtColor(cv2.cvtColor(initial_cam_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
 
     eval_dir = Path("outputs/eval")
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -405,6 +426,9 @@ def run_policy_rollout(
             else:
                 cam_frame = cam1_stream.read_frame()
 
+            if is_grayscale:
+                cam_frame = cv2.cvtColor(cv2.cvtColor(cam_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+
             # 2. Acquire latest robot telemetry
             obs = robot.get_observation()
             current_q = [obs[f"{j}.pos"] for j in UR5E_JOINTS]
@@ -419,7 +443,10 @@ def run_policy_rollout(
                 "observation.images.workspace": img_tensor,
             }
             if has_wrist_cam and cam2_stream is not None:
-                wrist_rgb = cv2.cvtColor(cam2_stream.read_frame(), cv2.COLOR_BGR2RGB)
+                wrist_raw = cam2_stream.read_frame()
+                if is_grayscale:
+                    wrist_raw = cv2.cvtColor(cv2.cvtColor(wrist_raw, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+                wrist_rgb = cv2.cvtColor(wrist_raw, cv2.COLOR_BGR2RGB)
                 step_batch["observation.images.wrist"] = torch.from_numpy(wrist_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
 
             # 4. Predict next action

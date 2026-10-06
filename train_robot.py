@@ -506,6 +506,23 @@ def generate_html_dashboard(
 # 3. Modular RobotTrainer Class
 # =============================================================================
 
+def detect_dataset_grayscale(dataset_path: Path) -> bool:
+    """Checks dataset metadata for grayscale recording mode."""
+    for candidate in [
+        Path(dataset_path) / "meta" / "recording_config.json",
+        Path(dataset_path) / "recording_config.json",
+    ]:
+        if candidate.exists():
+            try:
+                with open(candidate, "r") as f:
+                    cfg = json.load(f)
+                    if cfg.get("grayscale") is True:
+                        return True
+            except Exception:
+                pass
+    return False
+
+
 class RobotTrainer:
     """
     Core imitation learning training manager for UR5e LeRobot datasets.
@@ -540,6 +557,7 @@ class RobotTrainer:
         n_action_steps: Optional[int] = None,
         kl_weight: Optional[float] = None,
         dropout: Optional[float] = None,
+        grayscale: Optional[bool] = None,
     ):
         if not LEROBOT_AVAILABLE:
             raise RuntimeError(f"LeRobot could not be loaded in this Python environment: {LEROBOT_IMPORT_ERROR}")
@@ -577,6 +595,10 @@ class RobotTrainer:
         self.n_action_steps = int(n_action_steps) if n_action_steps is not None else None
         self.kl_weight = float(kl_weight) if kl_weight is not None else None
         self.dropout = float(dropout) if dropout is not None else None
+        if grayscale is not None:
+            self.is_grayscale = bool(grayscale)
+        else:
+            self.is_grayscale = detect_dataset_grayscale(self.dataset_path)
 
         # History tracking
         self.history_steps: List[int] = []
@@ -731,6 +753,8 @@ class RobotTrainer:
             "step": step,
             "training_steps": self.training_steps,
             "dataset": str(self.dataset_path.name),
+            "grayscale": self.is_grayscale,
+            "image_channels": 1 if self.is_grayscale else 3,
             "updated_at": datetime.datetime.now().isoformat(),
         }
         with open(self.checkpoint_dir / "training_info.json", "w") as f:
@@ -781,6 +805,7 @@ class RobotTrainer:
         print(f"  • Dataset:           {self.dataset_path}")
         print(f"  • Selected Policy:   {self.policy_name.upper()}")
         print(f"  • Optimizer:         {self.optimizer_name} (lr={self.learning_rate}, wd={self.weight_decay})")
+        print(f"  • Image Mode:        {'Grayscale (1-Ch luminance)' if self.is_grayscale else 'RGB (3-Ch color)'}")
         print(f"  • Total Steps:       {self.training_steps:,}")
         print(f"  • Batch Size:        {self.batch_size}")
         print(f"  • Device:            {self.device} ({torch.cuda.get_device_name(0) if self.device.type == 'cuda' else 'CPU'})")
@@ -918,6 +943,16 @@ class RobotTrainer:
             batch = preprocessor(batch)
             batch = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
+            # Grayscale channel consistency
+            if self.is_grayscale:
+                for k in batch:
+                    if "image" in k and isinstance(batch[k], torch.Tensor) and batch[k].ndim == 4:
+                        if batch[k].shape[1] == 3:
+                            lum = 0.2989 * batch[k][:, 0:1] + 0.5870 * batch[k][:, 1:2] + 0.1140 * batch[k][:, 2:3]
+                            batch[k] = lum.repeat(1, 3, 1, 1)
+                        elif batch[k].shape[1] == 1:
+                            batch[k] = batch[k].repeat(1, 3, 1, 1)
+
             # Visual Data Augmentation (mild random brightness/contrast on images)
             if self.use_augmentation:
                 for k in batch:
@@ -953,6 +988,14 @@ class RobotTrainer:
                     for v_idx, v_batch in enumerate(val_loader):
                         v_batch = preprocessor(v_batch)
                         v_batch = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in v_batch.items()}
+                        if self.is_grayscale:
+                            for k in v_batch:
+                                if "image" in k and isinstance(v_batch[k], torch.Tensor) and v_batch[k].ndim == 4:
+                                    if v_batch[k].shape[1] == 3:
+                                        lum = 0.2989 * v_batch[k][:, 0:1] + 0.5870 * v_batch[k][:, 1:2] + 0.1140 * v_batch[k][:, 2:3]
+                                        v_batch[k] = lum.repeat(1, 3, 1, 1)
+                                    elif v_batch[k].shape[1] == 1:
+                                        v_batch[k] = v_batch[k].repeat(1, 3, 1, 1)
                         v_loss, _ = policy.forward(v_batch)
                         val_losses.append(v_loss.item())
                         if v_idx >= 30:  # Evaluate up to 30 batches for rapid, non-blocking evaluation
@@ -1072,6 +1115,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default=DEVICE, help="Execution device (cuda or cpu)")
     parser.add_argument("--workers", type=int, default=NUM_WORKERS, help="DataLoader subprocess workers")
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed for reproducibility")
+    parser.add_argument("--grayscale", action="store_true", default=None, help="Train policy on single-channel Grayscale imagery")
     return parser.parse_args()
 
 
@@ -1095,6 +1139,7 @@ def main():
         device=args.device,
         num_workers=args.workers,
         seed=args.seed,
+        grayscale=args.grayscale,
     )
 
     try:

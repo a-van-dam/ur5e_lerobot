@@ -612,6 +612,18 @@ class UR5eTrainerStudio(QMainWindow):
         self.lbl_dataset_meta.setWordWrap(True)
         ds_layout.addWidget(self.lbl_dataset_meta)
 
+        meta_row = QHBoxLayout()
+        self.lbl_channel_mode = QLabel("● RGB Mode (3-Ch)")
+        self.lbl_channel_mode.setStyleSheet("color: #a855f7; font-weight: bold; font-size: 11px; padding: 2px 4px;")
+        meta_row.addWidget(self.lbl_channel_mode)
+
+        self.chk_grayscale = QCheckBox("Train in Grayscale Mode (1-Ch)")
+        self.chk_grayscale.setStyleSheet("font-size: 11px; color: #cbd5e1; font-weight: bold;")
+        self.chk_grayscale.setToolTip("Train policy using 1-channel luminance inputs (automatically activated for grayscale datasets).")
+        meta_row.addWidget(self.chk_grayscale)
+        meta_row.addStretch()
+        ds_layout.addLayout(meta_row)
+
         layout.addWidget(grp_ds)
 
         # 2. Policy Architecture Selection
@@ -1109,6 +1121,30 @@ class UR5eTrainerStudio(QMainWindow):
 
         self.lbl_dataset_meta.setText(meta_text)
 
+        # Inspect if dataset is recorded in grayscale mode
+        is_gray = False
+        for cfg_p in [ds_path / "meta" / "recording_config.json", ds_path / "recording_config.json"]:
+            if cfg_p.exists():
+                try:
+                    with open(cfg_p, "r") as cf:
+                        cfg = json.load(cf)
+                        if cfg.get("grayscale") is True:
+                            is_gray = True
+                            break
+                except Exception:
+                    pass
+
+        if hasattr(self, "lbl_channel_mode") and hasattr(self, "chk_grayscale"):
+            self.chk_grayscale.blockSignals(True)
+            self.chk_grayscale.setChecked(is_gray)
+            self.chk_grayscale.blockSignals(False)
+            if is_gray:
+                self.lbl_channel_mode.setText("● Grayscale Mode (1-Ch)")
+                self.lbl_channel_mode.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px; padding: 2px 4px;")
+            else:
+                self.lbl_channel_mode.setText("● RGB Mode (3-Ch)")
+                self.lbl_channel_mode.setStyleSheet("color: #a855f7; font-weight: bold; font-size: 11px; padding: 2px 4px;")
+
         if not self._user_edited_name:
             self.update_auto_model_name()
 
@@ -1290,6 +1326,7 @@ class UR5eTrainerStudio(QMainWindow):
             "chunk_size": self.spin_chunk_size.value(),
             "kl_weight": self.spin_kl_weight.value(),
             "dropout": self.spin_dropout.value(),
+            "grayscale": self.chk_grayscale.isChecked(),
         }
 
         if self.chk_resume.isChecked():

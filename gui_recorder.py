@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import math
 import os
 from pathlib import Path
@@ -59,6 +60,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -233,17 +235,23 @@ class CameraWorker(QThread):
     fps_updated = pyqtSignal(int, float)       # (camera_id, measured_fps)
     status_signal = pyqtSignal(int, bool, str) # (camera_id, is_connected, message)
 
-    def __init__(self, camera_id: int, target_fps: int = 30, width: int = 320, height: int = 240, mock: bool = False, parent=None):
+    def __init__(self, camera_id: int, target_fps: int = 30, width: int = 320, height: int = 240, mock: bool = False, grayscale: bool = False, parent=None):
         super().__init__(parent)
         self.camera_id = camera_id
         self.target_fps = target_fps
         self.target_width = width
         self.target_height = height
         self.mock = mock
+        self._grayscale = grayscale
         self._running = False
         self._cap = None
         self._mutex = QMutex()
         self._reconnect_requested = False
+
+    def set_grayscale(self, enabled: bool):
+        self._mutex.lock()
+        self._grayscale = bool(enabled)
+        self._mutex.unlock()
 
     def set_resolution(self, width: int, height: int):
         self._mutex.lock()
@@ -392,6 +400,16 @@ class CameraWorker(QThread):
                     (150, 180, 200),
                     1,
                 )
+
+            # Apply grayscale mode if enabled
+            self._mutex.lock()
+            is_gray = self._grayscale
+            self._mutex.unlock()
+
+            if is_gray:
+                if len(frame.shape) == 3:
+                    gray_img = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    frame = cv2.cvtColor(gray_img, cv2.COLOR_GRAY2BGR)
 
             # Emit frame
             self.frame_ready.emit(self.camera_id, frame)
@@ -822,6 +840,18 @@ class CameraFeedWidget(QFrame):
 
         header.addStretch()
 
+        self.lbl_mode_badge = QLabel("RGB")
+        self.lbl_mode_badge.setStyleSheet("""
+            color: #a855f7;
+            font-size: 10px;
+            font-weight: bold;
+            padding: 1px 5px;
+            background-color: rgba(168, 85, 247, 0.15);
+            border: 1px solid rgba(168, 85, 247, 0.3);
+            border-radius: 3px;
+        """)
+        header.addWidget(self.lbl_mode_badge)
+
         self.lbl_fps = QLabel("0.0 FPS")
         self.lbl_fps.setStyleSheet("color: #38bdf8; font-family: monospace; font-size: 11px;")
         header.addWidget(self.lbl_fps)
@@ -878,16 +908,44 @@ class CameraFeedWidget(QFrame):
             self._fps = fps
             self.lbl_fps.setText(f"{fps:4.1f} FPS")
 
+    def set_grayscale(self, enabled: bool):
+        if enabled:
+            self.lbl_mode_badge.setText("GRAY")
+            self.lbl_mode_badge.setStyleSheet("""
+                color: #38bdf8;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 1px 5px;
+                background-color: rgba(56, 189, 248, 0.15);
+                border: 1px solid rgba(56, 189, 248, 0.3);
+                border-radius: 3px;
+            """)
+        else:
+            self.lbl_mode_badge.setText("RGB")
+            self.lbl_mode_badge.setStyleSheet("""
+                color: #a855f7;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 1px 5px;
+                background-color: rgba(168, 85, 247, 0.15);
+                border: 1px solid rgba(168, 85, 247, 0.3);
+                border-radius: 3px;
+            """)
+
     @pyqtSlot(int, np.ndarray)
     def update_frame(self, cam_id: int, frame_bgr: np.ndarray):
         if cam_id != self.camera_id:
             return
 
-        h, w, ch = frame_bgr.shape
-        bytes_per_line = ch * w
-        # OpenCV BGR to RGB conversion
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        qimg = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        if len(frame_bgr.shape) == 2:
+            h, w = frame_bgr.shape
+            bytes_per_line = w
+            qimg = QImage(frame_bgr.data, w, h, bytes_per_line, QImage.Format.Format_Grayscale8)
+        else:
+            h, w, ch = frame_bgr.shape
+            bytes_per_line = ch * w
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            qimg = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
 
         # Scale to canvas dimensions preserving aspect ratio
         canvas_w = max(10, self.video_canvas.width())
@@ -921,6 +979,7 @@ class UR5eRecorderStudio(QMainWindow):
         self.enable_dual_cameras = False
         self.target_fps = fps
         self.mock_mode = mock
+        self.is_grayscale = False
 
         # State tracking
         self.is_recording = False
@@ -1230,6 +1289,24 @@ class UR5eRecorderStudio(QMainWindow):
         self.combo_resolution.setToolTip("Select recording resolution for cameras. Smaller resolutions (e.g. 320x240) train faster and save disk space.")
         self.combo_resolution.currentIndexChanged.connect(self.on_resolution_changed)
         cam_ctrl_bar.addWidget(self.combo_resolution)
+
+        self.chk_grayscale = QCheckBox("Grayscale (1-Ch)")
+        self.chk_grayscale.setChecked(False)
+        self.chk_grayscale.setStyleSheet("""
+            QCheckBox {
+                color: #cbd5e1;
+                font-size: 11px;
+                font-weight: bold;
+                margin-left: 6px;
+            }
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+            }
+        """)
+        self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
+        self.chk_grayscale.toggled.connect(self.on_grayscale_toggled)
+        cam_ctrl_bar.addWidget(self.chk_grayscale)
 
         self.lbl_dual_badge = QLabel("○ 1-Cam Mode")
         self.lbl_dual_badge.setStyleSheet("color: #64748b; font-size: 10px; margin-left: 6px;")
@@ -1681,12 +1758,34 @@ class UR5eRecorderStudio(QMainWindow):
         ds_layout.addWidget(ds_name_lbl)
 
         ds_name_row = QHBoxLayout()
-        self.txt_dataset_name = QLineEdit(DEFAULT_DATASET_NAME)
-        self.txt_dataset_name.returnPressed.connect(self.apply_dataset_name)
-        ds_name_row.addWidget(self.txt_dataset_name)
+        self.txt_dataset_name = QLineEdit()
+        self.txt_dataset_name.setPlaceholderText("Enter new dataset name (e.g. cube_pick_place)...")
+        self.txt_dataset_name.setText(DEFAULT_DATASET_NAME)
+        self.txt_dataset_name.returnPressed.connect(self.create_new_dataset)
+        self.txt_dataset_name.textChanged.connect(self.on_dataset_name_edited)
+        ds_name_row.addWidget(self.txt_dataset_name, stretch=2)
 
-        self.btn_apply_ds = QPushButton("Set / Load")
-        self.btn_apply_ds.setStyleSheet("""
+        self.btn_new_ds = QPushButton("➕ Add New")
+        self.btn_new_ds.setStyleSheet("""
+            QPushButton {
+                background-color: #047857;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 5px 10px;
+                border: 1px solid #059669;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #059669;
+            }
+        """)
+        self.btn_new_ds.setToolTip("Create a new dataset with the name typed above (warns if name already exists)")
+        self.btn_new_ds.clicked.connect(self.create_new_dataset)
+        ds_name_row.addWidget(self.btn_new_ds)
+
+        self.btn_load_ds = QPushButton("📁 Load Existing...")
+        self.btn_load_ds.setStyleSheet("""
             QPushButton {
                 background-color: #2563eb;
                 color: #ffffff;
@@ -1700,8 +1799,9 @@ class UR5eRecorderStudio(QMainWindow):
                 background-color: #1d4ed8;
             }
         """)
-        self.btn_apply_ds.clicked.connect(self.apply_dataset_name)
-        ds_name_row.addWidget(self.btn_apply_ds)
+        self.btn_load_ds.setToolTip("Open file dialog to load an existing dataset folder to add new episodes")
+        self.btn_load_ds.clicked.connect(self.load_existing_dataset)
+        ds_name_row.addWidget(self.btn_load_ds)
 
         self.btn_refresh_ds = QPushButton("↺")
         self.btn_refresh_ds.setToolTip("Rescan dataset directory")
@@ -2187,7 +2287,7 @@ class UR5eRecorderStudio(QMainWindow):
             if self.camera_worker_2 is None:
                 print(f"[CAMERA 2] Initializing Secondary Camera on /dev/video{self.camera_2_index}...")
                 self.camera_worker_2 = CameraWorker(
-                    self.camera_2_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode
+                    self.camera_2_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode, self.is_grayscale
                 )
                 self.camera_worker_2.frame_ready.connect(self.on_cam2_frame_received)
                 self.camera_worker_2.fps_updated.connect(self.cam_widget_2.update_fps)
@@ -2217,6 +2317,24 @@ class UR5eRecorderStudio(QMainWindow):
         # Invalidate active dataset handle so next episode writes correct schema (1 or 2 cameras)
         self.active_dataset = None
 
+    def on_grayscale_toggled(self, checked: bool):
+        self.is_grayscale = checked
+        if self.camera_worker_1 is not None:
+            self.camera_worker_1.set_grayscale(checked)
+        if self.camera_worker_2 is not None:
+            self.camera_worker_2.set_grayscale(checked)
+        if hasattr(self, "cam_widget_1"):
+            self.cam_widget_1.set_grayscale(checked)
+        if hasattr(self, "cam_widget_2"):
+            self.cam_widget_2.set_grayscale(checked)
+        ch_desc = "GRAY (1-Ch)" if checked else "RGB (3-Ch)"
+        self.lbl_cam_info.setText(f"Format: {self.camera_width}x{self.camera_height} {ch_desc} @ {self.target_fps} FPS")
+        print(f"[CAMERA] Vision mode switched to: {ch_desc}")
+        if hasattr(self, "status_bar"):
+            self.status_bar.showMessage(f"Camera mode set to {ch_desc}.", 3000)
+        # Invalidate active dataset handle so any new recording starts with matching format
+        self.active_dataset = None
+
     def on_cam1_device_changed(self, index: int):
         cam_id = self.combo_cam1.itemData(index)
         if cam_id is not None and cam_id != self.camera_1_index:
@@ -2226,7 +2344,7 @@ class UR5eRecorderStudio(QMainWindow):
             if self.camera_worker_1 is not None:
                 self.camera_worker_1.stop()
                 self.camera_worker_1 = CameraWorker(
-                    self.camera_1_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode
+                    self.camera_1_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode, self.is_grayscale
                 )
                 self.camera_worker_1.frame_ready.connect(self.on_cam1_frame_received)
                 self.camera_worker_1.fps_updated.connect(self.cam_widget_1.update_fps)
@@ -2243,7 +2361,7 @@ class UR5eRecorderStudio(QMainWindow):
             if self.camera_worker_2 is not None:
                 self.camera_worker_2.stop()
                 self.camera_worker_2 = CameraWorker(
-                    self.camera_2_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode
+                    self.camera_2_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode, self.is_grayscale
                 )
                 self.camera_worker_2.frame_ready.connect(self.on_cam2_frame_received)
                 self.camera_worker_2.fps_updated.connect(self.cam_widget_2.update_fps)
@@ -2261,7 +2379,8 @@ class UR5eRecorderStudio(QMainWindow):
             self.camera_worker_1.set_resolution(w, h)
         if self.camera_worker_2 is not None:
             self.camera_worker_2.set_resolution(w, h)
-        self.lbl_cam_info.setText(f"Format: {w}x{h} RGB @ {self.target_fps} FPS")
+        ch_desc = "GRAY (1-Ch)" if self.is_grayscale else "RGB (3-Ch)"
+        self.lbl_cam_info.setText(f"Format: {w}x{h} {ch_desc} @ {self.target_fps} FPS")
         print(f"[CAMERA] Resolution updated to {w}x{h} ({desc})")
         self.status_bar.showMessage(f"Camera resolution set to {w}x{h}.", 3000)
         # Invalidate active dataset handle so any new recording starts with the chosen resolution
@@ -2274,7 +2393,8 @@ class UR5eRecorderStudio(QMainWindow):
             self.camera_worker_1.set_resolution(w, h)
         if self.camera_worker_2 is not None:
             self.camera_worker_2.set_resolution(w, h)
-        self.lbl_cam_info.setText(f"Format: {w}x{h} RGB @ {self.target_fps} FPS")
+        ch_desc = "GRAY (1-Ch)" if self.is_grayscale else "RGB (3-Ch)"
+        self.lbl_cam_info.setText(f"Format: {w}x{h} {ch_desc} @ {self.target_fps} FPS")
         if hasattr(self, "combo_resolution"):
             self.combo_resolution.blockSignals(True)
             found_idx = -1
@@ -3034,7 +3154,14 @@ class UR5eRecorderStudio(QMainWindow):
             raw_1 = cam1_frame
             if raw_1.shape[1] != self.camera_width or raw_1.shape[0] != self.camera_height:
                 raw_1 = cv2.resize(raw_1, (self.camera_width, self.camera_height), interpolation=cv2.INTER_AREA)
-            img_workspace = cv2.cvtColor(raw_1, cv2.COLOR_BGR2RGB)
+            if self.is_grayscale:
+                if len(raw_1.shape) == 3:
+                    g1 = cv2.cvtColor(raw_1, cv2.COLOR_BGR2GRAY)
+                else:
+                    g1 = raw_1
+                img_workspace = cv2.cvtColor(g1, cv2.COLOR_GRAY2RGB)
+            else:
+                img_workspace = cv2.cvtColor(raw_1, cv2.COLOR_BGR2RGB)
         else:
             img_workspace = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
 
@@ -3054,7 +3181,14 @@ class UR5eRecorderStudio(QMainWindow):
                 raw_2 = self.latest_camera_frame_2
                 if raw_2.shape[1] != self.camera_width or raw_2.shape[0] != self.camera_height:
                     raw_2 = cv2.resize(raw_2, (self.camera_width, self.camera_height), interpolation=cv2.INTER_AREA)
-                img_wrist = cv2.cvtColor(raw_2, cv2.COLOR_BGR2RGB)
+                if self.is_grayscale:
+                    if len(raw_2.shape) == 3:
+                        g2 = cv2.cvtColor(raw_2, cv2.COLOR_BGR2GRAY)
+                    else:
+                        g2 = raw_2
+                    img_wrist = cv2.cvtColor(g2, cv2.COLOR_GRAY2RGB)
+                else:
+                    img_wrist = cv2.cvtColor(raw_2, cv2.COLOR_BGR2RGB)
             else:
                 img_wrist = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
             frame_data["observation.images.wrist"] = img_wrist
@@ -3202,26 +3336,108 @@ class UR5eRecorderStudio(QMainWindow):
     # -------------------------------------------------------------------------
     # Dataset Management & Persistence
     # -------------------------------------------------------------------------
-    def apply_dataset_name(self):
-        """Switches or initializes the active dataset when the user clicks 'Set / Load' or presses Enter."""
+    def on_dataset_name_edited(self, text: str):
+        """Automatically unlocks the grayscale toggle when typing a new unique dataset name."""
+        clean_name = text.strip()
+        if not clean_name:
+            return
+        target_path = DEFAULT_DATASETS_DIR / clean_name
+        has_episodes = False
+        target_info = target_path / "meta" / "info.json"
+        if target_info.exists():
+            try:
+                with open(target_info, "r") as f:
+                    meta = json.load(f)
+                    has_episodes = meta.get("total_episodes", 0) > 0
+            except Exception:
+                has_episodes = True
+        if hasattr(self, "chk_grayscale"):
+            if not target_path.exists() or not has_episodes:
+                self.chk_grayscale.setEnabled(True)
+                self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
+
+    def create_new_dataset(self):
+        """Creates a new dataset using the exact name typed in the text box.
+        If a dataset with that name already exists with recorded episodes, warns the user and aborts."""
         clean_name = self.txt_dataset_name.text().strip()
         if not clean_name:
-            QMessageBox.warning(self, "Invalid Name", "Please enter a valid dataset name.")
+            QMessageBox.warning(self, "Missing Name", "Please type a dataset name in the text box first.")
             return
 
-        self.active_dataset = None
-        self.dataset_root = DEFAULT_DATASETS_DIR / clean_name
-        self.lbl_dataset_path.setText(f"Path: datasets/{clean_name}")
-        self.rescan_dataset_directory()
+        target_dir = DEFAULT_DATASETS_DIR / clean_name
+        # Check if the dataset already exists and contains data
+        meta_info = target_dir / "meta" / "info.json"
+        episodes_dir = target_dir / "meta" / "episodes"
+        has_episodes = False
+        if meta_info.exists():
+            try:
+                with open(meta_info, "r") as f:
+                    meta = json.load(f)
+                    has_episodes = meta.get("total_episodes", 0) > 0
+            except Exception:
+                has_episodes = True
+        elif episodes_dir.exists() and any(episodes_dir.iterdir()):
+            has_episodes = True
 
-        print(f"[DATASET] Switched active dataset to: '{clean_name}' (Path: datasets/{clean_name})")
-        self.status_bar.showMessage(f"Active dataset switched to '{clean_name}'.", 4000)
+        if target_dir.exists() and has_episodes:
+            msg = "The dataset '" + clean_name + "' already exists with recorded demonstrations!\n\n" +                   "A new dataset was NOT created to prevent accidental overwriting.\n\n" +                   "- To create a brand new dataset, please enter a different name.\n" +                   "- To add episodes to '" + clean_name + "', click 'Load Existing...'."
+            QMessageBox.warning(self, "Dataset Already Exists", msg)
+            return
+
+        # Prepare new dataset
+        self.active_dataset = None
+        self.dataset_root = target_dir
+        self.lbl_dataset_path.setText(f"Path: datasets/{clean_name}")
+        self.list_episodes.clear()
+
+        # Unlock grayscale toggle for the new dataset
+        if hasattr(self, "chk_grayscale"):
+            self.chk_grayscale.setEnabled(True)
+            self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
+
+        print(f"[DATASET] Prepared fresh new dataset: '{clean_name}' (Path: datasets/{clean_name})")
+        self.status_bar.showMessage(f"New dataset '{clean_name}' ready. Choose Grayscale or RGB mode.", 4000)
+        self.update_visualizer_command()
+
+    def load_existing_dataset(self):
+        """Opens a file browser to select an existing dataset directory and locks the grayscale toggle to match."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Existing Dataset Folder",
+            str(DEFAULT_DATASETS_DIR),
+        )
+        if not folder:
+            return
+
+        chosen_path = Path(folder).resolve()
+        self.active_dataset = None
+        self.dataset_root = chosen_path
+        self.txt_dataset_name.blockSignals(True)
+        self.txt_dataset_name.setText(chosen_path.name)
+        self.txt_dataset_name.blockSignals(False)
+
+        try:
+            rel = chosen_path.relative_to(DEFAULT_DATASETS_DIR.parent)
+            self.lbl_dataset_path.setText(f"Path: {rel}")
+        except Exception:
+            self.lbl_dataset_path.setText(f"Path: {chosen_path}")
+
+        self.rescan_dataset_directory()
+        print(f"[DATASET] Loaded existing dataset: '{chosen_path.name}' ({chosen_path})")
+        self.status_bar.showMessage(f"Loaded dataset '{chosen_path.name}' ({self.list_episodes.count()} episodes).", 4000)
+
+    def apply_dataset_name(self):
+        """Alias pointing to create_new_dataset for backwards compatibility."""
+        self.create_new_dataset()
 
     def rescan_dataset_directory(self):
         self.list_episodes.clear()
 
         if not self.dataset_root.exists():
             print(f"[DATASET] Directory '{self.dataset_root.name}' does not exist yet. It will be created when an episode is saved.")
+            if hasattr(self, "chk_grayscale"):
+                self.chk_grayscale.setEnabled(True)
+                self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
             self.update_visualizer_command()
             return
 
@@ -3263,6 +3479,44 @@ class UR5eRecorderStudio(QMainWindow):
                     if line.strip():
                         self.list_episodes.addItem(QListWidgetItem(line.strip()))
                 self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
+
+        # Inspect dataset recording configuration (grayscale detection & episode consistency lock)
+        detected_grayscale = None
+        for cfg_candidate in [self.dataset_root / "meta" / "recording_config.json", self.dataset_root / "recording_config.json"]:
+            if cfg_candidate.exists():
+                try:
+                    with open(cfg_candidate, "r") as cf:
+                        cfg_json = json.load(cf)
+                        if "grayscale" in cfg_json:
+                            detected_grayscale = bool(cfg_json["grayscale"])
+                            break
+                except Exception as err:
+                    print(f"[WARNING] Could not parse {cfg_candidate}: {err}")
+
+        if hasattr(self, "chk_grayscale"):
+            if detected_grayscale is not None:
+                self.chk_grayscale.blockSignals(True)
+                self.chk_grayscale.setChecked(detected_grayscale)
+                self.chk_grayscale.blockSignals(False)
+                self.on_grayscale_toggled(detected_grayscale)
+                if total_episodes > 0:
+                    self.chk_grayscale.setEnabled(False)
+                    mode_label = "Grayscale (1-Ch)" if detected_grayscale else "RGB (3-Ch)"
+                    self.chk_grayscale.setToolTip(f"Dataset format locked to {mode_label} to preserve consistency across episodes in '{self.dataset_root.name}'.")
+                else:
+                    self.chk_grayscale.setEnabled(True)
+                    self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
+            else:
+                if total_episodes > 0:
+                    self.chk_grayscale.blockSignals(True)
+                    self.chk_grayscale.setChecked(False)
+                    self.chk_grayscale.blockSignals(False)
+                    self.on_grayscale_toggled(False)
+                    self.chk_grayscale.setEnabled(False)
+                    self.chk_grayscale.setToolTip(f"Existing dataset '{self.dataset_root.name}' is RGB (mode locked).")
+                else:
+                    self.chk_grayscale.setEnabled(True)
+                    self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
 
         print(f"[DATASET] Scanned '{self.dataset_root.name}': {self.list_episodes.count()} episodes found.")
         self.update_visualizer_command()
@@ -3378,6 +3632,23 @@ class UR5eRecorderStudio(QMainWindow):
                 dataset.save_episode()
                 # Immediately finalize so parquet footers and meta/episodes are completely written to disk
                 dataset.finalize()
+
+                # Save persistent recording configuration metadata
+                meta_dir = self.dataset_root / "meta"
+                meta_dir.mkdir(parents=True, exist_ok=True)
+                rec_cfg = {
+                    "grayscale": self.is_grayscale,
+                    "channels": 1 if self.is_grayscale else 3,
+                    "width": self.camera_width,
+                    "height": self.camera_height,
+                    "fps": self.target_fps,
+                    "dual_cam": self.enable_dual_cameras,
+                    "updated_at": datetime.datetime.now().isoformat(),
+                }
+                with open(meta_dir / "recording_config.json", "w") as f_cfg:
+                    json.dump(rec_cfg, f_cfg, indent=2)
+                with open(self.dataset_root / "recording_config.json", "w") as f_cfg:
+                    json.dump(rec_cfg, f_cfg, indent=2)
                 total_episodes_saved = dataset.num_episodes
                 has_wrist = self.enable_dual_cameras
                 self.active_dataset = None  # Reset instance so next episode cleanly resumes via LeRobotDataset.resume()

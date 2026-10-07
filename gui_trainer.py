@@ -100,6 +100,11 @@ except Exception:
 try:
     import train_robot
     from train_robot import (
+        AUG_COLOR,
+        AUG_CUTOUT,
+        AUG_NOISE,
+        AUG_ROTATION,
+        AUG_TRANSLATION,
         AVAILABLE_OPTIMIZERS,
         AVAILABLE_POLICIES,
         BATCH_SIZE,
@@ -138,6 +143,11 @@ except Exception as err:
     WEIGHT_DECAY = 1e-4
     GRAD_CLIP_NORM = 10.0
     USE_AUGMENTATION = True
+    AUG_ROTATION = True
+    AUG_TRANSLATION = True
+    AUG_COLOR = True
+    AUG_CUTOUT = False
+    AUG_NOISE = False
     SAVE_CHECKPOINT_FREQ = 2500
     LOG_FREQ = 20
     EVAL_FREQ = 1000
@@ -829,13 +839,62 @@ class UR5eTrainerStudio(QMainWindow):
         self.spin_log_freq.setValue(LOG_FREQ)
         grid_freq.addWidget(self.spin_log_freq, 1, 3)
 
-        self.chk_aug = QCheckBox("Enable Visual Data Augmentation (Randomized GPU Brightness & Contrast)")
-        self.chk_aug.setChecked(USE_AUGMENTATION)
-        grid_freq.addWidget(self.chk_aug, 2, 0, 1, 4)
-
         layout.addWidget(grp_freq)
+
+        # Real-time Visual Data Augmentation Group
+        grp_aug = QGroupBox("REAL-TIME VISUAL DATA AUGMENTATION (GPU)")
+        layout_aug = QVBoxLayout(grp_aug)
+        layout_aug.setSpacing(10)
+
+        self.chk_aug_master = QCheckBox("Enable Visual Data Augmentation (Master Switch)")
+        self.chk_aug_master.setStyleSheet("font-weight: bold; color: #38bdf8;")
+        self.chk_aug_master.setChecked(USE_AUGMENTATION)
+        self.chk_aug = self.chk_aug_master  # Backwards compatibility alias
+        layout_aug.addWidget(self.chk_aug_master)
+
+        aug_sub_widget = QWidget()
+        grid_sub_aug = QGridLayout(aug_sub_widget)
+        grid_sub_aug.setContentsMargins(16, 2, 4, 4)
+        grid_sub_aug.setSpacing(8)
+
+        self.chk_aug_rotation = QCheckBox("Random Rotation (±10°)")
+        self.chk_aug_rotation.setToolTip("Applies random rotations up to ±10 degrees directly on GPU tensors to simulate camera tilt and robot vibration.")
+        self.chk_aug_rotation.setChecked(AUG_ROTATION)
+        grid_sub_aug.addWidget(self.chk_aug_rotation, 0, 0)
+
+        self.chk_aug_translation = QCheckBox("Random Translation / Shifts (±8% X/Y)")
+        self.chk_aug_translation.setToolTip("Applies subtle 2D translations (±8% along X and Y) with border padding to make policy robust against robot mounting shifts (DrQ-v2 / RAD standard).")
+        self.chk_aug_translation.setChecked(AUG_TRANSLATION)
+        grid_sub_aug.addWidget(self.chk_aug_translation, 0, 1)
+
+        self.chk_aug_color = QCheckBox("Lighting & Color Jitter (Brightness/Contrast ±20%)")
+        self.chk_aug_color.setToolTip("Randomized brightness and contrast perturbations on GPU to prevent policy overfitting to ambient room lighting and shadows.")
+        self.chk_aug_color.setChecked(AUG_COLOR)
+        grid_sub_aug.addWidget(self.chk_aug_color, 1, 0)
+
+        self.chk_aug_cutout = QCheckBox("Random Cutout / Occlusions (Dropout Patches)")
+        self.chk_aug_cutout.setToolTip("Dropout random rectangular patches (5-15% area) to prevent policy relying on single visual landmarks and handle gripper/arm occlusions.")
+        self.chk_aug_cutout.setChecked(AUG_CUTOUT)
+        grid_sub_aug.addWidget(self.chk_aug_cutout, 1, 1)
+
+        self.chk_aug_noise = QCheckBox("Sensor Noise / Gaussian Noise (Sensor Grain)")
+        self.chk_aug_noise.setToolTip("Mild additive Gaussian noise and grain to simulate low-light sensor noise and sensor variation.")
+        self.chk_aug_noise.setChecked(AUG_NOISE)
+        grid_sub_aug.addWidget(self.chk_aug_noise, 2, 0, 1, 2)
+
+        layout_aug.addWidget(aug_sub_widget)
+
+        self.chk_aug_master.toggled.connect(aug_sub_widget.setEnabled)
+        aug_sub_widget.setEnabled(self.chk_aug_master.isChecked())
+
+        layout.addWidget(grp_aug)
         layout.addStretch()
-        return widget
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(widget)
+        return scroll
 
     # -------------------------------------------------------------------------
     # Tab 3: Hardware & Policy Tuning
@@ -1340,7 +1399,12 @@ class UR5eTrainerStudio(QMainWindow):
             "warmup_steps": self.spin_warmup.value(),
             "weight_decay": weight_decay,
             "grad_clip_norm": self.spin_grad_clip.value(),
-            "use_augmentation": self.chk_aug.isChecked(),
+            "use_augmentation": self.chk_aug_master.isChecked(),
+            "aug_rotation": self.chk_aug_rotation.isChecked(),
+            "aug_translation": self.chk_aug_translation.isChecked(),
+            "aug_color": self.chk_aug_color.isChecked(),
+            "aug_cutout": self.chk_aug_cutout.isChecked(),
+            "aug_noise": self.chk_aug_noise.isChecked(),
             "save_checkpoint_freq": self.spin_save_freq.value(),
             "log_freq": self.spin_log_freq.value(),
             "eval_freq": self.spin_eval_freq.value(),

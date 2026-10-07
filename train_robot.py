@@ -81,7 +81,12 @@ LR_MIN = 1e-6                 # Minimum learning rate at end of Cosine Annealing
 WARMUP_STEPS = 1000           # Linear warmup steps to stabilize transformer attention layers
 WEIGHT_DECAY = 1e-4           # L2 regularization weight decay
 GRAD_CLIP_NORM = 10.0         # Gradient clipping max norm to prevent exploding gradients
-USE_AUGMENTATION = True       # Apply mild visual jitter to prevent overfitting to lighting
+USE_AUGMENTATION = True       # Master switch for GPU visual data augmentation
+AUG_ROTATION = True           # Slight random rotation (±10 deg)
+AUG_TRANSLATION = True        # Slight random translation (±8% X/Y)
+AUG_COLOR = True              # Mild brightness & contrast jitter (±20%)
+AUG_CUTOUT = False            # Random cutout / occlusion patches (5-15% area)
+AUG_NOISE = False             # Mild Gaussian sensor noise
 
 # Checkpoint & Disk Space Management
 # Overwrites the same folder every save to prevent gigabytes of redundant copies
@@ -523,6 +528,110 @@ def detect_dataset_grayscale(dataset_path: Path) -> bool:
     return False
 
 
+def apply_visual_augmentation(
+    img: torch.Tensor,
+    aug_rotation: bool = True,
+    aug_translation: bool = True,
+    aug_color: bool = True,
+    aug_cutout: bool = False,
+    aug_noise: bool = False,
+    max_rotation_deg: float = 10.0,
+    max_translation_ratio: float = 0.08,
+) -> torch.Tensor:
+    """
+    High-performance GPU-accelerated visual data augmentation for imitation & RL policies.
+    Supports 4D tensors (B, C, H, W) and 5D temporal sequences (B, T, C, H, W).
+    Executes under torch.no_grad() to eliminate autograd graph overhead.
+    """
+    if not (aug_rotation or aug_translation or aug_color or aug_cutout or aug_noise):
+        return img
+
+    with torch.no_grad():
+        orig_shape = img.shape
+        if img.ndim == 5:
+            B, T, C, H, W = img.shape
+            flat_img = img.view(B * T, C, H, W)
+        elif img.ndim == 4:
+            B, C, H, W = img.shape
+            flat_img = img
+            T = 1
+        else:
+            return img
+
+        N = B * T
+        if N == 0:
+            return img
+
+        # 1. Spatial Affine Transformation (Random Rotation ±10 deg, Shift ±8% X/Y)
+        if aug_rotation or aug_translation:
+            if aug_rotation:
+                angles = torch.empty(N, device=flat_img.device).uniform_(-max_rotation_deg, max_rotation_deg)
+                rad = angles * (3.141592653589793 / 180.0)
+                cos = torch.cos(rad)
+                sin = torch.sin(rad)
+            else:
+                cos = torch.ones(N, device=flat_img.device)
+                sin = torch.zeros(N, device=flat_img.device)
+
+            if aug_translation:
+                max_t = 2.0 * max_translation_ratio
+                tx = torch.empty(N, device=flat_img.device).uniform_(-max_t, max_t)
+                ty = torch.empty(N, device=flat_img.device).uniform_(-max_t, max_t)
+            else:
+                tx = torch.zeros(N, device=flat_img.device)
+                ty = torch.zeros(N, device=flat_img.device)
+
+            theta = torch.zeros(N, 2, 3, device=flat_img.device, dtype=flat_img.dtype)
+            theta[:, 0, 0] = cos
+            theta[:, 0, 1] = -sin
+            theta[:, 0, 2] = tx
+            theta[:, 1, 0] = sin
+            theta[:, 1, 1] = cos
+            theta[:, 1, 2] = ty
+
+            grid = torch.nn.functional.affine_grid(theta, flat_img.size(), align_corners=False)
+            flat_img = torch.nn.functional.grid_sample(flat_img, grid, mode='bilinear', padding_mode='border', align_corners=False)
+
+        # 2. Lighting & Color Jitter (Brightness ±20%, Contrast ±20%)
+        if aug_color:
+            bright = 1.0 + (torch.rand(N, 1, 1, 1, device=flat_img.device) - 0.5) * 0.3
+            contrast = 1.0 + (torch.rand(N, 1, 1, 1, device=flat_img.device) - 0.5) * 0.3
+            flat_img = flat_img * bright
+            mean = flat_img.mean(dim=(-2, -1), keepdim=True)
+            flat_img = (flat_img - mean) * contrast + mean
+            flat_img = torch.clamp(flat_img, 0.0, 1.0)
+
+        # 3. Gaussian Sensor Noise
+        if aug_noise:
+            noise_mask = (torch.rand(N, 1, 1, 1, device=flat_img.device) < 0.5).float()
+            noise = torch.randn_like(flat_img) * 0.02 * noise_mask
+            flat_img = torch.clamp(flat_img + noise, 0.0, 1.0)
+
+        # 4. Random Cutout / Occlusion Dropout Patches (simulates gripper/tool/arm occlusions)
+        if aug_cutout:
+            cutout_probs = torch.rand(N, device=flat_img.device)
+            box_ws = (torch.rand(N, device=flat_img.device) * 0.15 + 0.05) * W
+            box_hs = (torch.rand(N, device=flat_img.device) * 0.15 + 0.05) * H
+            xs = torch.rand(N, device=flat_img.device) * (W - 1)
+            ys = torch.rand(N, device=flat_img.device) * (H - 1)
+
+            for i in range(N):
+                if cutout_probs[i] < 0.5:
+                    bw = int(box_ws[i].item())
+                    bh = int(box_hs[i].item())
+                    cx = int(xs[i].item())
+                    cy = int(ys[i].item())
+                    x1 = max(0, cx - bw // 2)
+                    x2 = min(W, cx + bw // 2)
+                    y1 = max(0, cy - bh // 2)
+                    y2 = min(H, cy + bh // 2)
+                    flat_img[i, :, y1:y2, x1:x2] = 0.0
+
+        if orig_shape != flat_img.shape:
+            flat_img = flat_img.view(orig_shape)
+        return flat_img
+
+
 class RobotTrainer:
     """
     Core imitation learning training manager for UR5e LeRobot datasets.
@@ -543,6 +652,11 @@ class RobotTrainer:
         weight_decay: float = WEIGHT_DECAY,
         grad_clip_norm: float = GRAD_CLIP_NORM,
         use_augmentation: bool = USE_AUGMENTATION,
+        aug_rotation: bool = AUG_ROTATION,
+        aug_translation: bool = AUG_TRANSLATION,
+        aug_color: bool = AUG_COLOR,
+        aug_cutout: bool = AUG_CUTOUT,
+        aug_noise: bool = AUG_NOISE,
         save_checkpoint_freq: int = SAVE_CHECKPOINT_FREQ,
         log_freq: int = LOG_FREQ,
         eval_freq: int = EVAL_FREQ,
@@ -574,6 +688,11 @@ class RobotTrainer:
         self.weight_decay = float(weight_decay)
         self.grad_clip_norm = float(grad_clip_norm)
         self.use_augmentation = bool(use_augmentation)
+        self.aug_rotation = bool(aug_rotation)
+        self.aug_translation = bool(aug_translation)
+        self.aug_color = bool(aug_color)
+        self.aug_cutout = bool(aug_cutout)
+        self.aug_noise = bool(aug_noise)
         self.save_checkpoint_freq = int(save_checkpoint_freq)
         self.log_freq = int(log_freq)
         self.eval_freq = int(eval_freq)
@@ -774,6 +893,14 @@ class RobotTrainer:
             "decision_interval_s": dec_interval,
             "grayscale": self.is_grayscale,
             "image_channels": 1 if self.is_grayscale else 3,
+            "augmentation": {
+                "enabled": self.use_augmentation,
+                "rotation": self.aug_rotation,
+                "translation": self.aug_translation,
+                "color": self.aug_color,
+                "cutout": self.aug_cutout,
+                "noise": self.aug_noise,
+            },
             "updated_at": datetime.datetime.now().isoformat(),
         }
         with open(self.checkpoint_dir / "training_info.json", "w") as f:
@@ -912,7 +1039,18 @@ class RobotTrainer:
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         print(f"[SCHEDULER] Cosine Annealing initialized: {self.warmup_steps} warmup steps -> min lr {self.lr_min:.1e}")
         if self.use_augmentation:
-            print("[AUGMENT] Visual data augmentation active (mild randomized brightness/contrast jitter on GPU).")
+            active_augs = []
+            if self.aug_rotation: active_augs.append("Rotation (±10°)")
+            if self.aug_translation: active_augs.append("Translation (±8% X/Y)")
+            if self.aug_color: active_augs.append("Color/Brightness Jitter (±20%)")
+            if self.aug_cutout: active_augs.append("Occlusion Cutout")
+            if self.aug_noise: active_augs.append("Sensor Noise")
+            if active_augs:
+                print(f"[AUGMENT] Visual data augmentation active on GPU: {', '.join(active_augs)}")
+            else:
+                print("[AUGMENT] Visual data augmentation enabled, but no sub-augmentations selected.")
+        else:
+            print("[AUGMENT] Visual data augmentation disabled.")
 
         # Check for starting step if resuming
         start_step = 0
@@ -975,16 +1113,18 @@ class RobotTrainer:
                         elif batch[k].shape[1] == 1:
                             batch[k] = batch[k].repeat(1, 3, 1, 1)
 
-            # Visual Data Augmentation (mild random brightness/contrast on images)
-            if self.use_augmentation:
+            # Visual Data Augmentation (GPU Real-Time)
+            if self.use_augmentation and (self.aug_rotation or self.aug_translation or self.aug_color or self.aug_cutout or self.aug_noise):
                 for k in batch:
-                    if "image" in k and isinstance(batch[k], torch.Tensor) and batch[k].ndim == 4:
-                        bright = 1.0 + (torch.rand(batch[k].shape[0], 1, 1, 1, device=batch[k].device) - 0.5) * 0.25
-                        contrast = 1.0 + (torch.rand(batch[k].shape[0], 1, 1, 1, device=batch[k].device) - 0.5) * 0.25
-                        img = batch[k] * bright
-                        mean = img.mean(dim=(-2, -1), keepdim=True)
-                        img = (img - mean) * contrast + mean
-                        batch[k] = torch.clamp(img, 0.0, 1.0)
+                    if "image" in k and isinstance(batch[k], torch.Tensor) and batch[k].ndim in (4, 5):
+                        batch[k] = apply_visual_augmentation(
+                            batch[k],
+                            aug_rotation=self.aug_rotation,
+                            aug_translation=self.aug_translation,
+                            aug_color=self.aug_color,
+                            aug_cutout=self.aug_cutout,
+                            aug_noise=self.aug_noise,
+                        )
 
             # Forward & Backward Pass
             optimizer.zero_grad()
@@ -1130,6 +1270,11 @@ def parse_args():
     parser.add_argument("--lr-backbone", type=float, default=LR_BACKBONE, help="Learning rate for ResNet vision backbone")
     parser.add_argument("--warmup-steps", type=int, default=WARMUP_STEPS, help="Linear warmup steps for scheduler")
     parser.add_argument("--no-aug", action="store_true", help="Disable visual data augmentation")
+    parser.add_argument("--aug-rotation", action=argparse.BooleanOptionalAction, default=AUG_ROTATION, help="Random rotation (±10 deg)")
+    parser.add_argument("--aug-translation", action=argparse.BooleanOptionalAction, default=AUG_TRANSLATION, help="Random translation / shifts (±8%% X/Y)")
+    parser.add_argument("--aug-color", action=argparse.BooleanOptionalAction, default=AUG_COLOR, help="Random color & brightness jitter (±20%%)")
+    parser.add_argument("--aug-cutout", action=argparse.BooleanOptionalAction, default=AUG_CUTOUT, help="Random cutout / occlusion patches")
+    parser.add_argument("--aug-noise", action=argparse.BooleanOptionalAction, default=AUG_NOISE, help="Random Gaussian sensor noise")
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="L2 weight decay")
     parser.add_argument("--save-freq", type=int, default=SAVE_CHECKPOINT_FREQ, help="Checkpoint save step frequency (in-place overwrite)")
     parser.add_argument("--log-freq", type=int, default=LOG_FREQ, help="Console logging interval")
@@ -1156,6 +1301,11 @@ def main():
         lr_backbone=args.lr_backbone,
         warmup_steps=args.warmup_steps,
         use_augmentation=not args.no_aug,
+        aug_rotation=args.aug_rotation,
+        aug_translation=args.aug_translation,
+        aug_color=args.aug_color,
+        aug_cutout=args.aug_cutout,
+        aug_noise=args.aug_noise,
         weight_decay=args.weight_decay,
         save_checkpoint_freq=args.save_freq,
         log_freq=args.log_freq,

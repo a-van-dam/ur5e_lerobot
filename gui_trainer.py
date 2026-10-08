@@ -126,6 +126,7 @@ try:
         VAL_SPLIT_RATIO,
         WARMUP_STEPS,
         WEIGHT_DECAY,
+        TEMPORAL_ENSEMBLE_COEFF,
         RobotTrainer,
     )
     LEROBOT_IMPORT_ERROR = getattr(train_robot, "LEROBOT_IMPORT_ERROR", None)
@@ -143,6 +144,7 @@ except Exception as err:
     WEIGHT_DECAY = 1e-4
     GRAD_CLIP_NORM = 10.0
     USE_AUGMENTATION = True
+    TEMPORAL_ENSEMBLE_COEFF = 0.01
     AUG_ROTATION = True
     AUG_TRANSLATION = True
     AUG_COLOR = True
@@ -627,9 +629,11 @@ class UR5eTrainerStudio(QMainWindow):
         self.lbl_channel_mode.setStyleSheet("color: #a855f7; font-weight: bold; font-size: 11px; padding: 2px 4px;")
         meta_row.addWidget(self.lbl_channel_mode)
 
-        self.chk_grayscale = QCheckBox("Train in Grayscale Mode (1-Ch)")
+        self.chk_grayscale = QCheckBox("Train in Grayscale Mode (Convert to 1-Ch on GPU)")
+        self.chk_grayscale.setChecked(False)
         self.chk_grayscale.setStyleSheet("font-size: 11px; color: #cbd5e1; font-weight: bold;")
-        self.chk_grayscale.setToolTip("Train policy using 1-channel luminance inputs (automatically activated for grayscale datasets).")
+        self.chk_grayscale.setToolTip("When checked, RGB dataset frames are converted to 1-channel luminance on GPU during training and model is saved with '_gs'. Default is unchecked (RGB color, '_col').")
+        self.chk_grayscale.toggled.connect(self.on_grayscale_toggled)
         meta_row.addWidget(self.chk_grayscale)
         meta_row.addStretch()
         ds_layout.addLayout(meta_row)
@@ -933,7 +937,7 @@ class UR5eTrainerStudio(QMainWindow):
         layout.addWidget(grp_hw)
 
         # Policy Architecture Hyperparameters (Horizon & Interval Tuning)
-        grp_act = QGroupBox("POLICY HORIZON & RE-PLANNING INTERVAL")
+        grp_act = QGroupBox("POLICY HORIZON & TEMPORAL ENSEMBLING")
         grid_act = QGridLayout(grp_act)
         grid_act.setSpacing(8)
 
@@ -949,26 +953,47 @@ class UR5eTrainerStudio(QMainWindow):
         self.spin_n_action_steps = QSpinBox()
         self.spin_n_action_steps.setRange(1, 100)
         self.spin_n_action_steps.setValue(15)
-        self.spin_n_action_steps.setToolTip("How many action steps to execute before taking a new camera observation and re-planning")
+        self.spin_n_action_steps.setToolTip("How many action steps to execute before taking a new camera observation (used when Temporal Ensembling is disabled)")
         self.spin_n_action_steps.valueChanged.connect(self.update_decision_interval)
         grid_act.addWidget(self.spin_n_action_steps, 0, 3)
 
-        grid_act.addWidget(QLabel("KL Divergence Weight:"), 1, 0)
+        self.chk_temporal_ensemble = QCheckBox("Enable Temporal Ensembling (Smooth 30 Hz Moving Average for ACT)")
+        self.chk_temporal_ensemble.setChecked(True)
+        self.chk_temporal_ensemble.setStyleSheet("font-weight: bold; color: #38bdf8;")
+        self.chk_temporal_ensemble.setToolTip("ACT Algorithm 2: Continuously queries policy at 30 Hz and blends overlapping chunks via exponential decay weights w_i = exp(-m*i). Eliminates open-loop pauses and boundary jerks.")
+        self.chk_temporal_ensemble.toggled.connect(self.on_temporal_ensemble_toggled)
+        grid_act.addWidget(self.chk_temporal_ensemble, 1, 0, 1, 2)
+
+        te_box = QHBoxLayout()
+        lbl_coeff = QLabel("Ensemble Coeff (m):")
+        lbl_coeff.setStyleSheet("color: #cbd5e1; font-size: 11px;")
+        te_box.addWidget(lbl_coeff)
+        self.spin_temporal_coeff = QDoubleSpinBox()
+        self.spin_temporal_coeff.setRange(0.001, 0.200)
+        self.spin_temporal_coeff.setSingleStep(0.005)
+        self.spin_temporal_coeff.setValue(0.010)
+        self.spin_temporal_coeff.setDecimals(3)
+        self.spin_temporal_coeff.setToolTip("Exponential weight decay coefficient (ACT default: 0.010). Lower values average more smoothly across time.")
+        self.spin_temporal_coeff.valueChanged.connect(self.update_decision_interval)
+        te_box.addWidget(self.spin_temporal_coeff)
+        grid_act.addLayout(te_box, 1, 2, 1, 2)
+
+        grid_act.addWidget(QLabel("KL Divergence Weight:"), 2, 0)
         self.spin_kl_weight = QDoubleSpinBox()
         self.spin_kl_weight.setRange(0.1, 100.0)
         self.spin_kl_weight.setValue(10.0)
-        grid_act.addWidget(self.spin_kl_weight, 1, 1)
+        grid_act.addWidget(self.spin_kl_weight, 2, 1)
 
-        grid_act.addWidget(QLabel("Transformer Dropout:"), 1, 2)
+        grid_act.addWidget(QLabel("Transformer Dropout:"), 2, 2)
         self.spin_dropout = QDoubleSpinBox()
         self.spin_dropout.setRange(0.0, 0.5)
         self.spin_dropout.setSingleStep(0.05)
         self.spin_dropout.setValue(0.1)
-        grid_act.addWidget(self.spin_dropout, 1, 3)
+        grid_act.addWidget(self.spin_dropout, 2, 3)
 
-        self.lbl_decision_interval = QLabel("Decision Interval: 0.50s (500 ms) @ 30 FPS")
+        self.lbl_decision_interval = QLabel("Replanning Mode: Temporal Ensembling (m=0.010, 30 Hz Continuous Smooth Blend)")
         self.lbl_decision_interval.setStyleSheet("color: #38bdf8; font-family: monospace; font-weight: bold; font-size: 11px; padding: 4px;")
-        grid_act.addWidget(self.lbl_decision_interval, 2, 0, 1, 4)
+        grid_act.addWidget(self.lbl_decision_interval, 3, 0, 1, 4)
 
         layout.addWidget(grp_act)
         layout.addStretch()
@@ -1172,16 +1197,50 @@ class UR5eTrainerStudio(QMainWindow):
         else:
             self.lbl_resume_info.setText("No previous checkpoints found in outputs/train/.")
 
+    def on_temporal_ensemble_toggled(self, checked: bool):
+        if hasattr(self, "spin_temporal_coeff"):
+            self.spin_temporal_coeff.setEnabled(checked)
+        self.update_decision_interval()
+
     def update_decision_interval(self):
         fps = getattr(self, "dataset_fps", 30)
-        steps = self.spin_n_action_steps.value() if hasattr(self, "spin_n_action_steps") else 15
-        dt = steps / max(1, fps)
         chunk = self.spin_chunk_size.value() if hasattr(self, "spin_chunk_size") else 100
-        if hasattr(self, "lbl_decision_interval"):
-            self.lbl_decision_interval.setText(
-                f"Decision Interval: {dt:.2f}s ({int(dt*1000)}ms) @ {fps} FPS  |  "
-                f"Executes {steps} of {chunk} predicted horizon steps before observing camera"
-            )
+        if hasattr(self, "chk_temporal_ensemble") and self.chk_temporal_ensemble.isChecked():
+            m_coeff = self.spin_temporal_coeff.value() if hasattr(self, "spin_temporal_coeff") else 0.010
+            if hasattr(self, "lbl_decision_interval"):
+                self.lbl_decision_interval.setText(
+                    f"Replanning Mode: Temporal Ensembling (m={m_coeff:.3f}) | Smooth 30 Hz Moving Average (Horizon={chunk})"
+                )
+                self.lbl_decision_interval.setStyleSheet("color: #38bdf8; font-family: monospace; font-weight: bold; font-size: 11px; padding: 4px;")
+        else:
+            steps = self.spin_n_action_steps.value() if hasattr(self, "spin_n_action_steps") else 15
+            dt = steps / max(1, fps)
+            if hasattr(self, "lbl_decision_interval"):
+                self.lbl_decision_interval.setText(
+                    f"Replanning Mode: Open-Loop Chunks every {steps} steps ({dt:.2f}s / {int(dt*1000)}ms @ {fps} FPS) of {chunk}"
+                )
+                self.lbl_decision_interval.setStyleSheet("color: #f59e0b; font-family: monospace; font-weight: bold; font-size: 11px; padding: 4px;")
+
+    def on_grayscale_toggled(self, checked: bool):
+        if checked:
+            self.lbl_channel_mode.setText("● Grayscale Mode (1-Ch GPU Filter)")
+            self.lbl_channel_mode.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px; padding: 2px 4px;")
+        else:
+            self.lbl_channel_mode.setText("● RGB Color Mode (3-Ch Full Spectrum)")
+            self.lbl_channel_mode.setStyleSheet("color: #a855f7; font-weight: bold; font-size: 11px; padding: 2px 4px;")
+
+        if not self._user_edited_name:
+            self.update_auto_model_name()
+        else:
+            cur = self.edit_model_name.text().strip()
+            if cur.endswith("_col") and checked:
+                new_n = cur[:-4] + "_gs"
+                self.edit_model_name.setText(new_n)
+                self.update_output_directory(new_n)
+            elif cur.endswith("_gs") and not checked:
+                new_n = cur[:-3] + "_col"
+                self.edit_model_name.setText(new_n)
+                self.update_output_directory(new_n)
 
     def on_dataset_selection_changed(self, index: int):
         ds_path_str = self.combo_dataset.currentData()
@@ -1206,7 +1265,7 @@ class UR5eTrainerStudio(QMainWindow):
 
         self.lbl_dataset_meta.setText(meta_text)
 
-        # Inspect if dataset is recorded in grayscale mode
+        # Inspect if dataset is legacy grayscale
         is_gray = False
         for cfg_p in [ds_path / "meta" / "recording_config.json", ds_path / "recording_config.json"]:
             if cfg_p.exists():
@@ -1227,7 +1286,7 @@ class UR5eTrainerStudio(QMainWindow):
                 self.lbl_channel_mode.setText("● Grayscale Mode (1-Ch)")
                 self.lbl_channel_mode.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px; padding: 2px 4px;")
             else:
-                self.lbl_channel_mode.setText("● RGB Mode (3-Ch)")
+                self.lbl_channel_mode.setText("● RGB Color Mode (3-Ch)")
                 self.lbl_channel_mode.setStyleSheet("color: #a855f7; font-weight: bold; font-size: 11px; padding: 2px 4px;")
 
         if not self._user_edited_name:
@@ -1259,8 +1318,9 @@ class UR5eTrainerStudio(QMainWindow):
         else:
             ds_name = "model"
         pol = self.combo_policy.currentData() or "act"
+        color_tag = "gs" if (hasattr(self, "chk_grayscale") and self.chk_grayscale.isChecked()) else "col"
 
-        default_name = f"{ds_name}_{pol}"
+        default_name = f"{ds_name}_{pol}_{color_tag}"
         self.edit_model_name.setText(default_name)
         self.update_output_directory(default_name)
 
@@ -1418,6 +1478,7 @@ class UR5eTrainerStudio(QMainWindow):
             "kl_weight": self.spin_kl_weight.value(),
             "dropout": self.spin_dropout.value(),
             "grayscale": self.chk_grayscale.isChecked(),
+            "temporal_ensemble_coeff": self.spin_temporal_coeff.value() if (hasattr(self, "chk_temporal_ensemble") and self.chk_temporal_ensemble.isChecked()) else None,
         }
 
         if self.chk_resume.isChecked():

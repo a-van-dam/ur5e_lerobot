@@ -733,6 +733,8 @@ class PolicyRolloutWorker(QThread):
         control_fps: int = 30,
         max_jump_deg: float = 45.0,
         n_action_steps: Optional[int] = None,
+        temporal_ensemble: bool = True,
+        temporal_ensemble_coeff: float = 0.01,
         auto_freedrive_after: bool = True,
         return_start_after: bool = False,
         start_pose_deg: Optional[Dict[str, float]] = None,
@@ -749,6 +751,8 @@ class PolicyRolloutWorker(QThread):
         self.control_fps = control_fps
         self.max_jump_deg = max_jump_deg
         self.n_action_steps = n_action_steps
+        self.temporal_ensemble = temporal_ensemble
+        self.temporal_ensemble_coeff = temporal_ensemble_coeff
         self.auto_freedrive_after = auto_freedrive_after
         self.return_start_after = return_start_after
         self.start_pose_deg = start_pose_deg or DEFAULT_START_JOINTS_DICT
@@ -775,17 +779,34 @@ class PolicyRolloutWorker(QThread):
         try:
             policy = ACTPolicy.from_pretrained(self.model_path).to(device)
             policy.eval()
-            policy.reset()
             preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=self.model_path)
             print(f"      ✔ Policy loaded: {policy.__class__.__name__} on {device}")
-            if self.n_action_steps is not None and hasattr(policy.config, "n_action_steps"):
-                policy.config.n_action_steps = int(self.n_action_steps)
-            if hasattr(policy, "drop_queued_actions"):
-                policy.drop_queued_actions()
 
-            curr_steps = getattr(policy.config, "n_action_steps", 10)
-            dt_dec = curr_steps / max(1, self.control_fps)
-            print(f"  • Replanning Horizon: {curr_steps} steps ({dt_dec:.2f}s / {int(dt_dec*1000)}ms @ {self.control_fps} FPS)")
+            if self.temporal_ensemble and hasattr(policy, "temporal_ensembler"):
+                try:
+                    from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
+                    policy.config.temporal_ensemble_coeff = float(self.temporal_ensemble_coeff)
+                    policy.temporal_ensembler = ACTTemporalEnsembler(
+                        float(self.temporal_ensemble_coeff),
+                        getattr(policy.config, "chunk_size", 100),
+                    )
+                    policy.reset()
+                    print(f"  • Replanning Mode:    Temporal Ensembling Active (m={self.temporal_ensemble_coeff:.3f}, 30 Hz continuous blend)")
+                except Exception as e:
+                    print(f"  • Note: Temporal ensembling initialization fallback ({e}). Using open-loop chunks.")
+                    if hasattr(policy.config, "temporal_ensemble_coeff"):
+                        policy.config.temporal_ensemble_coeff = None
+            else:
+                if hasattr(policy.config, "temporal_ensemble_coeff"):
+                    policy.config.temporal_ensemble_coeff = None
+                if self.n_action_steps is not None and hasattr(policy.config, "n_action_steps"):
+                    policy.config.n_action_steps = int(self.n_action_steps)
+                if hasattr(policy, "drop_queued_actions"):
+                    policy.drop_queued_actions()
+                policy.reset()
+                curr_steps = getattr(policy.config, "n_action_steps", 10)
+                dt_dec = curr_steps / max(1, self.control_fps)
+                print(f"  • Replanning Mode:    Open-Loop Chunks ({curr_steps} steps, {dt_dec:.2f}s @ {self.control_fps} FPS)")
         except Exception as err:
             msg = f"Failed to load policy checkpoint: {err}"
             print(f"[ERROR] {msg}")
@@ -1417,15 +1438,41 @@ class UR5ePolicyTesterStudio(QMainWindow):
 
         eval_layout.addLayout(opts_row)
 
-        # Decision Interval & Action Steps Horizon Row
-        interval_row = QHBoxLayout()
-        lbl_steps = QLabel("Re-plan Interval:")
-        lbl_steps.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px;")
-        interval_row.addWidget(lbl_steps)
+        # Temporal Ensembling & Decision Horizon Controls
+        ensemble_row = QHBoxLayout()
+        self.chk_temporal_ensemble = QCheckBox("Temporal Ensembling (Smooth 30 Hz continuous blend)")
+        self.chk_temporal_ensemble.setChecked(True)
+        self.chk_temporal_ensemble.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
+        self.chk_temporal_ensemble.setToolTip("Enable ACT Temporal Ensembling with exponential moving average weights (recommended for smooth continuous control)")
+        self.chk_temporal_ensemble.toggled.connect(self.on_temporal_ensemble_toggled)
+        ensemble_row.addWidget(self.chk_temporal_ensemble)
+
+        lbl_coeff = QLabel("Coeff (m):")
+        lbl_coeff.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px; margin-left: 8px;")
+        self.spin_ensemble_coeff = QDoubleSpinBox()
+        self.spin_ensemble_coeff.setRange(0.001, 0.500)
+        self.spin_ensemble_coeff.setDecimals(3)
+        self.spin_ensemble_coeff.setSingleStep(0.005)
+        self.spin_ensemble_coeff.setValue(0.010)
+        self.spin_ensemble_coeff.setToolTip("Temporal ensembling exponential decay weight coefficient: w_i = exp(-m * i). Default 0.010")
+        self.spin_ensemble_coeff.valueChanged.connect(lambda val: self.on_temporal_ensemble_toggled(self.chk_temporal_ensemble.isChecked()))
+        ensemble_row.addWidget(lbl_coeff)
+        ensemble_row.addWidget(self.spin_ensemble_coeff)
+        ensemble_row.addStretch()
+        eval_layout.addLayout(ensemble_row)
+
+        # Decision Interval & Action Steps Horizon Row (for Open-Loop Chunking when ensembling disabled)
+        self.interval_container = QWidget()
+        interval_row = QHBoxLayout(self.interval_container)
+        interval_row.setContentsMargins(0, 0, 0, 0)
+        self.lbl_steps = QLabel("Re-plan Interval (Open-Loop):")
+        self.lbl_steps.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px;")
+        interval_row.addWidget(self.lbl_steps)
 
         self.slider_action_steps = QSlider(Qt.Orientation.Horizontal)
         self.slider_action_steps.setRange(1, 50)
         self.slider_action_steps.setValue(10)
+        self.slider_action_steps.setEnabled(False)
         self.slider_action_steps.setStyleSheet("""
             QSlider::groove:horizontal {
                 height: 6px;
@@ -1448,11 +1495,11 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.slider_action_steps.valueChanged.connect(self.on_action_steps_changed)
         interval_row.addWidget(self.slider_action_steps, stretch=2)
 
-        self.lbl_interval_hud = QLabel("10 steps (0.33s / 333ms)")
+        self.lbl_interval_hud = QLabel("Ensemble Active (m=0.010, 30 Hz)")
         self.lbl_interval_hud.setStyleSheet("color: #38bdf8; font-weight: bold; font-family: monospace; font-size: 11px; min-width: 220px;")
         interval_row.addWidget(self.lbl_interval_hud)
 
-        eval_layout.addLayout(interval_row)
+        eval_layout.addWidget(self.interval_container)
 
         # Rollout Progress Bar
         self.progress_bar = QProgressBar()
@@ -2234,9 +2281,10 @@ class UR5ePolicyTesterStudio(QMainWindow):
             self.set_grayscale_mode(is_model_grayscale)
             mode_badge = "Grayscale (1-Ch)" if is_model_grayscale else "RGB (3-Ch)"
 
-            # Check for trained FPS and decision horizon
+            # Check for trained FPS, decision horizon, and temporal ensemble settings
             model_fps = 30
             trained_n_steps = 10
+            trained_ensemble_coeff = None
             for info_p in [p / "training_info.json", p.parent / "training_info.json"]:
                 if info_p.exists():
                     try:
@@ -2244,15 +2292,36 @@ class UR5ePolicyTesterStudio(QMainWindow):
                             t_info = json.load(f_info)
                             model_fps = int(t_info.get("fps", 30))
                             trained_n_steps = int(t_info.get("n_action_steps", 10))
+                            if "temporal_ensemble_coeff" in t_info and t_info["temporal_ensemble_coeff"] is not None:
+                                trained_ensemble_coeff = float(t_info["temporal_ensemble_coeff"])
                             break
                     except Exception:
                         pass
+            if trained_ensemble_coeff is None:
+                try:
+                    with open(p / "config.json", "r") as f_cfg:
+                        cfg_data = json.load(f_cfg)
+                        if "temporal_ensemble_coeff" in cfg_data and cfg_data["temporal_ensemble_coeff"] is not None:
+                            trained_ensemble_coeff = float(cfg_data["temporal_ensemble_coeff"])
+                except Exception:
+                    pass
+
             self.model_fps = model_fps
+            if trained_ensemble_coeff is not None and hasattr(self, "spin_ensemble_coeff"):
+                self.spin_ensemble_coeff.blockSignals(True)
+                self.spin_ensemble_coeff.setValue(trained_ensemble_coeff)
+                self.spin_ensemble_coeff.blockSignals(False)
+
             if hasattr(self, "slider_action_steps"):
                 self.slider_action_steps.blockSignals(True)
                 self.slider_action_steps.setValue(trained_n_steps)
                 self.slider_action_steps.blockSignals(False)
+
+            if hasattr(self, "chk_temporal_ensemble"):
+                self.on_temporal_ensemble_toggled(self.chk_temporal_ensemble.isChecked())
+            else:
                 self.on_action_steps_changed(trained_n_steps)
+
             info_text = f"✔ {policy_type.upper()} | Cams: {cam_str} | Mode: {mode_badge} | Device: {device_str} | Checkpoint: {p.parent.name}"
             self.lbl_model_info.setText(info_text)
             self.lbl_model_info.setStyleSheet("background-color: #0b1120; color: #4ade80; border: 1px solid #166534; font-weight: bold;")
@@ -2267,6 +2336,23 @@ class UR5ePolicyTesterStudio(QMainWindow):
     # -------------------------------------------------------------------------
     # Camera Controls & Devices
     # -------------------------------------------------------------------------
+    def on_temporal_ensemble_toggled(self, checked: bool):
+        if hasattr(self, "spin_ensemble_coeff"):
+            self.spin_ensemble_coeff.setEnabled(checked)
+        if hasattr(self, "slider_action_steps"):
+            self.slider_action_steps.setEnabled(not checked)
+        if hasattr(self, "lbl_interval_hud"):
+            fps = getattr(self, "model_fps", 30)
+            if checked:
+                coeff = self.spin_ensemble_coeff.value() if hasattr(self, "spin_ensemble_coeff") else 0.010
+                self.lbl_interval_hud.setText(f"Ensemble Active (m={coeff:.3f}, {fps} Hz)")
+                self.lbl_interval_hud.setStyleSheet("color: #38bdf8; font-weight: bold; font-family: monospace; font-size: 11px; min-width: 220px;")
+            else:
+                steps = self.slider_action_steps.value() if hasattr(self, "slider_action_steps") else 10
+                dt = steps / max(1, fps)
+                self.lbl_interval_hud.setText(f"{steps} steps ({dt:.2f}s / {int(dt*1000)}ms @ {fps} FPS)")
+                self.lbl_interval_hud.setStyleSheet("color: #f59e0b; font-weight: bold; font-family: monospace; font-size: 11px; min-width: 220px;")
+
     def on_grayscale_toggled(self, checked: bool):
         self.set_grayscale_mode(checked)
 
@@ -2289,7 +2375,13 @@ class UR5ePolicyTesterStudio(QMainWindow):
         fps = getattr(self, "model_fps", 30)
         dt = steps / max(1, fps)
         if hasattr(self, "lbl_interval_hud"):
-            self.lbl_interval_hud.setText(f"{steps} steps ({dt:.2f}s / {int(dt*1000)}ms @ {fps} FPS)")
+            if hasattr(self, "chk_temporal_ensemble") and self.chk_temporal_ensemble.isChecked():
+                coeff = self.spin_ensemble_coeff.value() if hasattr(self, "spin_ensemble_coeff") else 0.010
+                self.lbl_interval_hud.setText(f"Ensemble Active (m={coeff:.3f}, {fps} Hz)")
+                self.lbl_interval_hud.setStyleSheet("color: #38bdf8; font-weight: bold; font-family: monospace; font-size: 11px; min-width: 220px;")
+            else:
+                self.lbl_interval_hud.setText(f"{steps} steps ({dt:.2f}s / {int(dt*1000)}ms @ {fps} FPS)")
+                self.lbl_interval_hud.setStyleSheet("color: #f59e0b; font-weight: bold; font-family: monospace; font-size: 11px; min-width: 220px;")
 
     def toggle_dual_cameras(self):
         self.set_dual_cameras_enabled(not self.enable_dual_cameras)
@@ -2901,6 +2993,8 @@ class UR5ePolicyTesterStudio(QMainWindow):
 
         # Launch background rollout thread
         n_steps = self.slider_action_steps.value() if hasattr(self, "slider_action_steps") else 10
+        use_ensemble = self.chk_temporal_ensemble.isChecked() if hasattr(self, "chk_temporal_ensemble") else True
+        ens_coeff = self.spin_ensemble_coeff.value() if hasattr(self, "spin_ensemble_coeff") else 0.01
         self.rollout_worker = PolicyRolloutWorker(
             model_path=self.active_model_path,
             robot_worker=self.robot_worker,
@@ -2910,6 +3004,8 @@ class UR5ePolicyTesterStudio(QMainWindow):
             control_fps=getattr(self, "model_fps", 30),
             max_jump_deg=max_jump,
             n_action_steps=n_steps,
+            temporal_ensemble=use_ensemble,
+            temporal_ensemble_coeff=ens_coeff,
             auto_freedrive_after=auto_fd,
             return_start_after=return_start,
             start_pose_deg=self.start_position,

@@ -87,6 +87,7 @@ AUG_TRANSLATION = True        # Slight random translation (±8% X/Y)
 AUG_COLOR = True              # Mild brightness & contrast jitter (±20%)
 AUG_CUTOUT = False            # Random cutout / occlusion patches (5-15% area)
 AUG_NOISE = False             # Mild Gaussian sensor noise
+TEMPORAL_ENSEMBLE_COEFF = 0.01  # ACT Algorithm 2: Exponential moving average across overlapping chunks (0.01 standard)
 
 # Checkpoint & Disk Space Management
 # Overwrites the same folder every save to prevent gigabytes of redundant copies
@@ -672,6 +673,7 @@ class RobotTrainer:
         kl_weight: Optional[float] = None,
         dropout: Optional[float] = None,
         grayscale: Optional[bool] = None,
+        temporal_ensemble_coeff: Optional[float] = TEMPORAL_ENSEMBLE_COEFF,
     ):
         if not LEROBOT_AVAILABLE:
             raise RuntimeError(f"LeRobot could not be loaded in this Python environment: {LEROBOT_IMPORT_ERROR}")
@@ -714,10 +716,11 @@ class RobotTrainer:
         self.n_action_steps = int(n_action_steps) if n_action_steps is not None else None
         self.kl_weight = float(kl_weight) if kl_weight is not None else None
         self.dropout = float(dropout) if dropout is not None else None
+        self.temporal_ensemble_coeff = float(temporal_ensemble_coeff) if temporal_ensemble_coeff is not None else None
         if grayscale is not None:
             self.is_grayscale = bool(grayscale)
         else:
-            self.is_grayscale = detect_dataset_grayscale(self.dataset_path)
+            self.is_grayscale = False  # Default: Train in RGB Color
 
         # Extract native dataset FPS
         self.dataset_fps = 30
@@ -781,6 +784,8 @@ class RobotTrainer:
                 kwargs["kl_weight"] = self.kl_weight
             if self.dropout is not None:
                 kwargs["dropout"] = self.dropout
+            if self.temporal_ensemble_coeff is not None:
+                kwargs["temporal_ensemble_coeff"] = self.temporal_ensemble_coeff
             cfg = ACTConfig(input_features=input_features, output_features=output_features, **kwargs)
             if self.resume_checkpoint:
                 resume_p = self.resume_checkpoint
@@ -891,7 +896,9 @@ class RobotTrainer:
             "chunk_size": eff_chunk,
             "n_action_steps": eff_n_actions,
             "decision_interval_s": dec_interval,
+            "temporal_ensemble_coeff": self.temporal_ensemble_coeff,
             "grayscale": self.is_grayscale,
+            "image_mode": "gs" if self.is_grayscale else "col",
             "image_channels": 1 if self.is_grayscale else 3,
             "augmentation": {
                 "enabled": self.use_augmentation,
@@ -1285,11 +1292,14 @@ def parse_args():
     parser.add_argument("--grayscale", action="store_true", default=None, help="Train policy on single-channel Grayscale imagery")
     parser.add_argument("--chunk-size", type=int, default=None, help="Action prediction horizon steps")
     parser.add_argument("--n-action-steps", type=int, default=None, help="Action execution steps before re-querying visual observation")
+    parser.add_argument("--temporal-ensemble-coeff", type=float, default=TEMPORAL_ENSEMBLE_COEFF, help="ACT Temporal Ensembling coefficient (0.01 standard)")
+    parser.add_argument("--no-temporal-ensemble", action="store_true", help="Disable ACT temporal ensembling")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    te_coeff = None if args.no_temporal_ensemble else args.temporal_ensemble_coeff
 
     trainer = RobotTrainer(
         dataset_path=args.dataset,
@@ -1316,6 +1326,7 @@ def main():
         grayscale=args.grayscale,
         chunk_size=args.chunk_size,
         n_action_steps=args.n_action_steps,
+        temporal_ensemble_coeff=te_coeff,
     )
 
     try:

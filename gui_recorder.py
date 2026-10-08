@@ -1290,23 +1290,10 @@ class UR5eRecorderStudio(QMainWindow):
         self.combo_resolution.currentIndexChanged.connect(self.on_resolution_changed)
         cam_ctrl_bar.addWidget(self.combo_resolution)
 
-        self.chk_grayscale = QCheckBox("Grayscale (1-Ch)")
-        self.chk_grayscale.setChecked(False)
-        self.chk_grayscale.setStyleSheet("""
-            QCheckBox {
-                color: #cbd5e1;
-                font-size: 11px;
-                font-weight: bold;
-                margin-left: 6px;
-            }
-            QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-            }
-        """)
-        self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
-        self.chk_grayscale.toggled.connect(self.on_grayscale_toggled)
-        cam_ctrl_bar.addWidget(self.chk_grayscale)
+        self.lbl_color_badge = QLabel("● RGB Color Mode")
+        self.lbl_color_badge.setStyleSheet("color: #a855f7; font-weight: bold; font-size: 11px; margin-left: 6px; padding: 2px 4px;")
+        self.lbl_color_badge.setToolTip("Datasets are collected in full RGB color. Grayscale filtering can be applied dynamically during training.")
+        cam_ctrl_bar.addWidget(self.lbl_color_badge)
 
         lbl_fps_tag = QLabel("Rate:")
         lbl_fps_tag.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px; margin-left: 6px;")
@@ -3420,16 +3407,16 @@ class UR5eRecorderStudio(QMainWindow):
         self.lbl_dataset_path.setText(f"Path: datasets/{clean_name}")
         self.list_episodes.clear()
 
-        # Unlock grayscale toggle and FPS selector for the new dataset
-        if hasattr(self, "chk_grayscale"):
-            self.chk_grayscale.setEnabled(True)
-            self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
+        self.is_grayscale = False
+        if hasattr(self, "lbl_color_badge"):
+            self.lbl_color_badge.setText("● RGB Color Mode")
+            self.lbl_color_badge.setStyleSheet("color: #a855f7; font-weight: bold; font-size: 11px; margin-left: 6px; padding: 2px 4px;")
         if hasattr(self, "combo_fps"):
             self.combo_fps.setEnabled(True)
             self.combo_fps.setToolTip("Observation and control rate (FPS). Standard for UR5e imitation learning is 30 FPS.")
 
         print(f"[DATASET] Prepared fresh new dataset: '{clean_name}' (Path: datasets/{clean_name})")
-        self.status_bar.showMessage(f"New dataset '{clean_name}' ready. Choose Grayscale or RGB mode.", 4000)
+        self.status_bar.showMessage(f"New dataset '{clean_name}' ready in full RGB color.", 4000)
         self.update_visualizer_command()
 
     def load_existing_dataset(self):
@@ -3568,30 +3555,14 @@ class UR5eRecorderStudio(QMainWindow):
                 else:
                     self.combo_fps.setEnabled(True)
 
-        if hasattr(self, "chk_grayscale"):
-            if detected_grayscale is not None:
-                self.chk_grayscale.blockSignals(True)
-                self.chk_grayscale.setChecked(detected_grayscale)
-                self.chk_grayscale.blockSignals(False)
-                self.on_grayscale_toggled(detected_grayscale)
-                if total_episodes > 0:
-                    self.chk_grayscale.setEnabled(False)
-                    mode_label = "Grayscale (1-Ch)" if detected_grayscale else "RGB (3-Ch)"
-                    self.chk_grayscale.setToolTip(f"Dataset format locked to {mode_label} to preserve consistency across episodes in '{self.dataset_root.name}'.")
-                else:
-                    self.chk_grayscale.setEnabled(True)
-                    self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
+        self.is_grayscale = False
+        if hasattr(self, "lbl_color_badge"):
+            if detected_grayscale is True:
+                self.lbl_color_badge.setText("● Legacy Grayscale Detected")
+                self.lbl_color_badge.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px; margin-left: 6px; padding: 2px 4px;")
             else:
-                if total_episodes > 0:
-                    self.chk_grayscale.blockSignals(True)
-                    self.chk_grayscale.setChecked(False)
-                    self.chk_grayscale.blockSignals(False)
-                    self.on_grayscale_toggled(False)
-                    self.chk_grayscale.setEnabled(False)
-                    self.chk_grayscale.setToolTip(f"Existing dataset '{self.dataset_root.name}' is RGB (mode locked).")
-                else:
-                    self.chk_grayscale.setEnabled(True)
-                    self.chk_grayscale.setToolTip("Record dataset with 1-channel grayscale luminance (saves ~60% video disk space)")
+                self.lbl_color_badge.setText("● RGB Color Mode")
+                self.lbl_color_badge.setStyleSheet("color: #a855f7; font-weight: bold; font-size: 11px; margin-left: 6px; padding: 2px 4px;")
 
         print(f"[DATASET] Scanned '{self.dataset_root.name}': {self.list_episodes.count()} episodes found.")
         self.update_visualizer_command()

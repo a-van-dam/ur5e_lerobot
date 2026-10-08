@@ -192,6 +192,8 @@ def run_policy_rollout(
     safe_acceleration: float = SAFE_ACCELERATION,
     max_jump_deg: float = MAX_ALLOWED_JUMP_DEG,
     n_action_steps: Optional[int] = None,
+    temporal_ensemble: bool = True,
+    temporal_ensemble_coeff: Optional[float] = 0.01,
     auto_execute: bool = AUTO_EXECUTE,
     single_step: bool = False,
     mock: bool = False,
@@ -286,14 +288,34 @@ def run_policy_rollout(
             except Exception:
                 pass
 
-    exec_steps = n_action_steps if n_action_steps is not None else default_n_steps
-    if hasattr(policy.config, "n_action_steps"):
-        policy.config.n_action_steps = int(exec_steps)
-    if hasattr(policy, "drop_queued_actions"):
-        policy.drop_queued_actions()
+    # Configure Temporal Ensembling vs Open-Loop Chunks
+    use_te = temporal_ensemble
+    te_coeff = temporal_ensemble_coeff if temporal_ensemble_coeff is not None else 0.01
 
-    dt_decision = exec_steps / max(1, model_fps)
-    print(f"      • Replanning Horizon: {exec_steps} steps ({dt_decision:.2f}s / {int(dt_decision*1000)}ms @ {model_fps} FPS)")
+    if use_te and hasattr(policy, "temporal_ensembler"):
+        try:
+            from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
+            policy.config.temporal_ensemble_coeff = float(te_coeff)
+            policy.temporal_ensembler = ACTTemporalEnsembler(
+                float(te_coeff), getattr(policy.config, "chunk_size", 100)
+            )
+            policy.reset()
+            print(f"      • Replanning Mode:    Temporal Ensembling Active (m={te_coeff:.3f}, 30 Hz continuous smooth blend)")
+        except Exception as e:
+            print(f"      • Note: Temporal ensembling initialization fallback ({e}). Using open-loop chunks.")
+            use_te = False
+
+    if not use_te:
+        if hasattr(policy.config, "temporal_ensemble_coeff"):
+            policy.config.temporal_ensemble_coeff = None
+        exec_steps = n_action_steps if n_action_steps is not None else default_n_steps
+        if hasattr(policy.config, "n_action_steps"):
+            policy.config.n_action_steps = int(exec_steps)
+        if hasattr(policy, "drop_queued_actions"):
+            policy.drop_queued_actions()
+        policy.reset()
+        dt_decision = exec_steps / max(1, model_fps)
+        print(f"      • Replanning Mode:    Open-Loop Chunks ({exec_steps} steps, {dt_decision:.2f}s @ {model_fps} FPS)")
 
     # ─────────────────────────────────────────────────────────────────
     # Phase 2: Connect Robot & Camera Sensors
@@ -599,6 +621,18 @@ def parse_args():
     parser.add_argument("--yes", action="store_true", help="Auto-execute movement without terminal confirmation prompt")
     parser.add_argument("--mock", action="store_true", help="Run in Simulation/Mock mode without physical robot")
     parser.add_argument("--n-action-steps", type=int, default=None, help="Action execution steps before re-querying camera observations")
+    parser.add_argument(
+        "--temporal-ensemble",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable ACT Temporal Ensembling (smooth 30 Hz continuous exponential moving average)",
+    )
+    parser.add_argument(
+        "--temporal-ensemble-coeff",
+        type=float,
+        default=0.01,
+        help="Decay coefficient for temporal ensembling (default: 0.01 from ACT paper)",
+    )
     parser.add_argument("--device", type=str, default=DEVICE, help="Compute device (cuda or cpu)")
     return parser.parse_args()
 
@@ -615,6 +649,8 @@ def main():
         safe_acceleration=args.safe_acc,
         max_jump_deg=args.max_jump,
         n_action_steps=args.n_action_steps,
+        temporal_ensemble=args.temporal_ensemble,
+        temporal_ensemble_coeff=args.temporal_ensemble_coeff,
         auto_execute=args.yes,
         single_step=args.single_step,
         mock=args.mock,

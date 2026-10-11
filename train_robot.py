@@ -633,6 +633,161 @@ def apply_visual_augmentation(
         return flat_img
 
 
+def repair_dataset_indices_if_needed(dataset_path: Path) -> bool:
+    """
+    Checks if dataset parquet index columns, episode indices, and info.json total_frames
+    are strictly contiguous and in-bounds (e.g. after episode deletions). If a desynchronization
+    is detected, reindexes all parquet rows starting from 0 and updates metadata/stats.
+    """
+    data_dir = dataset_path / "data"
+    meta_info_file = dataset_path / "meta" / "info.json"
+    if not data_dir.exists() or not meta_info_file.exists():
+        return False
+
+    try:
+        import pyarrow.parquet as pq
+        import pyarrow as pa
+        import numpy as np
+
+        data_files = sorted(data_dir.glob("**/*.parquet"))
+        if not data_files:
+            return False
+
+        with open(meta_info_file, "r") as f:
+            info = json.load(f)
+
+        meta_frames = info.get("total_frames", 0)
+        total_rows = sum(pq.read_metadata(df).num_rows for df in data_files)
+
+        # Check first index
+        first_table = pq.read_table(data_files[0])
+        first_idx = first_table.column("index")[0].as_py() if "index" in first_table.column_names else 0
+
+        # If meta_frames matches total_rows and first index is 0, no repair needed
+        if meta_frames == total_rows and first_idx == 0:
+            return False
+
+        print(f"[REPAIR] Dataset '{dataset_path.name}' index desynchronization detected:")
+        print(f"         meta total_frames={meta_frames}, actual rows={total_rows}, first_index={first_idx}")
+        print(f"         Repairing contiguous frame indices (0 -> {total_rows - 1}) and updating metadata...")
+
+        ep_meta_dir = dataset_path / "meta" / "episodes"
+        ep_files = sorted(ep_meta_dir.glob("**/*.parquet")) if ep_meta_dir.exists() else []
+
+        curr_offset = 0
+        all_ep_stats = []
+
+        for i, df_p in enumerate(data_files):
+            d_table = pq.read_table(df_p)
+            num_rows = len(d_table)
+            new_index = pa.array(np.arange(curr_offset, curr_offset + num_rows, dtype=np.int64))
+            new_ep_idx = pa.array(np.full(num_rows, i, dtype=np.int64))
+
+            d_cols = {}
+            for name in d_table.column_names:
+                if name == "index":
+                    d_cols[name] = new_index
+                elif name == "episode_index":
+                    d_cols[name] = new_ep_idx
+                else:
+                    d_cols[name] = d_table.column(name)
+
+            new_d_table = pa.Table.from_arrays(list(d_cols.values()), names=list(d_cols.keys()))
+            pq.write_table(new_d_table, df_p)
+
+            # Repair corresponding episode meta parquet if available
+            if i < len(ep_files):
+                ep_p = ep_files[i]
+                e_table = pq.read_table(ep_p)
+                idx_arr = np.arange(curr_offset, curr_offset + num_rows, dtype=np.float64)
+
+                e_dict = {col: e_table.column(col)[0].as_py() for col in e_table.column_names}
+                e_dict["episode_index"] = i
+                e_dict["data/file_index"] = i
+                if "meta/episodes/file_index" in e_dict:
+                    e_dict["meta/episodes/file_index"] = i
+                e_dict["dataset_from_index"] = curr_offset
+                e_dict["dataset_to_index"] = curr_offset + num_rows
+
+                for k in list(e_dict.keys()):
+                    if k.startswith("videos/") and k.endswith("/file_index"):
+                        e_dict[k] = i
+
+                if "stats/index/min" in e_dict:
+                    e_dict["stats/index/min"] = [float(curr_offset)]
+                    e_dict["stats/index/max"] = [float(curr_offset + num_rows - 1)]
+                    e_dict["stats/index/mean"] = [float(np.mean(idx_arr))]
+                    e_dict["stats/index/std"] = [float(np.std(idx_arr))]
+                    e_dict["stats/index/count"] = [num_rows]
+                    e_dict["stats/index/q01"] = [float(np.percentile(idx_arr, 1))]
+                    e_dict["stats/index/q10"] = [float(np.percentile(idx_arr, 10))]
+                    e_dict["stats/index/q50"] = [float(np.percentile(idx_arr, 50))]
+                    e_dict["stats/index/q90"] = [float(np.percentile(idx_arr, 90))]
+                    e_dict["stats/index/q99"] = [float(np.percentile(idx_arr, 99))]
+
+                if "stats/episode_index/min" in e_dict:
+                    e_dict["stats/episode_index/min"] = [float(i)]
+                    e_dict["stats/episode_index/max"] = [float(i)]
+                    e_dict["stats/episode_index/mean"] = [float(i)]
+                    e_dict["stats/episode_index/std"] = [0.0]
+                    e_dict["stats/episode_index/count"] = [num_rows]
+                    e_dict["stats/episode_index/q01"] = [float(i)]
+                    e_dict["stats/episode_index/q10"] = [float(i)]
+                    e_dict["stats/episode_index/q50"] = [float(i)]
+                    e_dict["stats/episode_index/q90"] = [float(i)]
+                    e_dict["stats/episode_index/q99"] = [float(i)]
+
+                new_e_arrays = []
+                for f in e_table.schema:
+                    val = e_dict[f.name]
+                    new_e_arrays.append(pa.array([val], type=f.type))
+                new_e_table = pa.Table.from_arrays(new_e_arrays, schema=e_table.schema)
+                pq.write_table(new_e_table, ep_p)
+
+                # Collect stats for aggregate_stats
+                ep_stat = {}
+                for col in e_table.column_names:
+                    if col.startswith("stats/"):
+                        parts = col.split("/")
+                        feat_name = "/".join(parts[1:-1])
+                        stat_name = parts[-1]
+                        if feat_name not in ep_stat:
+                            ep_stat[feat_name] = {}
+                        val = new_e_table.column(col)[0].as_py()
+                        ep_stat[feat_name][stat_name] = np.array(val)
+                all_ep_stats.append(ep_stat)
+
+            curr_offset += num_rows
+
+        # Update info.json
+        info["total_episodes"] = len(data_files)
+        info["total_frames"] = curr_offset
+        with open(meta_info_file, "w") as f:
+            json.dump(info, f, indent=2)
+
+        # Update stats.json if ep_stats available
+        if all_ep_stats:
+            try:
+                from lerobot.datasets.compute_stats import aggregate_stats
+                global_stats = aggregate_stats(all_ep_stats)
+                def to_json_serializable(d):
+                    if isinstance(d, dict):
+                        return {k: to_json_serializable(v) for k, v in d.items()}
+                    elif isinstance(d, np.ndarray):
+                        return d.tolist()
+                    return d
+                with open(dataset_path / "meta" / "stats.json", "w") as f:
+                    json.dump(to_json_serializable(global_stats), f, indent=2)
+            except Exception:
+                pass
+
+        print(f"[REPAIR] ✔ Dataset '{dataset_path.name}' repaired successfully ({len(data_files)} episodes, {curr_offset} frames).")
+        return True
+    except Exception as err:
+        print(f"[WARNING] Could not auto-repair dataset indices: {err}")
+        return False
+
+
 class RobotTrainer:
     """
     Core imitation learning training manager for UR5e LeRobot datasets.
@@ -713,10 +868,13 @@ class RobotTrainer:
         self.dashboard_html_file = self.output_dir / "training_dashboard.html"
         self.resume_checkpoint = Path(resume_checkpoint).resolve() if resume_checkpoint else None
         self.chunk_size = int(chunk_size) if chunk_size is not None else None
-        self.n_action_steps = int(n_action_steps) if n_action_steps is not None else None
+        self.temporal_ensemble_coeff = float(temporal_ensemble_coeff) if temporal_ensemble_coeff is not None else None
+        if self.policy_name == "act" and self.temporal_ensemble_coeff is not None:
+            self.n_action_steps = 1
+        else:
+            self.n_action_steps = int(n_action_steps) if n_action_steps is not None else None
         self.kl_weight = float(kl_weight) if kl_weight is not None else None
         self.dropout = float(dropout) if dropout is not None else None
-        self.temporal_ensemble_coeff = float(temporal_ensemble_coeff) if temporal_ensemble_coeff is not None else None
         if grayscale is not None:
             self.is_grayscale = bool(grayscale)
         else:
@@ -757,6 +915,9 @@ class RobotTrainer:
                 f"The folder does not appear to be a valid finalized LeRobot dataset."
             )
 
+        # Self-healing index alignment (repairs any frame gaps or off-by-N indices from episode deletions)
+        repair_dataset_indices_if_needed(self.dataset_path)
+
         repo_id = f"local/{self.dataset_path.name}"
         meta = LeRobotDatasetMetadata(repo_id, root=self.dataset_path)
 
@@ -778,14 +939,15 @@ class RobotTrainer:
             kwargs = {}
             if self.chunk_size is not None:
                 kwargs["chunk_size"] = self.chunk_size
-            if self.n_action_steps is not None:
+            if self.temporal_ensemble_coeff is not None:
+                kwargs["temporal_ensemble_coeff"] = self.temporal_ensemble_coeff
+                kwargs["n_action_steps"] = 1
+            elif self.n_action_steps is not None:
                 kwargs["n_action_steps"] = self.n_action_steps
             if self.kl_weight is not None:
                 kwargs["kl_weight"] = self.kl_weight
             if self.dropout is not None:
                 kwargs["dropout"] = self.dropout
-            if self.temporal_ensemble_coeff is not None:
-                kwargs["temporal_ensemble_coeff"] = self.temporal_ensemble_coeff
             cfg = ACTConfig(input_features=input_features, output_features=output_features, **kwargs)
             if self.resume_checkpoint:
                 resume_p = self.resume_checkpoint
@@ -960,8 +1122,12 @@ class RobotTrainer:
         print(f"  • Optimizer:         {self.optimizer_name} (lr={self.learning_rate}, wd={self.weight_decay})")
         print(f"  • Image Mode:        {'Grayscale (1-Ch luminance)' if self.is_grayscale else 'RGB (3-Ch color)'}")
         print(f"  • Dataset Frequency: {self.dataset_fps} FPS (dt = {1.0/max(1, self.dataset_fps):.3f}s)")
-        eff_steps = self.n_action_steps or (50 if self.policy_name == 'act' else 10)
-        print(f"  • Decision Horizon:  Chunk={self.chunk_size or 100}, Execution={eff_steps} steps ({eff_steps/max(1, self.dataset_fps):.2f}s interval)")
+        if self.policy_name == "act" and self.temporal_ensemble_coeff is not None:
+            print(f"  • Replanning Mode:   Temporal Ensembling Active (m={self.temporal_ensemble_coeff:.3f}, 30 Hz continuous blend)")
+            print(f"  • Decision Horizon:  Chunk={self.chunk_size or 100}, Step=1 (Queried every frame @ {self.dataset_fps} FPS)")
+        else:
+            eff_steps = self.n_action_steps or (50 if self.policy_name == 'act' else 10)
+            print(f"  • Decision Horizon:  Chunk={self.chunk_size or 100}, Execution={eff_steps} steps ({eff_steps/max(1, self.dataset_fps):.2f}s interval)")
         print(f"  • Total Steps:       {self.training_steps:,}")
         print(f"  • Batch Size:        {self.batch_size}")
         print(f"  • Device:            {self.device} ({torch.cuda.get_device_name(0) if self.device.type == 'cuda' else 'CPU'})")

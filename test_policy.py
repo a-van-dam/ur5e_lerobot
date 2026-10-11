@@ -296,6 +296,7 @@ def run_policy_rollout(
         try:
             from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
             policy.config.temporal_ensemble_coeff = float(te_coeff)
+            policy.config.n_action_steps = 1
             policy.temporal_ensembler = ACTTemporalEnsembler(
                 float(te_coeff), getattr(policy.config, "chunk_size", 100)
             )

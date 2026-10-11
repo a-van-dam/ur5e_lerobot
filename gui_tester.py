@@ -786,6 +786,7 @@ class PolicyRolloutWorker(QThread):
                 try:
                     from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
                     policy.config.temporal_ensemble_coeff = float(self.temporal_ensemble_coeff)
+                    policy.config.n_action_steps = 1
                     policy.temporal_ensembler = ACTTemporalEnsembler(
                         float(self.temporal_ensemble_coeff),
                         getattr(policy.config, "chunk_size", 100),

@@ -962,6 +962,7 @@ class UR5eTrainerStudio(QMainWindow):
         self.chk_temporal_ensemble.setStyleSheet("font-weight: bold; color: #38bdf8;")
         self.chk_temporal_ensemble.setToolTip("ACT Algorithm 2: Continuously queries policy at 30 Hz and blends overlapping chunks via exponential decay weights w_i = exp(-m*i). Eliminates open-loop pauses and boundary jerks.")
         self.chk_temporal_ensemble.toggled.connect(self.on_temporal_ensemble_toggled)
+        self.spin_n_action_steps.setEnabled(False)
         grid_act.addWidget(self.chk_temporal_ensemble, 1, 0, 1, 2)
 
         te_box = QHBoxLayout()
@@ -1200,6 +1201,8 @@ class UR5eTrainerStudio(QMainWindow):
     def on_temporal_ensemble_toggled(self, checked: bool):
         if hasattr(self, "spin_temporal_coeff"):
             self.spin_temporal_coeff.setEnabled(checked)
+        if hasattr(self, "spin_n_action_steps"):
+            self.spin_n_action_steps.setEnabled(not checked)
         self.update_decision_interval()
 
     def update_decision_interval(self):
@@ -1447,6 +1450,10 @@ class UR5eTrainerStudio(QMainWindow):
             return
 
         # Prepare kwargs
+        use_te = hasattr(self, "chk_temporal_ensemble") and self.chk_temporal_ensemble.isChecked()
+        te_coeff = self.spin_temporal_coeff.value() if use_te else None
+        n_act_steps = 1 if use_te else self.spin_n_action_steps.value()
+
         trainer_kwargs = {
             "dataset_path": ds_path,
             "policy_name": self.combo_policy.currentData(),
@@ -1474,11 +1481,11 @@ class UR5eTrainerStudio(QMainWindow):
             "num_workers": self.spin_workers.value(),
             "seed": self.spin_seed.value(),
             "chunk_size": self.spin_chunk_size.value(),
-            "n_action_steps": self.spin_n_action_steps.value(),
+            "n_action_steps": n_act_steps,
             "kl_weight": self.spin_kl_weight.value(),
             "dropout": self.spin_dropout.value(),
             "grayscale": self.chk_grayscale.isChecked(),
-            "temporal_ensemble_coeff": self.spin_temporal_coeff.value() if (hasattr(self, "chk_temporal_ensemble") and self.chk_temporal_ensemble.isChecked()) else None,
+            "temporal_ensemble_coeff": te_coeff,
         }
 
         if self.chk_resume.isChecked():

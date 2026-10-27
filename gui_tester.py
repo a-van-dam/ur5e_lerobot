@@ -142,15 +142,15 @@ HOME_JOINTS_DICT = {
     "wrist_3": 0.0,
 }
 
-# Default Start Position: [-180°, -90°, 90°, 0°, 90°, -90°]
-DEFAULT_START_JOINTS = [-180.0, -90.0, 90.0, 0.0, 90.0, -90.0]
+# Default Start Position: [-85°, -72°, -60°, 145°, -84°, 275°]
+DEFAULT_START_JOINTS = [-85.0, -72.0, -60.0, 145.0, -84.0, 275.0]
 DEFAULT_START_JOINTS_DICT = {
-    "shoulder_pan": -180.0,
-    "shoulder_lift": -90.0,
-    "elbow": 90.0,
-    "wrist_1": 0.0,
-    "wrist_2": 90.0,
-    "wrist_3": -90.0,
+    "shoulder_pan": -85.0,
+    "shoulder_lift": -72.0,
+    "elbow": -60.0,
+    "wrist_1": 145.0,
+    "wrist_2": -84.0,
+    "wrist_3": 275.0,
 }
 
 
@@ -1061,7 +1061,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
             else:
                 self.active_model_path = Path(DEFAULT_MODEL_PATH).resolve() if "DEFAULT_MODEL_PATH" in globals() else (DEFAULT_TRAIN_DIR / "checkpoint")
 
-        # Custom Start Position (defaults to DEFAULT_START_JOINTS_DICT: -180°, -90°, 90°, 0°, 90°, -90°)
+        # Custom Start Position (defaults to DEFAULT_START_JOINTS_DICT: -85°, -72°, -60°, 145°, -84°, 275°)
         self.start_position: Dict[str, float] = dict(DEFAULT_START_JOINTS_DICT)
         self.freedrive_active: bool = False
         self._user_dragging_joint: Optional[str] = None

@@ -140,15 +140,15 @@ HOME_JOINTS_DICT = {
     "wrist_3": 0.0,
 }
 
-# Default Start Position: [-180°, -90°, 90°, 0°, 90°, -90°]
-DEFAULT_START_JOINTS = [-180.0, -90.0, 90.0, 0.0, 90.0, -90.0]
+# Default Start Position: [-85°, -72°, -60°, 145°, -84°, 275°]
+DEFAULT_START_JOINTS = [-85.0, -72.0, -60.0, 145.0, -84.0, 275.0]
 DEFAULT_START_JOINTS_DICT = {
-    "shoulder_pan": -180.0,
-    "shoulder_lift": -90.0,
-    "elbow": 90.0,
-    "wrist_1": 0.0,
-    "wrist_2": 90.0,
-    "wrist_3": -90.0,
+    "shoulder_pan": -85.0,
+    "shoulder_lift": -72.0,
+    "elbow": -60.0,
+    "wrist_1": 145.0,
+    "wrist_2": -84.0,
+    "wrist_3": 275.0,
 }
 
 
@@ -881,7 +881,7 @@ class CameraFeedWidget(QFrame):
             border-radius: 6px;
         """)
         self.video_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.video_canvas.setMinimumSize(320, 240)
+        self.video_canvas.setMinimumSize(200, 200)
         layout.addWidget(self.video_canvas)
 
         # Blinking timer for REC badge
@@ -999,7 +999,7 @@ class UR5eRecorderStudio(QMainWindow):
         self.setMinimumSize(1100, 800)
         self._user_dragging_joint: Optional[str] = None
 
-        # Custom Start Position (defaults to DEFAULT_START_JOINTS_DICT: -180°, -90°, 90°, 0°, 90°, -90°)
+        # Custom Start Position (defaults to DEFAULT_START_JOINTS_DICT: -85°, -72°, -60°, 145°, -84°, 275°)
         self.start_position: Dict[str, float] = dict(DEFAULT_START_JOINTS_DICT)
         self.jog_sliders: Dict[str, QSlider] = {}
         self.jog_inputs: Dict[str, QLineEdit] = {}
@@ -1275,18 +1275,37 @@ class UR5eRecorderStudio(QMainWindow):
         cam_ctrl_bar.addWidget(lbl_res)
 
         self.RESOLUTION_PRESETS = [
-            ("320 x 240 (Fast Training - Recommended)", 320, 240),
-            ("256 x 256 (Square - Policy/ACT)", 256, 256),
-            ("224 x 224 (Square - ResNet/ViT)", 224, 224),
-            ("640 x 480 (Full / High-Res)", 640, 480),
-            ("160 x 120 (Ultra Fast)", 160, 120),
+            # Standard Landscape (Width x Height)
+            ("320 x 240 (Landscape 4:3 - Recommended Fast)", 320, 240),
+            ("640 x 480 (Landscape 4:3 - VGA Standard)", 640, 480),
+            ("480 x 360 (Landscape 4:3 - Medium)", 480, 360),
+            ("160 x 120 (Landscape 4:3 - Ultra Fast)", 160, 120),
+            ("640 x 360 (Landscape 16:9 - Widescreen nHD)", 640, 360),
+            ("1280 x 720 (Landscape 16:9 - HD 720p)", 1280, 720),
+            ("848 x 480 (Landscape 16:9 - Wide 480p)", 848, 480),
+            # Square (1:1)
+            ("256 x 256 (Square 1:1 - Policy/ACT Standard)", 256, 256),
+            ("224 x 224 (Square 1:1 - ResNet/ViT Standard)", 224, 224),
+            ("384 x 384 (Square 1:1 - High-Res Vision)", 384, 384),
+            ("192 x 192 (Square 1:1 - Compact)", 192, 192),
+            ("128 x 128 (Square 1:1 - Ultra Fast)", 128, 128),
+            # Portrait / Vertical (Height > Width)
+            ("240 x 320 (Portrait 3:4 - Fast Training)", 240, 320),
+            ("360 x 480 (Portrait 3:4 - Medium)", 360, 480),
+            ("480 x 640 (Portrait 3:4 - High-Res)", 480, 640),
+            ("120 x 160 (Portrait 3:4 - Ultra Fast)", 120, 160),
+            ("270 x 480 (Portrait 9:16 - Vertical Fast)", 270, 480),
+            ("360 x 640 (Portrait 9:16 - Vertical nHD)", 360, 640),
+            ("540 x 960 (Portrait 9:16 - Vertical qHD)", 540, 960),
+            ("720 x 1280 (Portrait 9:16 - Vertical HD 720p)", 720, 1280),
         ]
         self.combo_resolution = QComboBox()
         for label, _, _ in self.RESOLUTION_PRESETS:
             self.combo_resolution.addItem(label)
         self.combo_resolution.setCurrentIndex(0)  # Default: 320x240
         self.combo_resolution.setStyleSheet("font-size: 11px; padding: 2px 6px;")
-        self.combo_resolution.setToolTip("Select recording resolution for cameras. Smaller resolutions (e.g. 320x240) train faster and save disk space.")
+        self.combo_resolution.setMinimumWidth(260)
+        self.combo_resolution.setToolTip("Select recording resolution for cameras (Landscape, Square, or Portrait). Smaller resolutions train faster and save disk space.")
         self.combo_resolution.currentIndexChanged.connect(self.on_resolution_changed)
         cam_ctrl_bar.addWidget(self.combo_resolution)
 

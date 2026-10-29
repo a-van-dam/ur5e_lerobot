@@ -1920,6 +1920,25 @@ class UR5eRecorderStudio(QMainWindow):
         """)
         self.btn_copy_viz_cmd.clicked.connect(self.copy_visualizer_command)
         viz_cmd_row.addWidget(self.btn_copy_viz_cmd, stretch=1)
+
+        self.btn_launch_viz = QPushButton("🌐 Launch Viewer")
+        self.btn_launch_viz.setToolTip("Launch the LeRobot Rerun visualizer directly for the selected episode")
+        self.btn_launch_viz.setStyleSheet("""
+            QPushButton {
+                background-color: #059669;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 6px 12px;
+                border: 1px solid #10b981;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #047857;
+            }
+        """)
+        self.btn_launch_viz.clicked.connect(self.launch_visualizer)
+        viz_cmd_row.addWidget(self.btn_launch_viz, stretch=1)
         ds_layout.addLayout(viz_cmd_row)
 
         self.list_episodes.currentRowChanged.connect(lambda _: self.update_visualizer_command())
@@ -2470,9 +2489,57 @@ class UR5eRecorderStudio(QMainWindow):
                 row = self.list_episodes.currentRow()
                 if row >= 0:
                     selected_idx = row
-        cmd = f"lerobot-dataset-viz --repo-id local/{clean_name} --root ./datasets/{clean_name} --episode-index {selected_idx}"
+        abs_root = self.dataset_root.resolve()
+        cmd = f"lerobot-dataset-viz --repo-id local/{clean_name} --root {abs_root} --episode-index {selected_idx}"
         if hasattr(self, "txt_viz_command"):
             self.txt_viz_command.setText(cmd)
+
+    def launch_visualizer(self):
+        clean_name = self.dataset_root.name
+        abs_root = self.dataset_root.resolve()
+        selected_idx = 0
+        curr_item = self.list_episodes.currentItem()
+        if curr_item is not None:
+            text = curr_item.text()
+            import re
+            m = re.search(r"Episode #(\d+)", text)
+            if m:
+                selected_idx = int(m.group(1))
+            else:
+                row = self.list_episodes.currentRow()
+                if row >= 0:
+                    selected_idx = row
+
+        info_path = abs_root / "meta" / "info.json"
+        if not info_path.exists():
+            QMessageBox.warning(
+                self,
+                "Dataset Not Found",
+                f"No episode metadata found at:\n{info_path}\n\nPlease record and save at least one episode first.",
+            )
+            return
+
+        env = os.environ.copy()
+        conda_bin = str(Path(sys.executable).parent)
+        env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "lerobot.scripts.lerobot_dataset_viz",
+            "--repo-id",
+            f"local/{clean_name}",
+            "--root",
+            str(abs_root),
+            "--episode-index",
+            str(selected_idx),
+        ]
+        try:
+            subprocess.Popen(cmd, env=env)
+            self.status_bar.showMessage(f"Opening LeRobot Visualizer for Episode #{selected_idx}...", 5000)
+            print(f"[SYSTEM] Launched visualizer: {' '.join(cmd)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Visualizer Error", f"Failed to launch visualizer:\n{e}")
 
     def copy_visualizer_command(self):
         cmd = self.txt_viz_command.text().strip()

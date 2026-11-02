@@ -26,6 +26,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pickle
 import shutil
 import subprocess
 import sys
@@ -3741,76 +3742,120 @@ class UR5eRecorderStudio(QMainWindow):
             return None
 
     def commit_episode_to_dataset(self, ep_idx: int, num_frames: int, duration_s: float):
+        """
+        Commits recorded demonstration frames to the LeRobot dataset.
+        Executes saving via an isolated background subprocess worker (save_episode_worker.py)
+        to guarantee that video encoding (PyAV / SVT-AV1) or C-extension faults cannot crash
+        the main GUI application.
+        """
+        if not self.current_episode_buffer:
+            print("[WARNING] Episode buffer empty; nothing to save.")
+            return
+
+        task_str = self.txt_task_desc.text().strip() or "Pick and place demonstration"
+
+        # 1. Prepare temporary save directory and serialize demonstration payload
+        temp_dir = self.dataset_root / ".temp_save"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        payload_file = temp_dir / f"episode_{ep_idx:04d}_{int(time.time())}.pkl"
+
+        payload = {
+            "dataset_root": str(self.dataset_root.resolve()),
+            "repo_id": f"local/{self.dataset_root.name}",
+            "fps": self.target_fps,
+            "camera_width": self.camera_width,
+            "camera_height": self.camera_height,
+            "enable_dual_cameras": self.enable_dual_cameras,
+            "is_grayscale": self.is_grayscale,
+            "ep_idx": ep_idx,
+            "num_frames": num_frames,
+            "duration_s": duration_s,
+            "task_str": task_str,
+            "frames": list(self.current_episode_buffer),
+        }
+
         try:
-            dataset = self.get_or_create_dataset()
-
-            if dataset is not None and torch is not None:
-                task_str = self.txt_task_desc.text().strip() or "Pick and place demonstration"
-                for frame in self.current_episode_buffer:
-                    t_frame = {
-                        "observation.state": torch.from_numpy(frame["observation.state"]),
-                        "action": torch.from_numpy(frame["action"]),
-                        "observation.images.workspace": torch.from_numpy(
-                            np.ascontiguousarray(frame["observation.images.workspace"], dtype=np.uint8)
-                        ),
-                        "task": task_str,
-                    }
-                    if "observation.images.wrist" in frame:
-                        t_frame["observation.images.wrist"] = torch.from_numpy(
-                            np.ascontiguousarray(frame["observation.images.wrist"], dtype=np.uint8)
-                        )
-                    dataset.add_frame(t_frame)
-
-                dataset.save_episode()
-                # Immediately finalize so parquet footers and meta/episodes are completely written to disk
-                dataset.finalize()
-
-                # Save persistent recording configuration metadata
-                meta_dir = self.dataset_root / "meta"
-                meta_dir.mkdir(parents=True, exist_ok=True)
-                rec_cfg = {
-                    "grayscale": self.is_grayscale,
-                    "channels": 1 if self.is_grayscale else 3,
-                    "width": self.camera_width,
-                    "height": self.camera_height,
-                    "fps": self.target_fps,
-                    "dual_cam": self.enable_dual_cameras,
-                    "updated_at": datetime.datetime.now().isoformat(),
-                }
-                with open(meta_dir / "recording_config.json", "w") as f_cfg:
-                    json.dump(rec_cfg, f_cfg, indent=2)
-                with open(self.dataset_root / "recording_config.json", "w") as f_cfg:
-                    json.dump(rec_cfg, f_cfg, indent=2)
-                total_episodes_saved = dataset.num_episodes
-                has_wrist = self.enable_dual_cameras
-                self.active_dataset = None  # Reset instance so next episode cleanly resumes via LeRobotDataset.resume()
-                print(f"[DATASET] ✔ LeRobot episode #{ep_idx:04d} written and finalized successfully ({num_frames} frames)!")
-                print(f"          • Telemetry Parquet: {self.dataset_root / 'data'}")
-                print(f"          • Workspace Video:   {self.dataset_root / 'videos' / 'observation.images.workspace'}")
-                if has_wrist:
-                    print(f"          • Wrist Video:       {self.dataset_root / 'videos' / 'observation.images.wrist'}")
-                print(f"          • Metadata Episodes: {self.dataset_root / 'meta' / 'episodes'}")
-                print(f"          • Total episodes:    {total_episodes_saved}")
-            else:
-                print("[WARNING] Saving to fallback manifest because LeRobot is unavailable in this environment.", file=sys.__stderr__)
-                self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
-
-            # Update UI List
-            item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s)"
-            self.list_episodes.addItem(QListWidgetItem(item_text))
-            self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
-            self.current_episode_buffer.clear()
-            self.update_visualizer_command()
-        except Exception as err:
-            print(f"[ERROR] commit_episode_to_dataset exception: {err}", file=sys.__stderr__)
-            import traceback
-            traceback.print_exc(file=sys.__stderr__)
+            with open(payload_file, "wb") as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as dump_err:
+            print(f"[ERROR] Failed to write temporary episode payload: {dump_err}", file=sys.__stderr__)
             self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
-            item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s)"
+            item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s) [MANIFEST]"
             self.list_episodes.addItem(QListWidgetItem(item_text))
             self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
             self.current_episode_buffer.clear()
             self.update_visualizer_command()
+            return
+
+        worker_script = Path(__file__).parent / "save_episode_worker.py"
+        save_success = False
+
+        if worker_script.exists():
+            env = os.environ.copy()
+            conda_bin = str(Path(sys.executable).parent)
+            env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
+
+            try:
+                print(f"[DATASET] Spawning isolated save worker for Episode #{ep_idx:04d}...")
+                proc = subprocess.run(
+                    [sys.executable, str(worker_script), "--payload", str(payload_file)],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=300,  # 5 minutes safety timeout
+                )
+
+                if proc.stdout:
+                    for line in proc.stdout.strip().splitlines():
+                        if not line.startswith("__WORKER_RESULT_JSON"):
+                            print(line)
+
+                if proc.returncode == 0:
+                    save_success = True
+                    print(f"[DATASET] ✔ Episode #{ep_idx:04d} saved successfully via worker ({num_frames} frames).")
+                else:
+                    print(f"[ERROR] Save worker failed with exit code {proc.returncode}!", file=sys.__stderr__)
+                    if proc.stderr:
+                        print(f"[WORKER STDERR]\n{proc.stderr}", file=sys.__stderr__)
+
+                    err_msg = (
+                        f"Failed to encode Episode #{ep_idx} into the dataset.\n"
+                        f"Worker Process Exit Code: {proc.returncode}\n\n"
+                        f"IMPORTANT: Your demonstration data was NOT lost!\n"
+                        f"Raw demonstration buffer is preserved at:\n{payload_file}\n\n"
+                        f"The studio has protected your session from crashing.\n"
+                        f"You can continue recording demonstrations."
+                    )
+                    QMessageBox.warning(self, "Episode Save Notice", err_msg)
+            except subprocess.TimeoutExpired:
+                print(f"[ERROR] Save worker timed out after 300s for Episode #{ep_idx}!", file=sys.__stderr__)
+                QMessageBox.warning(
+                    self,
+                    "Save Timeout",
+                    f"Episode #{ep_idx} encoding timed out. The studio remains active.\n"
+                    f"Raw data preserved at:\n{payload_file}",
+                )
+            except Exception as sub_err:
+                print(f"[ERROR] Failed to run isolated save worker: {sub_err}", file=sys.__stderr__)
+                QMessageBox.warning(
+                    self,
+                    "Save Error",
+                    f"Save worker could not be launched ({sub_err}).\n"
+                    f"Raw data preserved at:\n{payload_file}",
+                )
+        else:
+            print("[WARNING] save_episode_worker.py not found. Using fallback manifest.", file=sys.__stderr__)
+
+        if not save_success:
+            self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
+            item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s) [UNENCODED]"
+        else:
+            item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s)"
+
+        self.list_episodes.addItem(QListWidgetItem(item_text))
+        self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
+        self.current_episode_buffer.clear()
+        self.update_visualizer_command()
 
     def _write_local_manifest_episode(self, ep_idx: int, num_frames: int, duration_s: float):
         """Standard backup manifest recording episode records."""

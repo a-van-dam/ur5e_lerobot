@@ -829,7 +829,7 @@ class PolicyRolloutWorker(QThread):
                     pass
 
         # Inspect camera requirements
-        img_features = getattr(policy.config, "image_features", {})
+        img_features = getattr(policy.config, "image_features", {}) or getattr(policy.config, "input_features", {})
         has_wrist_cam = "observation.images.wrist" in img_features
         req_h, req_w = 240, 320
         if "observation.images.workspace" in img_features:
@@ -862,13 +862,14 @@ class PolicyRolloutWorker(QThread):
         }
         if has_wrist_cam and self.camera_worker_2:
             cam2_frame = self.camera_worker_2.get_latest_frame()
-            if cam2_frame is not None:
-                if cam2_frame.shape[1] != req_w or cam2_frame.shape[0] != req_h:
-                    cam2_frame = cv2.resize(cam2_frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
-                if is_model_grayscale and len(cam2_frame.shape) == 3:
-                    cam2_frame = cv2.cvtColor(cv2.cvtColor(cam2_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
-                wrist_rgb = cv2.cvtColor(cam2_frame, cv2.COLOR_BGR2RGB)
-                batch["observation.images.wrist"] = torch.from_numpy(wrist_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
+            if cam2_frame is None:
+                cam2_frame = np.zeros((req_h, req_w, 3), dtype=np.uint8)
+            if cam2_frame.shape[1] != req_w or cam2_frame.shape[0] != req_h:
+                cam2_frame = cv2.resize(cam2_frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
+            if is_model_grayscale and len(cam2_frame.shape) == 3:
+                cam2_frame = cv2.cvtColor(cv2.cvtColor(cam2_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+            wrist_rgb = cv2.cvtColor(cam2_frame, cv2.COLOR_BGR2RGB)
+            batch["observation.images.wrist"] = torch.from_numpy(wrist_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
 
         with torch.no_grad():
             pre_batch = preprocessor(batch)
@@ -957,14 +958,15 @@ class PolicyRolloutWorker(QThread):
                 }
                 if has_wrist_cam and self.camera_worker_2:
                     w_frame = self.camera_worker_2.get_latest_frame()
-                    if w_frame is not None:
-                        if w_frame.shape[1] != req_w or w_frame.shape[0] != req_h:
-                            w_frame = cv2.resize(w_frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
-                        if is_model_grayscale and len(w_frame.shape) == 3:
-                            w_frame = cv2.cvtColor(cv2.cvtColor(w_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
-                        step_batch["observation.images.wrist"] = torch.from_numpy(
-                            cv2.cvtColor(w_frame, cv2.COLOR_BGR2RGB)
-                        ).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
+                    if w_frame is None:
+                        w_frame = np.zeros((req_h, req_w, 3), dtype=np.uint8)
+                    if w_frame.shape[1] != req_w or w_frame.shape[0] != req_h:
+                        w_frame = cv2.resize(w_frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
+                    if is_model_grayscale and len(w_frame.shape) == 3:
+                        w_frame = cv2.cvtColor(cv2.cvtColor(w_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+                    step_batch["observation.images.wrist"] = torch.from_numpy(
+                        cv2.cvtColor(w_frame, cv2.COLOR_BGR2RGB)
+                    ).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
 
                 with torch.no_grad():
                     p_batch = preprocessor(step_batch)
@@ -1050,6 +1052,8 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.camera_2_index = DEFAULT_CAMERA_2_INDEX
         self.enable_dual_cameras = False
         self.is_grayscale = False
+        self.model_required_cams = 1
+        self.model_camera_names = ["Workspace"]
 
         # Model Checkpoint Path
         if model_path:
@@ -2256,13 +2260,42 @@ class UR5ePolicyTesterStudio(QMainWindow):
             import json
             data = json.loads(config_json.read_text())
             policy_type = data.get("type", "ACTPolicy")
-            features = data.get("image_features", {})
+
+            # Detect visual input features from both input_features and image_features
+            features = {}
+            if "input_features" in data and isinstance(data["input_features"], dict):
+                features.update({k: v for k, v in data["input_features"].items() if "observation.images" in k})
+            if "image_features" in data and isinstance(data["image_features"], dict):
+                features.update({k: v for k, v in data["image_features"].items() if "observation.images" in k})
+
             cams = []
             if "observation.images.workspace" in features:
                 cams.append("Workspace")
             if "observation.images.wrist" in features:
                 cams.append("Wrist")
-            cam_str = " + ".join(cams) if cams else "1-Cam"
+
+            # Fallback to training_info.json or info.json in parent folders if present
+            if not cams:
+                for info_p in [p / "training_info.json", p.parent / "training_info.json"]:
+                    if info_p.exists():
+                        try:
+                            with open(info_p, "r") as f_info:
+                                t_info = json.load(f_info)
+                                if t_info.get("dual_cam") is True or t_info.get("num_cameras") == 2:
+                                    cams = ["Workspace", "Wrist"]
+                                    break
+                                elif t_info.get("dual_cam") is False or t_info.get("num_cameras") == 1:
+                                    cams = ["Workspace"]
+                                    break
+                        except Exception:
+                            pass
+
+            if not cams:
+                cams = ["Workspace"]
+
+            self.model_required_cams = len(cams)
+            self.model_camera_names = list(cams)
+            cam_str = f"{len(cams)}-Cam ({' + '.join(cams)})"
 
             device_str = "CUDA (RTX)" if (torch and torch.cuda.is_available()) else "CPU"
 
@@ -2328,9 +2361,13 @@ class UR5ePolicyTesterStudio(QMainWindow):
             self.lbl_model_info.setStyleSheet("background-color: #0b1120; color: #4ade80; border: 1px solid #166534; font-weight: bold;")
             print(f"[MODEL] Inspected checkpoint: {info_text}")
 
-            # Auto-enable secondary camera if policy requires wrist camera
+            # Auto-align secondary camera with policy requirement upon loading
             if "Wrist" in cams and not self.enable_dual_cameras:
+                print(f"[MODEL] Model requires dual cameras ({cam_str}). Auto-enabling 2-Camera Mode.")
                 self.set_dual_cameras_enabled(True)
+            elif "Wrist" not in cams and self.enable_dual_cameras:
+                print(f"[MODEL] Model requires single camera ({cam_str}). Auto-setting 1-Camera Mode.")
+                self.set_dual_cameras_enabled(False)
         except Exception as e:
             self.lbl_model_info.setText(f"Error parsing model config: {e}")
 
@@ -2968,6 +3005,70 @@ class UR5ePolicyTesterStudio(QMainWindow):
 
         if not self.active_model_path.exists() or not (self.active_model_path / "config.json").exists():
             QMessageBox.critical(self, "Model Not Found", f"Cannot find valid checkpoint directory at:\n{self.active_model_path}")
+            return
+
+        # =====================================================================
+        # Camera Count & Configuration Validation Gate
+        # =====================================================================
+        required_cams = getattr(self, "model_required_cams", 1)
+        req_cam_names = getattr(self, "model_camera_names", ["Workspace"])
+        active_cams = 2 if (self.enable_dual_cameras and self.camera_worker_2 is not None) else 1
+
+        if required_cams == 2 and active_cams != 2:
+            warning_msg = (
+                f"<h3>⚠️ Camera Setup Mismatch</h3>"
+                f"<p>The loaded model was trained with <b>2 Camera Inputs</b>:</p>"
+                f"<ul>"
+                f"<li><b>Camera 1:</b> Primary Workspace View</li>"
+                f"<li><b>Camera 2:</b> Wrist Flange View</li>"
+                f"</ul>"
+                f"<p>However, currently only <b>{active_cams} camera</b> is active in the studio.</p>"
+                f"<p style='color: #ef4444; font-weight: bold;'>Autonomous policy evaluation has been prevented to avoid feeding incomplete observation tensors to the neural network.</p>"
+                f"<hr>"
+                f"<p><b>How to resolve this:</b></p>"
+                f"<ol>"
+                f"<li>Click the <b>'+ 2nd Camera'</b> button in the Camera Controls bar.</li>"
+                f"<li>Select the correct <code>/dev/video</code> node for your Wrist camera.</li>"
+                f"<li>Confirm that both live video windows are displaying active camera feeds before starting the evaluation.</li>"
+                f"</ol>"
+            )
+            print(f"[POLICY VALIDATION ERROR] Cannot start evaluation: Model was trained with 2 cameras ({' + '.join(req_cam_names)}), but only {active_cams} camera is active.", file=sys.__stderr__)
+            self.status_bar.showMessage("Evaluation blocked: Model requires 2 camera inputs (Workspace + Wrist).", 8000)
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setWindowTitle("Camera Input Mismatch")
+            msg_box.setTextFormat(Qt.TextFormat.RichText)
+            msg_box.setText(warning_msg)
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msg_box.exec()
+            return
+
+        if required_cams == 1 and active_cams != 1:
+            warning_msg = (
+                f"<h3>⚠️ Camera Setup Mismatch</h3>"
+                f"<p>The loaded model was trained with only <b>1 Camera Input</b> (Workspace View).</p>"
+                f"<p>However, <b>2 Cameras (Dual-Cam Mode)</b> are currently enabled in the studio.</p>"
+                f"<p style='color: #ef4444; font-weight: bold;'>Autonomous policy evaluation has been prevented to avoid unexpected observation dimensionality mismatch.</p>"
+                f"<hr>"
+                f"<p><b>How to resolve this:</b></p>"
+                f"<ol>"
+                f"<li>Click the <b>'✖ 1-Camera Mode'</b> button in the Camera Controls bar to disable the secondary wrist camera.</li>"
+                f"<li>Confirm that only the Primary Workspace Camera feed is visible before starting the evaluation.</li>"
+                f"</ol>"
+            )
+            print(f"[POLICY VALIDATION ERROR] Cannot start evaluation: Model was trained with 1 camera ({' + '.join(req_cam_names)}), but 2 cameras are currently active.", file=sys.__stderr__)
+            self.status_bar.showMessage("Evaluation blocked: Model requires 1 camera input (Workspace only).", 8000)
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setWindowTitle("Camera Input Mismatch")
+            msg_box.setTextFormat(Qt.TextFormat.RichText)
+            msg_box.setText(warning_msg)
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msg_box.exec()
+            return
+
+        if self.camera_worker_1 is None:
+            QMessageBox.critical(self, "Camera Error", "Primary Workspace camera is not initialized.")
             return
 
         if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():

@@ -172,6 +172,11 @@ class GamepadConfig:
     button_select: int = 6
     button_start: int = 7
 
+    # Gripper Button Indices (Xbox: A=0 close, B=1 open; PlayStation: Cross=0 close, Circle=1 open)
+    button_gripper_close: int = 0
+    button_gripper_open: int = 1
+    gripper_speed_mms: float = 25.0  # Aperture change rate in mm/s when button is held down
+
     # Direction inversions (+1.0 normal, -1.0 inverted)
     invert_x: float = -1.0
     invert_y: float = 1.0
@@ -268,6 +273,7 @@ XBOX_CONFIG = GamepadConfig(
     axis_trigger_left=2, axis_trigger_right=5,
     button_shoulder_left=4, button_shoulder_right=5,
     button_select=6, button_start=7,
+    button_gripper_close=0, button_gripper_open=1,
     invert_x=-1.0, invert_y=1.0, invert_z=-1.0,
     invert_base=1.0, invert_wrist2=1.0, invert_wrist3=1.0,
 )
@@ -278,6 +284,7 @@ PLAYSTATION_CONFIG = GamepadConfig(
     axis_trigger_left=4, axis_trigger_right=5,
     button_shoulder_left=4, button_shoulder_right=5,
     button_select=8, button_start=9,
+    button_gripper_close=0, button_gripper_open=1,
     invert_x=-1.0, invert_y=1.0, invert_z=-1.0,
     invert_base=1.0, invert_wrist2=1.0, invert_wrist3=1.0,
 )
@@ -358,6 +365,7 @@ class UR5eGamepadTeleop(QThread):
     accel_scale_changed = pyqtSignal(float)       # accel_scale (0.10 to 1.00)
     button_select_pressed = pyqtSignal()          # Trigger Go to Start position
     button_start_pressed = pyqtSignal()           # Trigger Start/End demonstration recording
+    gripper_width_updated = pyqtSignal(float)     # Target gripper width in mm
 
     def __init__(
         self,
@@ -411,6 +419,12 @@ class UR5eGamepadTeleop(QThread):
         # Base orientation tracking for heading-relative Cartesian control (radians)
         self._current_base_angle: float = self._current_joints[0]
         self._base_angle_provider: Optional[Callable[[], float]] = None
+
+        # Gripper control state
+        self.gripper: Optional[Any] = None
+        self._gripper_target_width: float = 72.0
+        self._last_gripper_cmd_time: float = 0.0
+        self._gripper_button_active: bool = False
 
     # -------------------------------------------------------------------------
     # Public Control & Configuration API
@@ -494,6 +508,29 @@ class UR5eGamepadTeleop(QThread):
     def set_base_angle_provider(self, provider_fn: Callable[[], float]):
         with QMutexLocker(self._lock):
             self._base_angle_provider = provider_fn
+
+    def set_gripper(self, gripper: Any):
+        """Attaches an OnRobot2FGModbus instance for gamepad gripper control."""
+        with QMutexLocker(self._lock):
+            self.gripper = gripper
+            if self.gripper is not None and hasattr(self.gripper, "get_width"):
+                try:
+                    w = float(self.gripper.get_width())
+                    if w > 0:
+                        self._gripper_target_width = w
+                except Exception:
+                    pass
+
+    def set_gripper_target_width(self, width_mm: float):
+        """Synchronizes target gripper width from external sources (such as GUI sliders)."""
+        with QMutexLocker(self._lock):
+            min_w = getattr(self.gripper, "min_width_mm", 55.0) if self.gripper else 55.0
+            max_w = getattr(self.gripper, "max_width_mm", 105.0) if self.gripper else 105.0
+            self._gripper_target_width = max(min_w, min(max_w, float(width_mm)))
+
+    def get_gripper_target_width(self) -> float:
+        with QMutexLocker(self._lock):
+            return self._gripper_target_width
 
     def set_invert_left_horizontal(self, invert: bool):
         with QMutexLocker(self._lock):
@@ -886,6 +923,55 @@ class UR5eGamepadTeleop(QThread):
                 has_cart = any(abs(v) > 1e-4 for v in cart_vel[:3])
                 has_joint = any(abs(w) > 1e-4 for w in (joint_vel[0], joint_vel[4], joint_vel[5]))
 
+                # ---------------------------------------------------------------------
+                # Gripper Teleoperation: Button A (Close Slowly) & Button B (Open Slowly)
+                # ---------------------------------------------------------------------
+                num_buttons = self._joystick.get_numbuttons()
+                btn_close = (
+                    self.config.button_gripper_close < num_buttons
+                    and bool(self._joystick.get_button(self.config.button_gripper_close))
+                )
+                btn_open = (
+                    self.config.button_gripper_open < num_buttons
+                    and bool(self._joystick.get_button(self.config.button_gripper_open))
+                )
+
+                if (btn_close or btn_open) and not self._inhibited:
+                    self._gripper_button_active = True
+                    min_w = getattr(self.gripper, "min_width_mm", 55.0) if self.gripper else 55.0
+                    max_w = getattr(self.gripper, "max_width_mm", 105.0) if self.gripper else 105.0
+
+                    delta = 0.0
+                    if btn_close and not btn_open:
+                        delta = -self.config.gripper_speed_mms * poll_period
+                    elif btn_open and not btn_close:
+                        delta = +self.config.gripper_speed_mms * poll_period
+
+                    if abs(delta) > 1e-4:
+                        with QMutexLocker(self._lock):
+                            self._gripper_target_width = max(min_w, min(max_w, self._gripper_target_width + delta))
+                            target_to_send = self._gripper_target_width
+
+                        now = time.perf_counter()
+                        if now - self._last_gripper_cmd_time >= 0.065:
+                            self._last_gripper_cmd_time = now
+                            if self.gripper is not None and hasattr(self.gripper, "grip"):
+                                try:
+                                    self.gripper.grip(target_to_send, force_n=30.0, speed_percent=50, wait=False)
+                                except Exception:
+                                    pass
+                            self.gripper_width_updated.emit(target_to_send)
+                elif self._gripper_button_active:
+                    self._gripper_button_active = False
+                    with QMutexLocker(self._lock):
+                        final_w = self._gripper_target_width
+                    if self.gripper is not None and hasattr(self.gripper, "grip"):
+                        try:
+                            self.gripper.grip(final_w, force_n=30.0, speed_percent=50, wait=False)
+                        except Exception:
+                            pass
+                    self.gripper_width_updated.emit(final_w)
+
                 with QMutexLocker(self._lock):
                     can_stream = self._enabled and not self._inhibited
 
@@ -1008,6 +1094,8 @@ def run_standalone():
     print("  • Right Stick (X)     : DIRECT Base Motor Rotation (shoulder_pan)")
     print("  • Shoulders (LB/RB)   : DIRECT Wrist 2 Rotation")
     print("  • Triggers (LT/RT)    : DIRECT Wrist 3 Rotation")
+    print("  • Button A (Hold)     : Slowly CLOSE Gripper (OnRobot 2FG)")
+    print("  • Button B (Hold)     : Slowly OPEN Gripper (OnRobot 2FG)")
     print("  • Select Button       : Go to Start / Home Position")
     print("  • Start Button        : Start / End Episode Recording (Space)")
     print("  • Note                : Wrist 3 is strictly decoupled from analog stick movement")
@@ -1016,6 +1104,15 @@ def run_standalone():
 
     teleop = UR5eGamepadTeleop(robot_ip=args.robot_ip, config=config, mock=args.mock)
     teleop.set_enabled(True)
+
+    try:
+        from onrobot_gripper import get_shared_gripper
+        gripper = get_shared_gripper(auto_connect=not args.mock)
+        if gripper.is_connected:
+            teleop.set_gripper(gripper)
+            print(f"[GAMEPAD] OnRobot 2FG Gripper connected! (Hold [A] to Close, [B] to Open)")
+    except Exception as e:
+        print(f"[GAMEPAD] Gripper init notice: {e}")
 
     def on_status(conn: bool, name: str):
         status = "CONNECTED" if conn else "DISCONNECTED"

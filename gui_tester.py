@@ -113,6 +113,15 @@ try:
 except ImportError:
     GAMEPAD_AVAILABLE = False
 
+# OnRobot 2FG Gripper Modbus TCP Controller
+try:
+    from onrobot_gripper import get_shared_gripper, OnRobot2FGModbus
+    ONROBOT_GRIPPER_AVAILABLE = True
+except ImportError:
+    get_shared_gripper = None
+    OnRobot2FGModbus = None
+    ONROBOT_GRIPPER_AVAILABLE = False
+
 # =============================================================================
 # Defaults & Global Constants
 # =============================================================================
@@ -1123,6 +1132,23 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.robot_worker.connection_state_changed.connect(self.on_robot_connection_status)
         self.robot_worker.start()
 
+        # Initialize OnRobot 2FG Gripper
+        self._user_dragging_gripper: bool = False
+        self.gripper: Optional[OnRobot2FGModbus] = None
+        if ONROBOT_GRIPPER_AVAILABLE and get_shared_gripper is not None:
+            try:
+                self.gripper = get_shared_gripper(auto_connect=not self.mock_mode)
+                if self.gripper and self.gripper.is_connected:
+                    init_w = self.gripper.get_width()
+                    if hasattr(self, "gripper_slider"):
+                        self.gripper_slider.blockSignals(True)
+                        self.gripper_slider.setValue(int(round(init_w)))
+                        self.gripper_slider.blockSignals(False)
+                    if hasattr(self, "gripper_input"):
+                        self.gripper_input.setText(f"{init_w:.1f}")
+            except Exception as e:
+                print(f"[GRIPPER] Init notice: {e}")
+
         # Start Gamepad Teleoperation Controller
         self.gamepad_teleop: Optional[UR5eGamepadTeleop] = None
         self.gamepad_teleop_active: bool = False
@@ -1133,6 +1159,9 @@ class UR5ePolicyTesterStudio(QMainWindow):
                     mock=self.mock_mode,
                     parent=self,
                 )
+                if self.gripper is not None:
+                    self.gamepad_teleop.set_gripper(self.gripper)
+                    self.gamepad_teleop.gripper_width_updated.connect(self.on_gamepad_gripper_width_updated)
                 self.gamepad_teleop.set_base_angle_provider(
                     lambda: self.robot_worker.get_latest_joints().get("shoulder_pan", 0.0)
                 )
@@ -1719,6 +1748,21 @@ class UR5ePolicyTesterStudio(QMainWindow):
             border-radius: 4px;
         """)
         gamepad_row2.addWidget(self.lbl_gamepad_vel)
+
+        # Gripper Gamepad Shortcut Badge
+        self.lbl_gamepad_gripper_hint = QLabel("🤏 Gripper: [A] Close | [B] Open")
+        self.lbl_gamepad_gripper_hint.setStyleSheet("""
+            color: #10b981;
+            font-family: monospace;
+            font-size: 11px;
+            font-weight: bold;
+            padding: 4px 8px;
+            background-color: #064e3b;
+            border: 1px solid #059669;
+            border-radius: 4px;
+        """)
+        self.lbl_gamepad_gripper_hint.setToolTip("Xbox Controller: Hold [A] to slowly CLOSE gripper | Hold [B] to slowly OPEN gripper")
+        gamepad_row2.addWidget(self.lbl_gamepad_gripper_hint)
         gamepad_layout.addLayout(gamepad_row2)
 
         # Inversion Checkboxes Row
@@ -2135,6 +2179,121 @@ class UR5ePolicyTesterStudio(QMainWindow):
             grid_jog.addWidget(slider, idx, 1)
             grid_jog.addWidget(input_box, idx, 2)
             grid_jog.addWidget(btn_move_joint, idx, 3)
+
+        # Gripper Control Row (OnRobot 2FG14)
+        sep_line = QFrame()
+        sep_line.setFrameShape(QFrame.Shape.HLine)
+        sep_line.setFrameShadow(QFrame.Shadow.Sunken)
+        sep_line.setStyleSheet("background-color: #334155; margin-top: 4px; margin-bottom: 4px;")
+        grid_jog.addWidget(sep_line, 6, 0, 1, 4)
+
+        gripper_lbl = QLabel("🤏 Gripper")
+        gripper_lbl.setStyleSheet("color: #10b981; font-weight: bold; font-size: 11px;")
+        gripper_lbl.setToolTip("OnRobot 2FG14 Gripper Opening Width (55mm to 105mm)")
+
+        self.gripper_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gripper_slider.setMinimum(55)
+        self.gripper_slider.setMaximum(105)
+        self.gripper_slider.setValue(72)
+        self.gripper_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #1e293b;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #10b981;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #f1f5f9;
+                width: 14px;
+                margin-top: -5px;
+                margin-bottom: -5px;
+                border-radius: 7px;
+                border: 1px solid #10b981;
+            }
+        """)
+        self.gripper_slider.setToolTip("Drag slider to open / close OnRobot 2FG gripper (55 - 105 mm)")
+
+        self.gripper_input = QLineEdit("72.0")
+        self.gripper_input.setFixedWidth(56)
+        self.gripper_input.setFixedHeight(22)
+        self.gripper_input.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.gripper_input.setStyleSheet("""
+            QLineEdit {
+                background-color: #0b1120;
+                color: #10b981;
+                font-family: monospace;
+                font-size: 10px;
+                font-weight: bold;
+                border: 1px solid #334155;
+                border-radius: 3px;
+                padding: 1px 3px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #10b981;
+                background-color: #0f172a;
+            }
+        """)
+        self.gripper_input.setToolTip("Type target width in mm (55 - 105) and press Enter")
+
+        self.btn_move_gripper = QPushButton("Move")
+        self.btn_move_gripper.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_move_gripper.setFixedWidth(46)
+        self.btn_move_gripper.setFixedHeight(22)
+        self.btn_move_gripper.setStyleSheet("""
+            QPushButton {
+                background-color: #059669;
+                color: #ffffff;
+                font-size: 10px;
+                font-weight: bold;
+                border-radius: 3px;
+                border: 1px solid #10b981;
+                padding: 1px 4px;
+            }
+            QPushButton:hover {
+                background-color: #047857;
+            }
+        """)
+        self.btn_move_gripper.setToolTip("Command gripper to the entered target width")
+
+        self.gripper_slider.sliderPressed.connect(self.on_gripper_slider_pressed)
+        self.gripper_slider.valueChanged.connect(self.on_gripper_slider_value_changed)
+        self.gripper_slider.sliderReleased.connect(self.on_gripper_slider_released)
+        self.gripper_input.returnPressed.connect(self.on_gripper_input_committed)
+        self.btn_move_gripper.clicked.connect(self.on_gripper_input_committed)
+
+        grid_jog.addWidget(gripper_lbl, 7, 0)
+        grid_jog.addWidget(self.gripper_slider, 7, 1)
+        grid_jog.addWidget(self.gripper_input, 7, 2)
+        grid_jog.addWidget(self.btn_move_gripper, 7, 3)
+
+        # Quick Gripper Action Buttons Row (Close 55mm / Half 80mm / Open 105mm)
+        row_quick_grip = QHBoxLayout()
+        row_quick_grip.setSpacing(6)
+        self.btn_grip_close = QPushButton("🤏 Close (55mm)")
+        self.btn_grip_close.setFixedHeight(22)
+        self.btn_grip_close.setStyleSheet("background-color: #1e293b; color: #f87171; font-size: 10px; font-weight: bold; border: 1px solid #334155; border-radius: 3px;")
+        self.btn_grip_close.setToolTip("Quick Close gripper to minimum width (55mm) - Xbox Button [A]")
+        self.btn_grip_close.clicked.connect(lambda: self.command_gripper_width(55.0))
+
+        self.btn_grip_half = QPushButton("↔ 80mm")
+        self.btn_grip_half.setFixedHeight(22)
+        self.btn_grip_half.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-size: 10px; font-weight: bold; border: 1px solid #334155; border-radius: 3px;")
+        self.btn_grip_half.setToolTip("Move gripper to mid-aperture (80mm)")
+        self.btn_grip_half.clicked.connect(lambda: self.command_gripper_width(80.0))
+
+        self.btn_grip_open = QPushButton("👐 Open (105mm)")
+        self.btn_grip_open.setFixedHeight(22)
+        self.btn_grip_open.setStyleSheet("background-color: #1e293b; color: #34d399; font-size: 10px; font-weight: bold; border: 1px solid #334155; border-radius: 3px;")
+        self.btn_grip_open.setToolTip("Quick Open gripper to maximum width (105mm) - Xbox Button [B]")
+        self.btn_grip_open.clicked.connect(lambda: self.command_gripper_width(105.0))
+
+        row_quick_grip.addWidget(self.btn_grip_close)
+        row_quick_grip.addWidget(self.btn_grip_half)
+        row_quick_grip.addWidget(self.btn_grip_open)
+        grid_jog.addLayout(row_quick_grip, 8, 0, 1, 4)
 
         jog_layout.addLayout(grid_jog)
         right_column.addWidget(jog_box)
@@ -2995,6 +3154,70 @@ class UR5ePolicyTesterStudio(QMainWindow):
         print(f"[MOTION] Jogging {j_name} to {val_deg:+5.1f}° ({target_rad:+.4f} rad)...")
         self.status_bar.showMessage(f"Jogging {j_name} to {val_deg:+5.1f}°...", 3000)
         self.robot_worker.request_move_pose(action)
+
+    # -------------------------------------------------------------------------
+    # Gripper Manual Control Slots (Slider, Input Box & Gamepad Teleop)
+    # -------------------------------------------------------------------------
+    def on_gripper_slider_pressed(self):
+        self._user_dragging_gripper = True
+
+    def on_gripper_slider_value_changed(self, val: int):
+        if hasattr(self, "gripper_input"):
+            self.gripper_input.setText(f"{float(val):.1f}")
+
+    def on_gripper_slider_released(self):
+        self._user_dragging_gripper = False
+        if hasattr(self, "gripper_slider"):
+            val = float(self.gripper_slider.value())
+            self.command_gripper_width(val)
+
+    def on_gripper_input_committed(self):
+        if hasattr(self, "gripper_input"):
+            text = self.gripper_input.text().replace("mm", "").strip()
+            try:
+                val = float(text)
+                self.command_gripper_width(val)
+            except ValueError:
+                pass
+
+    def command_gripper_width(self, width_mm: float):
+        min_w = getattr(self.gripper, "min_width_mm", 55.0) if self.gripper else 55.0
+        max_w = getattr(self.gripper, "max_width_mm", 105.0) if self.gripper else 105.0
+        clamped = max(min_w, min(max_w, float(width_mm)))
+
+        if hasattr(self, "gripper_slider"):
+            self.gripper_slider.blockSignals(True)
+            self.gripper_slider.setValue(int(round(clamped)))
+            self.gripper_slider.blockSignals(False)
+
+        if hasattr(self, "gripper_input"):
+            self.gripper_input.setText(f"{clamped:.1f}")
+
+        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop is not None:
+            self.gamepad_teleop.set_gripper_target_width(clamped)
+
+        if self.gripper is not None and self.gripper.is_connected:
+            try:
+                self.gripper.grip(clamped, force_n=30.0, speed_percent=50, wait=False)
+                print(f"[GRIPPER] Commanded width to {clamped:.1f} mm (30N force).")
+                self.status_bar.showMessage(f"Gripper moving to {clamped:.1f} mm...", 3000)
+            except Exception as e:
+                print(f"[GRIPPER ERROR] Failed to command gripper: {e}")
+                self.status_bar.showMessage(f"Gripper command failed: {e}", 3000)
+        else:
+            print(f"[GRIPPER SIM] Commanded width: {clamped:.1f} mm.")
+            self.status_bar.showMessage(f"Gripper set to {clamped:.1f} mm (Simulation).", 3000)
+
+    @pyqtSlot(float)
+    def on_gamepad_gripper_width_updated(self, width_mm: float):
+        """Called live when the user holds Xbox [A] (close) or [B] (open)."""
+        if not getattr(self, "_user_dragging_gripper", False):
+            if hasattr(self, "gripper_slider"):
+                self.gripper_slider.blockSignals(True)
+                self.gripper_slider.setValue(int(round(width_mm)))
+                self.gripper_slider.blockSignals(False)
+            if hasattr(self, "gripper_input"):
+                self.gripper_input.setText(f"{width_mm:.1f}")
 
     # -------------------------------------------------------------------------
     # Policy Evaluation Rollout Workflow

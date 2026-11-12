@@ -20,7 +20,7 @@ Features:
 - Smooth acceleration ramping (slew rate limiter) protecting Wrist 1 from protective stops.
 - Dynamic user scaling for Speed (10%-100%, default 50%) and Acceleration (10%-100%, default 50%).
 - Universal support for Xbox, PlayStation, and generic gamepads.
-- Standard default start pose: [-85, -72, -60, 145, -84, 275].
+- Standard default start pose: [-80, -45, -100, 150, -85, 60].
 """
 
 from __future__ import annotations
@@ -125,8 +125,8 @@ except ImportError:
             self.mutex.unlock()
 
 
-# Standard default start pose in degrees and radians: [-85, -72, -60, 145, -84, 275]
-DEFAULT_START_JOINTS_DEG = [-85.0, -72.0, -60.0, 145.0, -84.0, 275.0]
+# Standard default start pose in degrees and radians: [-80, -45, -100, 150, -85, 60]
+DEFAULT_START_JOINTS_DEG = [-80.0, -45.0, -100.0, 150.0, -85.0, 60.0]
 DEFAULT_START_JOINTS_RAD = [math.radians(x) for x in DEFAULT_START_JOINTS_DEG]
 UR5E_JOINT_NAMES = [
     "shoulder_pan",
@@ -422,7 +422,7 @@ class UR5eGamepadTeleop(QThread):
 
         # Gripper control state
         self.gripper: Optional[Any] = None
-        self._gripper_target_width: float = 72.0
+        self._gripper_target_width: float = 105.0  # Default wide open (105.0 mm)
         self._last_gripper_cmd_time: float = 0.0
         self._gripper_button_active: bool = False
 

@@ -151,16 +151,17 @@ HOME_JOINTS_DICT = {
     "wrist_3": 0.0,
 }
 
-# Default Start Position: [-85°, -72°, -60°, 145°, -84°, 275°]
-DEFAULT_START_JOINTS = [-85.0, -72.0, -60.0, 145.0, -84.0, 275.0]
+# Default Start Position: [-80°, -45°, -100°, 150°, -85°, 60°], Gripper 105.0 mm (wide open)
+DEFAULT_START_JOINTS = [-80.0, -45.0, -100.0, 150.0, -85.0, 60.0]
 DEFAULT_START_JOINTS_DICT = {
-    "shoulder_pan": -85.0,
-    "shoulder_lift": -72.0,
-    "elbow": -60.0,
-    "wrist_1": 145.0,
-    "wrist_2": -84.0,
-    "wrist_3": 275.0,
+    "shoulder_pan": -80.0,
+    "shoulder_lift": -45.0,
+    "elbow": -100.0,
+    "wrist_1": 150.0,
+    "wrist_2": -85.0,
+    "wrist_3": 60.0,
 }
+DEFAULT_START_GRIPPER_MM = 105.0
 
 
 def detect_available_cameras() -> List[Tuple[int, str]]:
@@ -1074,8 +1075,9 @@ class UR5ePolicyTesterStudio(QMainWindow):
             else:
                 self.active_model_path = Path(DEFAULT_MODEL_PATH).resolve() if "DEFAULT_MODEL_PATH" in globals() else (DEFAULT_TRAIN_DIR / "checkpoint")
 
-        # Custom Start Position (defaults to DEFAULT_START_JOINTS_DICT: -85°, -72°, -60°, 145°, -84°, 275°)
+        # Custom Start Position (defaults to DEFAULT_START_JOINTS_DICT: -80°, -45°, -100°, 150°, -85°, 60°)
         self.start_position: Dict[str, float] = dict(DEFAULT_START_JOINTS_DICT)
+        self.start_gripper_mm: float = DEFAULT_START_GRIPPER_MM
         self.freedrive_active: bool = False
         self._user_dragging_joint: Optional[str] = None
         self._user_modified_joints: set[str] = set()
@@ -2194,7 +2196,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.gripper_slider = QSlider(Qt.Orientation.Horizontal)
         self.gripper_slider.setMinimum(55)
         self.gripper_slider.setMaximum(105)
-        self.gripper_slider.setValue(72)
+        self.gripper_slider.setValue(int(round(DEFAULT_START_GRIPPER_MM)))
         self.gripper_slider.setStyleSheet("""
             QSlider::groove:horizontal {
                 height: 4px;
@@ -2216,7 +2218,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
         """)
         self.gripper_slider.setToolTip("Drag slider to open / close OnRobot 2FG gripper (55 - 105 mm)")
 
-        self.gripper_input = QLineEdit("72.0")
+        self.gripper_input = QLineEdit(f"{DEFAULT_START_GRIPPER_MM:.1f}")
         self.gripper_input.setFixedWidth(56)
         self.gripper_input.setFixedHeight(22)
         self.gripper_input.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)

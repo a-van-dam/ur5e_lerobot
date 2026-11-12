@@ -135,12 +135,12 @@ class MockUR5eRobot:
         self._freedrive_active = False
         self.sock = None
         self._joints = {
-            "shoulder_pan.pos": math.radians(-85.0),
-            "shoulder_lift.pos": math.radians(-72.0),
-            "elbow.pos": math.radians(-60.0),
-            "wrist_1.pos": math.radians(145.0),
-            "wrist_2.pos": math.radians(-84.0),
-            "wrist_3.pos": math.radians(275.0),
+            "shoulder_pan.pos": math.radians(-80.0),
+            "shoulder_lift.pos": math.radians(-45.0),
+            "elbow.pos": math.radians(-100.0),
+            "wrist_1.pos": math.radians(150.0),
+            "wrist_2.pos": math.radians(-85.0),
+            "wrist_3.pos": math.radians(60.0),
         }
 
     def connect(self):

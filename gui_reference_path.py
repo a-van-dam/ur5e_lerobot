@@ -6,32 +6,30 @@ Dedicated graphical interface for recording, saving, loading, and playing
 back deterministic reference trajectories for Hugging Face LeRobot on the
 UR5e arm with OnRobot 2FG14 Modbus TCP gripper.
 
-Key Capabilities:
-- Status Bar & Indicators:
-  * UR5e connection status (RTDE Port 30004 & URScript Port 30002)
-  * OnRobot 2FG14 Modbus TCP connection status (Port 502)
-  * Hardware Gamepad connection & teleoperation status
-  * Mode indicator (IDLE, RECORDING, PLAYING, STOPPED)
-- Trajectory Recording (30 Hz default):
-  * Large, prominent toggle button (Start Recording / Stop Recording)
-  * Real-time telemetry logging of Timestamp, Joint angles (q0..q5),
-    Cartesian TCP pose (x, y, z, rx, ry, rz), and Gripper opening width (mm)
-  * Gamepad integration: drive the robot freely during recording
-  * Stopwatch & sample frame counter
-- Trajectory Persistence:
-  * "Save Path" button: saves buffer to 'reference_paths/ref_path_YYYYMMDD_HHMM.csv' (or JSON)
-  * "Load Path" button: file dialog targeted at 'reference_paths/'
-  * Quick-access recent path list with one-click loading
-- Trajectory Playback:
-  * "Play Path" button: smooth deterministic reproduction using 'servoj' streaming
-  * Optional pre-playback auto-alignment to start waypoint
-  * Synchronized Modbus commands to OnRobot gripper
-  * Prominent RED "STOP" button: immediate emergency halt sending 'stopj()'/'stopl()'
-- Full Manual Jogging & Gamepad Controls (identical to gui_recorder.py):
-  * Start & Home pose controls (Go to Temp Start, Set New Start, Go Home, Move to Target, Sync)
-  * 6-DoF joint jog sliders (-360° to +360°) and numeric angle inputs
-  * OnRobot 2FG aperture slider (55 - 105 mm) and preset buttons
-  * Gamepad speed & acceleration scaling sliders, axis inversion toggles, and shortcuts
+Features:
+1. Dual Camera Live Feeds:
+   - Simultaneous real-time feeds from Workspace (Cam 1) and Wrist Flange (Cam 2)
+   - Visual guidance for operator control (NOT recorded as part of reference path)
+   - Device selectors, resolution presets, live FPS counters, and mock test pattern fallbacks
+2. Trajectory Start Position Tracking & Automatic Pre-Replay Alignment:
+   - Start position is recorded and serialized into CSV comments and JSON metadata
+   - Default Start Coordinates: -80°, -45°, -100°, 150°, -85°, 60°, Gripper 105.0 mm (wide open)
+   - During playback, automatically detects if the arm is not at the file's start position
+     and smoothly navigates there before waypoint streaming begins
+3. Advanced Control & Workflow Toggles:
+   - Checkboxes for inverting both Left Stick (L/R translation) and Right Stick (Base rotation)
+   - Checkbox to automatically return the robot to the Start Position after recording finishes
+4. Trajectory Management:
+   - Save, load, and delete recorded reference paths via GUI button and confirmation dialog
+   - Instant file inspection and selection
+5. Status Indicators:
+   - UR5e connection status, Gripper Modbus connection status, Gamepad hardware status
+6. Emergency Safety STOP:
+   - Instant halt sending stopj()/stopl() to UR5e and stopping the gripper
+7. Jogging, Start/Home Poses & Gripper Aperture:
+   - Canonical Home Pose, Go to Temp Start, Set New Start, Move to Target, Sync
+   - 6-DoF Joint Jog Sliders (-360° to +360°) and numeric inputs
+   - Gripper aperture slider (55 - 105 mm) with quick presets
 """
 
 from __future__ import annotations
@@ -43,7 +41,10 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import cv2
+import numpy as np
 
 # PyQt6 UI Framework
 from PyQt6.QtCore import (
@@ -60,7 +61,9 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QColor,
     QFont,
+    QImage,
     QKeySequence,
+    QPixmap,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -132,6 +135,8 @@ DEFAULT_ROBOT_IP = "192.168.1.102"
 DEFAULT_GRIPPER_IP = "192.168.1.1"
 DEFAULT_COMMAND_PORT = 30002
 DEFAULT_FPS = 30
+DEFAULT_CAMERA_1_INDEX = 4       # Workspace Camera (/dev/video4)
+DEFAULT_CAMERA_2_INDEX = 6       # Wrist Flange Camera (/dev/video6)
 
 HOME_JOINTS_DICT: Dict[str, float] = {
     "shoulder_pan": 0.0,
@@ -142,14 +147,311 @@ HOME_JOINTS_DICT: Dict[str, float] = {
     "wrist_3": 0.0,
 }
 
+# Requested Default Start Coordinates: -80, -45, -100, 150, -85, 60 (deg), Gripper wide open (105.0 mm)
 DEFAULT_START_JOINTS_DICT: Dict[str, float] = {
-    "shoulder_pan": -85.0,
-    "shoulder_lift": -72.0,
-    "elbow": -60.0,
-    "wrist_1": 145.0,
-    "wrist_2": -84.0,
-    "wrist_3": 275.0,
+    "shoulder_pan": -80.0,
+    "shoulder_lift": -45.0,
+    "elbow": -100.0,
+    "wrist_1": 150.0,
+    "wrist_2": -85.0,
+    "wrist_3": 60.0,
 }
+
+DEFAULT_START_GRIPPER_MM: float = 105.0  # As wide open as possible for OnRobot 2FG
+
+
+def detect_available_cameras() -> List[Tuple[int, str]]:
+    """
+    Scans Linux v4l2 device nodes and returns a list of (camera_index, user_friendly_label).
+    Filters out metadata-only sub-nodes using the sysfs 'index' attribute.
+    """
+    cameras = []
+    v4l_dir = Path("/sys/class/video4linux")
+    if v4l_dir.exists():
+        devs = sorted(
+            v4l_dir.glob("video*"),
+            key=lambda p: int(p.name.replace("video", "")) if p.name.replace("video", "").isdigit() else 999,
+        )
+        for dev in devs:
+            idx_file = dev / "index"
+            if idx_file.exists():
+                try:
+                    if idx_file.read_text().strip() != "0":
+                        continue
+                except Exception:
+                    pass
+            idx = int(dev.name.replace("video", ""))
+            name_file = dev / "name"
+            dev_name = name_file.read_text().strip() if name_file.exists() else f"Camera {idx}"
+            clean_name = dev_name.split(":")[0].strip()
+            cameras.append((idx, f"/dev/video{idx}: {clean_name}"))
+
+    if not cameras:
+        cameras = [
+            (DEFAULT_CAMERA_1_INDEX, f"/dev/video{DEFAULT_CAMERA_1_INDEX}: Workspace Camera"),
+            (DEFAULT_CAMERA_2_INDEX, f"/dev/video{DEFAULT_CAMERA_2_INDEX}: Wrist Camera"),
+        ]
+    return cameras
+
+
+# =============================================================================
+# Camera Capture Worker & Display Widget
+# =============================================================================
+
+class CameraWorker(QThread):
+    """
+    Dedicated QThread capturing frames from OpenCV camera device.
+    Runs asynchronously at target FPS to provide smooth operator feedback.
+    """
+
+    frame_ready = pyqtSignal(int, np.ndarray)  # (camera_id, bgr_image)
+    fps_updated = pyqtSignal(int, float)       # (camera_id, measured_fps)
+    status_signal = pyqtSignal(int, bool, str) # (camera_id, is_connected, message)
+
+    def __init__(
+        self,
+        camera_id: int,
+        target_fps: int = 30,
+        width: int = 320,
+        height: int = 240,
+        mock: bool = False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.camera_id = camera_id
+        self.target_fps = target_fps
+        self.target_width = width
+        self.target_height = height
+        self.mock = mock
+        self._running = False
+        self._cap: Optional[cv2.VideoCapture] = None
+        self._mutex = QMutex()
+        self._reconnect_requested = False
+
+    def set_camera_id(self, new_id: int):
+        with QMutexLocker(self._mutex):
+            self.camera_id = new_id
+            self._reconnect_requested = True
+
+    def set_resolution(self, width: int, height: int):
+        with QMutexLocker(self._mutex):
+            self.target_width = width
+            self.target_height = height
+            cap = self._cap
+        if cap is not None and cap.isOpened():
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            except Exception:
+                pass
+
+    def request_reconnect(self):
+        with QMutexLocker(self._mutex):
+            self._reconnect_requested = True
+
+    def run(self):
+        self._running = True
+
+        if not self.mock:
+            self._cap = cv2.VideoCapture(self.camera_id)
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
+            self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+
+            if not self._cap.isOpened():
+                self.status_signal.emit(
+                    self.camera_id,
+                    False,
+                    f"Camera /dev/video{self.camera_id} unavailable (Fallback synthetic feed)",
+                )
+                self.mock = True
+            else:
+                self.status_signal.emit(
+                    self.camera_id,
+                    True,
+                    f"Camera /dev/video{self.camera_id} connected @ {self.target_fps} FPS",
+                )
+
+        sim_t = 0.0
+        fps_counter = 0
+        fps_start = time.perf_counter()
+
+        while self._running:
+            t0 = time.perf_counter()
+
+            with QMutexLocker(self._mutex):
+                tw, th = self.target_width, self.target_height
+                current_id = self.camera_id
+                reconnect_needed = self._reconnect_requested
+                self._reconnect_requested = False
+
+            if reconnect_needed and not self.mock:
+                if self._cap is not None:
+                    try:
+                        self._cap.release()
+                    except Exception:
+                        pass
+                    self._cap = None
+                time.sleep(0.05)
+                self._cap = cv2.VideoCapture(current_id)
+                self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, tw)
+                self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, th)
+                self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+                if self._cap.isOpened():
+                    self.status_signal.emit(
+                        current_id,
+                        True,
+                        f"Camera /dev/video{current_id} reconnected @ {self.target_fps} FPS",
+                    )
+
+            if not self.mock and self._cap and self._cap.isOpened():
+                ret, frame = self._cap.read()
+                if not ret or frame is None:
+                    time.sleep(0.01)
+                    continue
+                if frame.shape[1] != tw or frame.shape[0] != th:
+                    frame = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_AREA)
+            else:
+                # Synthetic animated test frame with resolution and timestamp
+                frame = np.zeros((th, tw, 3), dtype=np.uint8)
+                sim_t += 0.04
+                gx = int(128 + 60 * math.sin(sim_t + current_id))
+                gy = int(128 + 60 * math.cos(sim_t * 0.8 + current_id))
+                frame[:, :, 0] = 25
+                frame[:, :, 1] = int(gx * 0.35)
+                frame[:, :, 2] = int(gy * 0.45)
+
+                step = max(24, min(tw, th) // 7)
+                for x in range(0, tw, step):
+                    cv2.line(frame, (x, 0), (x, th), (45, 55, 72), 1)
+                for y in range(0, th, step):
+                    cv2.line(frame, (0, y), (tw, y), (45, 55, 72), 1)
+
+                cv2.putText(
+                    frame,
+                    f"SIM CAM {current_id}: {tw}x{th}",
+                    (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (56, 189, 248),
+                    1,
+                    cv2.LINE_AA,
+                )
+                ts_str = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-4]
+                cv2.putText(
+                    frame,
+                    ts_str,
+                    (12, th - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (148, 163, 184),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            self.frame_ready.emit(current_id, frame)
+
+            # Benchmark FPS
+            fps_counter += 1
+            if time.perf_counter() - fps_start >= 1.0:
+                measured_fps = fps_counter / (time.perf_counter() - fps_start)
+                self.fps_updated.emit(current_id, measured_fps)
+                fps_counter = 0
+                fps_start = time.perf_counter()
+
+            elapsed = time.perf_counter() - t0
+            sleep_time = (1.0 / max(1, self.target_fps)) - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            self._cap = None
+        self._running = False
+
+    def stop(self):
+        self._running = False
+        self.wait(1500)
+
+
+class CameraFeedWidget(QWidget):
+    """Clean video feed viewport widget displaying camera feed with FPS and status."""
+
+    def __init__(self, title: str, camera_id: int, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.camera_id = camera_id
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        self.lbl_title = QLabel(f"<b>{self.title}</b>")
+        self.lbl_title.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        header.addWidget(self.lbl_title)
+
+        header.addStretch()
+
+        self.lbl_badge = QLabel("LIVE")
+        self.lbl_badge.setStyleSheet("""
+            color: #10b981;
+            font-size: 9px;
+            font-weight: 800;
+            padding: 1px 5px;
+            background-color: rgba(16, 185, 129, 0.15);
+            border: 1px solid rgba(16, 185, 129, 0.4);
+            border-radius: 3px;
+        """)
+        header.addWidget(self.lbl_badge)
+
+        self.lbl_fps = QLabel("0.0 FPS")
+        self.lbl_fps.setStyleSheet("color: #38bdf8; font-family: monospace; font-size: 10px; font-weight: bold;")
+        header.addWidget(self.lbl_fps)
+
+        layout.addLayout(header)
+
+        self.video_canvas = QLabel("Initializing Video Feed...")
+        self.video_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_canvas.setStyleSheet("""
+            background-color: #050811;
+            color: #64748b;
+            font-weight: bold;
+            font-size: 11px;
+            border: 1px solid #1e293b;
+            border-radius: 4px;
+        """)
+        self.video_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_canvas.setMinimumSize(220, 160)
+        layout.addWidget(self.video_canvas)
+
+    @pyqtSlot(int, float)
+    def update_fps(self, cam_id: int, fps: float):
+        if cam_id == self.camera_id:
+            self.lbl_fps.setText(f"{fps:4.1f} FPS")
+
+    @pyqtSlot(int, np.ndarray)
+    def update_frame(self, cam_id: int, frame_bgr: np.ndarray):
+        if cam_id != self.camera_id:
+            return
+
+        h, w, ch = frame_bgr.shape
+        bytes_per_line = ch * w
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        qimg = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+
+        canvas_w = max(10, self.video_canvas.width())
+        canvas_h = max(10, self.video_canvas.height())
+        scaled_pixmap = QPixmap.fromImage(qimg).scaled(
+            canvas_w,
+            canvas_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.video_canvas.setPixmap(scaled_pixmap)
 
 
 # =============================================================================
@@ -183,12 +485,17 @@ class RobotRTDEWorker(QThread):
         self._motion_start_time = 0.0
         self._motion_timeout = 8.0
 
-        # Cached telemetry state
+        # Cached telemetry state initialized to default start coordinates
         self._latest_q: Dict[str, float] = {
             j: math.radians(DEFAULT_START_JOINTS_DICT[j]) for j in UR5E_JOINT_NAMES
         }
         self._latest_tcp: List[float] = [0.35, -0.20, 0.45, 2.22, -2.22, 0.0]
         self._mock_velocity: List[float] = [0.0] * 6
+
+    @property
+    def is_motion_in_progress(self) -> bool:
+        with QMutexLocker(self._cmd_lock):
+            return self._motion_in_progress
 
     def get_latest_joints(self) -> Dict[str, float]:
         with QMutexLocker(self._cmd_lock):
@@ -260,7 +567,6 @@ class RobotRTDEWorker(QThread):
 
                     if self._robot and hasattr(self._robot, "send_action"):
                         try:
-                            # Reformat dict keys to f"{j}.pos"
                             action_dict = {f"{j}.pos": self._motion_target_q[i] for i, j in enumerate(UR5E_JOINT_NAMES)}
                             self._robot.send_action(action_dict)
                         except Exception as err:
@@ -332,13 +638,11 @@ class RobotRTDEWorker(QThread):
                     }
                 self.telemetry_signal.emit(payload)
 
-            # High-rate 125 Hz loop period (8ms)
             elapsed = time.perf_counter() - t0
             sleep_s = 0.008 - elapsed
             if sleep_s > 0:
                 time.sleep(sleep_s)
 
-        # Cleanup on thread exit
         if self._robot is not None:
             try:
                 self._robot.disconnect()
@@ -360,7 +664,7 @@ class RobotRTDEWorker(QThread):
 class ReferencePathStudio(QMainWindow):
     """
     Main application window for UR5e Reference Path recording, saving,
-    loading, and deterministic playback.
+    loading, and deterministic playback with dual live camera operator feeds.
     """
 
     def __init__(
@@ -368,23 +672,27 @@ class ReferencePathStudio(QMainWindow):
         robot_ip: str = DEFAULT_ROBOT_IP,
         gripper_ip: str = DEFAULT_GRIPPER_IP,
         target_fps: int = DEFAULT_FPS,
+        camera_1_index: int = DEFAULT_CAMERA_1_INDEX,
+        camera_2_index: int = DEFAULT_CAMERA_2_INDEX,
         mock_mode: bool = False,
     ):
         super().__init__()
         self.robot_ip = robot_ip
         self.gripper_host = gripper_ip
         self.target_fps = target_fps
+        self.camera_1_index = camera_1_index
+        self.camera_2_index = camera_2_index
         self.mock_mode = mock_mode
 
-        # Active Start Position (defaults to DEFAULT_START_JOINTS_DICT)
+        # Active Start Position initialized to requested defaults:
+        # [-80, -45, -100, 150, -85, 60] deg, Gripper: 105.0 mm (wide open)
         self.start_position: Dict[str, float] = dict(DEFAULT_START_JOINTS_DICT)
+        self.start_gripper_mm: float = DEFAULT_START_GRIPPER_MM
 
         # Staged jog values
         self._user_targets: Dict[str, float] = {}
         self._user_modified_joints: set[str] = set()
         self._user_dragging_joint: Optional[str] = None
-
-        # Playback status tracker
         self._last_progress_update_time = 0.0
 
         # Initialize PathManager Backend
@@ -393,6 +701,7 @@ class ReferencePathStudio(QMainWindow):
             gripper_host=self.gripper_host,
             mock=self.mock_mode,
         )
+        self.path_manager.set_start_position(self.start_position, gripper_width=self.start_gripper_mm)
 
         # Initialize OnRobot Gripper
         self.gripper: Optional[OnRobot2FGModbus] = None
@@ -401,6 +710,9 @@ class ReferencePathStudio(QMainWindow):
         # Build User Interface
         self.init_ui()
         self.apply_theme()
+
+        # Start Camera Workers for Dual Live Operator Feeds
+        self._init_cameras()
 
         # Start Robot RTDE Background Worker
         self.robot_worker = RobotRTDEWorker(self.robot_ip, self.mock_mode, parent=self)
@@ -425,7 +737,7 @@ class ReferencePathStudio(QMainWindow):
         # Scan initial reference paths
         self.refresh_saved_paths_list()
 
-        self.log(f"UR5e Reference Path Studio initialized. Robot IP: {self.robot_ip} | Gripper: {self.gripper_host}")
+        self.log(f"UR5e Reference Path Studio initialized. Robot: {self.robot_ip} | Gripper: {self.gripper_host}")
         if self.mock_mode:
             self.log("Running in SIMULATION/MOCK mode. No physical hardware required.")
 
@@ -525,8 +837,36 @@ class ReferencePathStudio(QMainWindow):
         """)
 
     # -------------------------------------------------------------------------
-    # Hardware Initialization Helpers
+    # Hardware & Camera Initialization Helpers
     # -------------------------------------------------------------------------
+
+    def _init_cameras(self):
+        """Initializes asynchronous camera feeds for visual operator feedback."""
+        # Camera 1 (Workspace)
+        self.camera_worker_1 = CameraWorker(
+            camera_id=self.camera_1_index,
+            target_fps=self.target_fps,
+            width=320,
+            height=240,
+            mock=self.mock_mode,
+            parent=self,
+        )
+        self.camera_worker_1.frame_ready.connect(self.cam_widget_1.update_frame)
+        self.camera_worker_1.fps_updated.connect(self.cam_widget_1.update_fps)
+        self.camera_worker_1.start()
+
+        # Camera 2 (Wrist Flange)
+        self.camera_worker_2 = CameraWorker(
+            camera_id=self.camera_2_index,
+            target_fps=self.target_fps,
+            width=320,
+            height=240,
+            mock=self.mock_mode,
+            parent=self,
+        )
+        self.camera_worker_2.frame_ready.connect(self.cam_widget_2.update_frame)
+        self.camera_worker_2.fps_updated.connect(self.cam_widget_2.update_fps)
+        self.camera_worker_2.start()
 
     def _init_gripper(self):
         """Initializes connection to OnRobot 2FG14 gripper."""
@@ -576,6 +916,12 @@ class ReferencePathStudio(QMainWindow):
             if hasattr(self, "slider_gamepad_accel"):
                 self.gamepad_teleop.set_accel_percentage(self.slider_gamepad_accel.value())
 
+            # Apply initial analog stick inversion settings
+            if hasattr(self, "chk_invert_left"):
+                self.gamepad_teleop.set_invert_left_horizontal(self.chk_invert_left.isChecked())
+            if hasattr(self, "chk_invert_right"):
+                self.gamepad_teleop.set_invert_right_horizontal(self.chk_invert_right.isChecked())
+
             if self.mock_mode:
                 self.gamepad_teleop.set_velocity_callback(self.robot_worker.apply_cartesian_velocity)
 
@@ -588,7 +934,7 @@ class ReferencePathStudio(QMainWindow):
         joints_dict = self.robot_worker.get_latest_joints()
         q = [joints_dict.get(j, 0.0) for j in UR5E_JOINT_NAMES]
         tcp = self.robot_worker.get_latest_tcp()
-        gripper_w = self.gripper.get_width() if (self.gripper and self.gripper.is_connected) else 72.0
+        gripper_w = self.gripper.get_width() if (self.gripper and self.gripper.is_connected) else self.start_gripper_mm
         return q, tcp, gripper_w
 
     # -------------------------------------------------------------------------
@@ -597,8 +943,8 @@ class ReferencePathStudio(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("UR5e Reference Path Studio — Phase 1 Deterministic Trajectory Tool")
-        self.resize(1280, 850)
-        self.setMinimumSize(1024, 700)
+        self.resize(1440, 920)
+        self.setMinimumSize(1100, 720)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -610,7 +956,7 @@ class ReferencePathStudio(QMainWindow):
         top_bar = self._build_top_status_bar()
         root_layout.addLayout(top_bar)
 
-        # 2. Main Horizontal Splitter (Left: Path Workflow, Right: Jog & Teleop)
+        # 2. Main Horizontal Splitter (Left: Feeds & Workflow, Right: Jog & Teleop)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(4)
 
@@ -620,15 +966,15 @@ class ReferencePathStudio(QMainWindow):
         right_panel = self._build_right_jog_panel()
         splitter.addWidget(right_panel)
 
-        splitter.setStretchFactor(0, 5)
-        splitter.setStretchFactor(1, 5)
+        splitter.setStretchFactor(0, 6)
+        splitter.setStretchFactor(1, 4)
         root_layout.addWidget(splitter, stretch=1)
 
         # Status Bar
         self.status_bar = QStatusBar()
         self.status_bar.setStyleSheet("background-color: #0b1120; color: #94a3b8; font-size: 11px;")
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready. Record a golden deterministic trajectory or load an existing path.")
+        self.status_bar.showMessage("Ready. Record golden reference trajectory or select an existing path.")
 
     # -------------------------------------------------------------------------
     # Top Status Bar
@@ -720,16 +1066,94 @@ class ReferencePathStudio(QMainWindow):
         return top_bar
 
     # -------------------------------------------------------------------------
-    # Left Panel: Reference Path Workflow & Playback
+    # Left Panel: Cameras, Workflow, HUD, File I/O & Playback
     # -------------------------------------------------------------------------
 
     def _build_left_workflow_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 4, 0)
         layout.setSpacing(8)
 
-        # Card 1: Trajectory Stats & Telemetry HUD
+        # ---------------------------------------------------------------------
+        # Card 1: Dual Camera Live Feed Viewport (Feature 1)
+        # ---------------------------------------------------------------------
+        box_cam = QGroupBox("VIDEO TELEMETRY VIEWPORT (OPERATOR LIVE FEEDS — DUAL CAMERAS)")
+        cam_layout = QVBoxLayout(box_cam)
+        cam_layout.setContentsMargins(8, 8, 8, 8)
+        cam_layout.setSpacing(6)
+
+        cam_row = QHBoxLayout()
+        cam_row.setSpacing(8)
+
+        # Primary Workspace Camera Widget
+        self.cam_widget_1 = CameraFeedWidget("Cam 1: Workspace", self.camera_1_index)
+        cam_row.addWidget(self.cam_widget_1, stretch=1)
+
+        # Secondary Wrist Flange Camera Widget
+        self.cam_widget_2 = CameraFeedWidget("Cam 2: Wrist Flange", self.camera_2_index)
+        cam_row.addWidget(self.cam_widget_2, stretch=1)
+
+        cam_layout.addLayout(cam_row)
+
+        # Camera Options Bar (Device Selectors & Resolution)
+        cam_ctrl_bar = QHBoxLayout()
+        cam_ctrl_bar.setSpacing(8)
+
+        available_cams = detect_available_cameras()
+
+        # Cam 1 Selector
+        lbl_c1 = QLabel("Cam 1:")
+        lbl_c1.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: bold;")
+        self.combo_cam1 = QComboBox()
+        for idx, label in available_cams:
+            self.combo_cam1.addItem(label, idx)
+        idx1_pos = self.combo_cam1.findData(self.camera_1_index)
+        if idx1_pos >= 0:
+            self.combo_cam1.setCurrentIndex(idx1_pos)
+        self.combo_cam1.currentIndexChanged.connect(self.on_cam1_selected)
+        cam_ctrl_bar.addWidget(lbl_c1)
+        cam_ctrl_bar.addWidget(self.combo_cam1)
+
+        # Cam 2 Selector
+        lbl_c2 = QLabel("Cam 2:")
+        lbl_c2.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: bold;")
+        self.combo_cam2 = QComboBox()
+        for idx, label in available_cams:
+            self.combo_cam2.addItem(label, idx)
+        idx2_pos = self.combo_cam2.findData(self.camera_2_index)
+        if idx2_pos >= 0:
+            self.combo_cam2.setCurrentIndex(idx2_pos)
+        self.combo_cam2.currentIndexChanged.connect(self.on_cam2_selected)
+        cam_ctrl_bar.addWidget(lbl_c2)
+        cam_ctrl_bar.addWidget(self.combo_cam2)
+
+        # Resolution Dropdown
+        lbl_res = QLabel("Res:")
+        lbl_res.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: bold;")
+        self.combo_res = QComboBox()
+        self.combo_res.addItem("320 x 240 (Fast)", (320, 240))
+        self.combo_res.addItem("640 x 480 (VGA)", (640, 480))
+        self.combo_res.addItem("480 x 360 (Medium)", (480, 360))
+        self.combo_res.currentIndexChanged.connect(self.on_camera_resolution_changed)
+        cam_ctrl_bar.addWidget(lbl_res)
+        cam_ctrl_bar.addWidget(self.combo_res)
+
+        cam_ctrl_bar.addStretch()
+        cam_hint = QLabel("👁 Live operator views — Not stored in trajectory file")
+        cam_hint.setStyleSheet("color: #64748b; font-size: 10px; font-style: italic;")
+        cam_ctrl_bar.addWidget(cam_hint)
+
+        cam_layout.addLayout(cam_ctrl_bar)
+        layout.addWidget(box_cam)
+
+        # ---------------------------------------------------------------------
+        # Card 2: Trajectory Stats & Telemetry HUD (Feature 2: Start Pose Tracking)
+        # ---------------------------------------------------------------------
         box_stats = QGroupBox("TRAJECTORY TELEMETRY HUD")
         stats_layout = QVBoxLayout(box_stats)
         stats_layout.setContentsMargins(10, 10, 10, 10)
@@ -760,6 +1184,21 @@ class ReferencePathStudio(QMainWindow):
 
         stats_layout.addLayout(grid_stats)
 
+        # File Start Position Banner (Feature 2)
+        pose_init_str = ", ".join(f"{DEFAULT_START_JOINTS_DICT[j]:+.1f}°" for j in UR5E_JOINT_NAMES)
+        self.lbl_file_start_pose = QLabel(f"File Start Pose: [{pose_init_str}] | Gripper: {DEFAULT_START_GRIPPER_MM:.1f} mm")
+        self.lbl_file_start_pose.setStyleSheet("""
+            background-color: #0b1120;
+            color: #34d399;
+            border: 1px solid #1e293b;
+            border-radius: 4px;
+            padding: 3px 6px;
+            font-family: monospace;
+            font-size: 10px;
+            font-weight: bold;
+        """)
+        stats_layout.addWidget(self.lbl_file_start_pose)
+
         # Live TCP & Gripper Readout Bar
         hud_bar = QHBoxLayout()
         hud_bar.setSpacing(6)
@@ -777,7 +1216,7 @@ class ReferencePathStudio(QMainWindow):
         """)
         hud_bar.addWidget(self.lbl_live_tcp, stretch=1)
 
-        self.lbl_live_gripper = QLabel("Gripper: 72.0 mm")
+        self.lbl_live_gripper = QLabel(f"Gripper: {DEFAULT_START_GRIPPER_MM:.1f} mm")
         self.lbl_live_gripper.setStyleSheet("""
             background-color: #0b1120;
             color: #10b981;
@@ -802,7 +1241,9 @@ class ReferencePathStudio(QMainWindow):
 
         layout.addWidget(box_stats)
 
-        # Card 2: Record Mode
+        # ---------------------------------------------------------------------
+        # Card 3: Record Mode (Feature 3: Auto-Return Checkbox)
+        # ---------------------------------------------------------------------
         box_rec = QGroupBox("RECORD TRAJECTORY (HUMAN TELEOP VIA GAMEPAD)")
         rec_layout = QVBoxLayout(box_rec)
         rec_layout.setContentsMargins(10, 10, 10, 10)
@@ -813,20 +1254,18 @@ class ReferencePathStudio(QMainWindow):
 
         # Big Prominent Start/Stop Recording Toggle
         self.btn_record_toggle = QPushButton("● Start Recording Path (Space)")
-        self.btn_record_toggle.setFixedHeight(42)
+        self.btn_record_toggle.setFixedHeight(40)
         self.btn_record_toggle.setStyleSheet("""
             QPushButton {
                 background-color: #16a34a;
                 color: #ffffff;
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 800;
                 border-radius: 5px;
                 border: 1px solid #22c55e;
                 padding: 6px 16px;
             }
-            QPushButton:hover {
-                background-color: #15803d;
-            }
+            QPushButton:hover { background-color: #15803d; }
         """)
         self.btn_record_toggle.clicked.connect(self.toggle_recording)
         rec_ctrl_row.addWidget(self.btn_record_toggle, stretch=2)
@@ -841,7 +1280,6 @@ class ReferencePathStudio(QMainWindow):
         self.combo_rec_freq.addItem("50 Hz (High-Res)", 50.0)
         self.combo_rec_freq.addItem("20 Hz (Lightweight)", 20.0)
         self.combo_rec_freq.addItem("10 Hz (Low-Rate)", 10.0)
-        self.combo_rec_freq.setToolTip("Target state sampling frequency in Hertz.")
         col_rate.addWidget(lbl_rate_title)
         col_rate.addWidget(self.combo_rec_freq)
         rec_ctrl_row.addLayout(col_rate)
@@ -857,19 +1295,27 @@ class ReferencePathStudio(QMainWindow):
             border-radius: 4px;
             padding: 6px;
             font-family: monospace;
-            font-size: 12px;
+            font-size: 11px;
             font-weight: bold;
         """)
         rec_ctrl_row.addWidget(self.lbl_rec_timer)
         rec_layout.addLayout(rec_ctrl_row)
 
-        lbl_rec_hint = QLabel("💡 Tip: Enable Gamepad Teleop in the right panel to freely drive the UR5e while recording.")
-        lbl_rec_hint.setStyleSheet("color: #64748b; font-size: 10px; font-style: italic;")
-        rec_layout.addWidget(lbl_rec_hint)
+        # Workflow Option: Auto-return to Start Position (Feature 3)
+        rec_opts_row = QHBoxLayout()
+        self.chk_auto_return = QCheckBox("↩ Auto-return to Start Position after recording finishes")
+        self.chk_auto_return.setChecked(True)
+        self.chk_auto_return.setStyleSheet("color: #38bdf8; font-weight: 600; font-size: 11px;")
+        self.chk_auto_return.setToolTip("When checked, automatically commands the arm back to the stored Start Position as soon as recording stops.")
+        rec_opts_row.addWidget(self.chk_auto_return)
+        rec_opts_row.addStretch()
+        rec_layout.addLayout(rec_opts_row)
 
         layout.addWidget(box_rec)
 
-        # Card 3: Save & Load Trajectory Files
+        # ---------------------------------------------------------------------
+        # Card 4: Trajectory File I/O & Delete (Feature 4: Delete Path Button)
+        # ---------------------------------------------------------------------
         box_io = QGroupBox("TRAJECTORY FILE I/O (reference_paths/)")
         io_layout = QVBoxLayout(box_io)
         io_layout.setContentsMargins(10, 10, 10, 10)
@@ -878,30 +1324,42 @@ class ReferencePathStudio(QMainWindow):
         io_btn_row = QHBoxLayout()
         io_btn_row.setSpacing(8)
 
-        self.btn_save_path = QPushButton("💾 Save Path (CSV)")
+        self.btn_save_path = QPushButton("💾 Save Path")
         self.btn_save_path.setStyleSheet("""
             QPushButton {
                 background-color: #0284c7;
                 color: #ffffff;
                 font-weight: bold;
                 border: 1px solid #38bdf8;
-                padding: 6px 12px;
+                padding: 5px 12px;
             }
-            QPushButton:hover {
-                background-color: #0369a1;
-            }
+            QPushButton:hover { background-color: #0369a1; }
         """)
-        self.btn_save_path.setToolTip("Saves recorded buffer to 'reference_paths/ref_path_YYYYMMDD_HHMM.csv'")
-        self.btn_save_path.clicked.connect(self.save_recorded_path)
+        self.btn_save_path.setToolTip("Saves recorded buffer and start position to 'reference_paths/'")
+        self.btn_save_path.clicked.connect(lambda: self.save_recorded_path(show_dialog=False))
         io_btn_row.addWidget(self.btn_save_path)
 
-        self.btn_load_path = QPushButton("📂 Load Path File...")
-        self.btn_load_path.setToolTip("Opens file dialog targeting 'reference_paths/' to select previous recording.")
+        self.btn_load_path = QPushButton("📂 Load Path...")
         self.btn_load_path.clicked.connect(self.open_load_path_dialog)
         io_btn_row.addWidget(self.btn_load_path)
 
+        # Delete Selected Path Button (Feature 4)
+        self.btn_delete_path = QPushButton("🗑 Delete Selected")
+        self.btn_delete_path.setStyleSheet("""
+            QPushButton {
+                background-color: #7f1d1d;
+                color: #fca5a5;
+                font-weight: bold;
+                border: 1px solid #ef4444;
+                padding: 5px 10px;
+            }
+            QPushButton:hover { background-color: #991b1b; }
+        """)
+        self.btn_delete_path.setToolTip("Permanently deletes the selected reference path from reference_paths/")
+        self.btn_delete_path.clicked.connect(self.delete_selected_path)
+        io_btn_row.addWidget(self.btn_delete_path)
+
         self.btn_refresh_paths = QPushButton("⟳ Refresh")
-        self.btn_refresh_paths.setToolTip("Rescan reference_paths/ directory")
         self.btn_refresh_paths.clicked.connect(self.refresh_saved_paths_list)
         io_btn_row.addWidget(self.btn_refresh_paths)
 
@@ -909,14 +1367,16 @@ class ReferencePathStudio(QMainWindow):
 
         # Quick Path Selector List
         self.list_saved_paths = QListWidget()
-        self.list_saved_paths.setFixedHeight(80)
+        self.list_saved_paths.setFixedHeight(85)
         self.list_saved_paths.itemDoubleClicked.connect(self.on_path_item_double_clicked)
-        self.list_saved_paths.setToolTip("Double-click any saved reference path to load it immediately into memory.")
+        self.list_saved_paths.setToolTip("Select a path to load or delete. Double-click to load immediately.")
         io_layout.addWidget(self.list_saved_paths)
 
         layout.addWidget(box_io)
 
-        # Card 4: Playback Mode & Emergency Stop
+        # ---------------------------------------------------------------------
+        # Card 5: Playback Mode & Emergency Stop (Feature 2: Auto-Align Pre-Check)
+        # ---------------------------------------------------------------------
         box_play = QGroupBox("DETERMINISTIC PLAYBACK (servoj / movej)")
         play_layout = QVBoxLayout(box_play)
         play_layout.setContentsMargins(10, 10, 10, 10)
@@ -925,50 +1385,44 @@ class ReferencePathStudio(QMainWindow):
         play_btn_row = QHBoxLayout()
         play_btn_row.setSpacing(10)
 
-        # Play Path Button
         self.btn_play_path = QPushButton("▶ Play Path (servoj)")
-        self.btn_play_path.setFixedHeight(42)
+        self.btn_play_path.setFixedHeight(40)
         self.btn_play_path.setStyleSheet("""
             QPushButton {
                 background-color: #4f46e5;
                 color: #ffffff;
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 800;
                 border-radius: 5px;
                 border: 1px solid #818cf8;
                 padding: 6px 16px;
             }
-            QPushButton:hover {
-                background-color: #4338ca;
-            }
+            QPushButton:hover { background-color: #4338ca; }
             QPushButton:disabled {
                 background-color: #1e293b;
                 color: #64748b;
                 border: 1px solid #334155;
             }
         """)
-        self.btn_play_path.setToolTip("Replicates recorded trajectory with smooth dense servoj and Modbus gripper commands.")
         self.btn_play_path.clicked.connect(self.start_playback)
         play_btn_row.addWidget(self.btn_play_path, stretch=2)
 
         # Big Red Safety STOP Button
         self.btn_stop_safety = QPushButton("⏹ STOP (Safety)")
-        self.btn_stop_safety.setFixedHeight(42)
+        self.btn_stop_safety.setFixedHeight(40)
         self.btn_stop_safety.setStyleSheet("""
             QPushButton {
                 background-color: #dc2626;
                 color: #ffffff;
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 800;
                 border-radius: 5px;
                 border: 1px solid #ef4444;
                 padding: 6px 16px;
             }
-            QPushButton:hover {
-                background-color: #b91c1c;
-            }
+            QPushButton:hover { background-color: #b91c1c; }
         """)
-        self.btn_stop_safety.setToolTip("Immediately halts trajectory playback and sends stopj() to the UR5e (Esc).")
+        self.btn_stop_safety.setToolTip("Immediately halts trajectory playback and sends stopj() to UR5e (Esc).")
         self.btn_stop_safety.clicked.connect(self.emergency_stop)
         play_btn_row.addWidget(self.btn_stop_safety, stretch=1)
 
@@ -978,26 +1432,24 @@ class ReferencePathStudio(QMainWindow):
         play_opt_row = QHBoxLayout()
         play_opt_row.setSpacing(10)
 
-        self.chk_auto_align = QCheckBox("Auto-align to Start Waypoint")
+        self.chk_auto_align = QCheckBox("Auto-align to Start Position if not at start")
         self.chk_auto_align.setChecked(True)
         self.chk_auto_align.setToolTip(
-            "Smoothly moves the robot to the first waypoint before streaming dense servoj commands."
+            "Checks if the robot is currently at the file's start position. If not, smoothly navigates there before waypoint streaming."
         )
         play_opt_row.addWidget(self.chk_auto_align)
 
-        # Playback Method (servoj vs movej)
         play_opt_row.addWidget(QLabel("Method:"))
         self.combo_play_method = QComboBox()
-        self.combo_play_method.addItem("servoj (Smooth Streaming)", "servoj")
-        self.combo_play_method.addItem("movej (Waypoint Series)", "movej")
+        self.combo_play_method.addItem("servoj (Streaming)", "servoj")
+        self.combo_play_method.addItem("movej (Waypoints)", "movej")
         play_opt_row.addWidget(self.combo_play_method)
 
-        # Speed Scale Slider
         play_opt_row.addWidget(QLabel("Speed:"))
         self.slider_play_speed = QSlider(Qt.Orientation.Horizontal)
         self.slider_play_speed.setRange(25, 150)
         self.slider_play_speed.setValue(100)
-        self.slider_play_speed.setFixedWidth(100)
+        self.slider_play_speed.setFixedWidth(90)
         self.slider_play_speed.valueChanged.connect(self.on_play_speed_changed)
         play_opt_row.addWidget(self.slider_play_speed)
 
@@ -1008,15 +1460,18 @@ class ReferencePathStudio(QMainWindow):
         play_layout.addLayout(play_opt_row)
         layout.addWidget(box_play)
 
-        # Card 5: Live Activity Log Console
-        box_log = QGroupBox("SYSTEM & MODBUS CONSOLE")
+        # ---------------------------------------------------------------------
+        # Card 6: Live Activity Log Console
+        # ---------------------------------------------------------------------
+        box_log = QGroupBox("SYSTEM & MODBUS ACTIVITY CONSOLE")
         log_layout = QVBoxLayout(box_log)
         log_layout.setContentsMargins(8, 8, 8, 8)
         log_layout.setSpacing(4)
 
         self.txt_log = QPlainTextEdit()
         self.txt_log.setReadOnly(True)
-        self.txt_log.setMaximumBlockCount(500)
+        self.txt_log.setMaximumBlockCount(400)
+        self.txt_log.setFixedHeight(110)
         self.txt_log.setStyleSheet("""
             background-color: #0b1120;
             color: #94a3b8;
@@ -1035,7 +1490,16 @@ class ReferencePathStudio(QMainWindow):
         log_ctrl_row.addWidget(btn_clear_log)
         log_layout.addLayout(log_ctrl_row)
 
-        layout.addWidget(box_log, stretch=1)
+        layout.addWidget(box_log)
+
+        scroll.setWidget(container)
+
+        panel_layout = QVBoxLayout()
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.addWidget(scroll)
+
+        panel = QWidget()
+        panel.setLayout(panel_layout)
         return panel
 
     # -------------------------------------------------------------------------
@@ -1043,7 +1507,6 @@ class ReferencePathStudio(QMainWindow):
     # -------------------------------------------------------------------------
 
     def _build_right_jog_panel(self) -> QWidget:
-        panel = QWidget()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1253,7 +1716,7 @@ class ReferencePathStudio(QMainWindow):
         jog_layout.addLayout(grid_jog)
         layout.addWidget(box_jog)
 
-        # 3. OnRobot Gripper Aperture Controls
+        # 3. OnRobot Gripper Aperture Controls (Wide Open = 105.0 mm)
         box_grip = QGroupBox("ONROBOT 2FG14 GRIPPER APERTURE")
         grip_layout = QVBoxLayout(box_grip)
         grip_layout.setContentsMargins(10, 10, 10, 10)
@@ -1268,7 +1731,7 @@ class ReferencePathStudio(QMainWindow):
 
         self.gripper_slider = QSlider(Qt.Orientation.Horizontal)
         self.gripper_slider.setRange(55, 105)
-        self.gripper_slider.setValue(72)
+        self.gripper_slider.setValue(int(round(self.start_gripper_mm)))
         self.gripper_slider.setStyleSheet("""
             QSlider::groove:horizontal {
                 height: 4px;
@@ -1291,7 +1754,7 @@ class ReferencePathStudio(QMainWindow):
         self.gripper_slider.sliderReleased.connect(self.on_gripper_slider_released)
         grip_row.addWidget(self.gripper_slider, stretch=1)
 
-        self.gripper_input = QLineEdit("72.0")
+        self.gripper_input = QLineEdit(f"{self.start_gripper_mm:.1f}")
         self.gripper_input.setFixedWidth(54)
         self.gripper_input.setFixedHeight(22)
         self.gripper_input.setAlignment(Qt.AlignmentFlag.AlignRight)
@@ -1315,8 +1778,8 @@ class ReferencePathStudio(QMainWindow):
         btn_open.clicked.connect(lambda: self.command_gripper_width(105.0))
         btn_close = QPushButton("Close (55mm)")
         btn_close.clicked.connect(lambda: self.command_gripper_width(55.0))
-        btn_mid = QPushButton("Mid (75mm)")
-        btn_mid.clicked.connect(lambda: self.command_gripper_width(75.0))
+        btn_mid = QPushButton("Mid (80mm)")
+        btn_mid.clicked.connect(lambda: self.command_gripper_width(80.0))
 
         grip_presets.addWidget(btn_close)
         grip_presets.addWidget(btn_mid)
@@ -1325,7 +1788,7 @@ class ReferencePathStudio(QMainWindow):
 
         layout.addWidget(box_grip)
 
-        # 4. Gamepad Teleoperation Controls (Matching gui_recorder.py)
+        # 4. Gamepad Teleoperation Controls (Feature 3: Analog Stick Inversions)
         box_gamepad = QGroupBox("HARDWARE GAMEPAD TELEOPERATION CONTROLS")
         gamepad_layout = QVBoxLayout(box_gamepad)
         gamepad_layout.setContentsMargins(10, 10, 10, 10)
@@ -1385,13 +1848,17 @@ class ReferencePathStudio(QMainWindow):
         gp_row1.addStretch()
         gamepad_layout.addLayout(gp_row1)
 
-        # Row 2: Inversion Checkboxes
+        # Row 2: Inversion Checkboxes for Both Analog Sticks (Feature 3)
         gp_row2 = QHBoxLayout()
         self.chk_invert_left = QCheckBox("⇄ Invert Left Stick (L/R)")
+        self.chk_invert_left.setChecked(False)
+        self.chk_invert_left.setToolTip("Invert Left Stick lateral translation direction (Left/Right)")
         self.chk_invert_left.toggled.connect(self.on_invert_left_toggled)
         gp_row2.addWidget(self.chk_invert_left)
 
         self.chk_invert_right = QCheckBox("⇄ Invert Right Stick (Base)")
+        self.chk_invert_right.setChecked(False)
+        self.chk_invert_right.setToolTip("Invert Right Stick horizontal base rotation direction (shoulder_pan)")
         self.chk_invert_right.toggled.connect(self.on_invert_right_toggled)
         gp_row2.addWidget(self.chk_invert_right)
         gp_row2.addStretch()
@@ -1406,7 +1873,7 @@ class ReferencePathStudio(QMainWindow):
         self.slider_gamepad_speed = QSlider(Qt.Orientation.Horizontal)
         self.slider_gamepad_speed.setRange(10, 100)
         self.slider_gamepad_speed.setValue(50)
-        self.slider_gamepad_speed.setFixedWidth(100)
+        self.slider_gamepad_speed.setFixedWidth(90)
         self.slider_gamepad_speed.valueChanged.connect(self.on_gamepad_speed_changed)
         gp_row3.addWidget(self.lbl_gp_speed)
         gp_row3.addWidget(self.slider_gamepad_speed)
@@ -1418,7 +1885,7 @@ class ReferencePathStudio(QMainWindow):
         self.slider_gamepad_accel = QSlider(Qt.Orientation.Horizontal)
         self.slider_gamepad_accel.setRange(10, 100)
         self.slider_gamepad_accel.setValue(50)
-        self.slider_gamepad_accel.setFixedWidth(100)
+        self.slider_gamepad_accel.setFixedWidth(90)
         self.slider_gamepad_accel.valueChanged.connect(self.on_gamepad_accel_changed)
         gp_row3.addWidget(self.lbl_gp_accel)
         gp_row3.addWidget(self.slider_gamepad_accel)
@@ -1427,7 +1894,7 @@ class ReferencePathStudio(QMainWindow):
         gamepad_layout.addLayout(gp_row3)
 
         # Row 4: Gamepad Button Shortcuts Hints
-        lbl_shortcuts = QLabel("🎮 Controller Shortcuts: [Select] Go to Temp Start | [Start] Toggle Record (Space)")
+        lbl_shortcuts = QLabel("🎮 Shortcuts: [Select] Go to Temp Start | [Start] Toggle Record (Space)")
         lbl_shortcuts.setStyleSheet("""
             color: #e2e8f0;
             background-color: #0b1120;
@@ -1444,13 +1911,46 @@ class ReferencePathStudio(QMainWindow):
 
         scroll.setWidget(container)
 
-        panel_layout = QVBoxLayout(panel)
+        panel_layout = QVBoxLayout()
         panel_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.addWidget(scroll)
+
+        panel = QWidget()
+        panel.setLayout(panel_layout)
         return panel
 
     # -------------------------------------------------------------------------
-    # Trajectory Recording Slots & Workflow
+    # Camera Event Slots
+    # -------------------------------------------------------------------------
+
+    def on_cam1_selected(self, index: int):
+        cam_id = self.combo_cam1.currentData()
+        if cam_id is not None and hasattr(self, "camera_worker_1"):
+            self.camera_1_index = int(cam_id)
+            self.cam_widget_1.camera_id = self.camera_1_index
+            self.cam_widget_1.lbl_title.setText(f"<b>Cam 1: /dev/video{self.camera_1_index}</b>")
+            self.camera_worker_1.set_camera_id(self.camera_1_index)
+            self.log(f"Camera 1 switched to device /dev/video{self.camera_1_index}")
+
+    def on_cam2_selected(self, index: int):
+        cam_id = self.combo_cam2.currentData()
+        if cam_id is not None and hasattr(self, "camera_worker_2"):
+            self.camera_2_index = int(cam_id)
+            self.cam_widget_2.camera_id = self.camera_2_index
+            self.cam_widget_2.lbl_title.setText(f"<b>Cam 2: /dev/video{self.camera_2_index}</b>")
+            self.camera_worker_2.set_camera_id(self.camera_2_index)
+            self.log(f"Camera 2 switched to device /dev/video{self.camera_2_index}")
+
+    def on_camera_resolution_changed(self, index: int):
+        res = self.combo_res.currentData()
+        if res and hasattr(self, "camera_worker_1") and hasattr(self, "camera_worker_2"):
+            w, h = res
+            self.camera_worker_1.set_resolution(w, h)
+            self.camera_worker_2.set_resolution(w, h)
+            self.log(f"Camera operator viewports resized to {w}x{h}")
+
+    # -------------------------------------------------------------------------
+    # Trajectory Recording Slots & Workflow (With Auto-Return)
     # -------------------------------------------------------------------------
 
     def toggle_recording(self):
@@ -1460,6 +1960,9 @@ class ReferencePathStudio(QMainWindow):
             return
 
         if not self.path_manager.is_recording:
+            # Synchronize start position into path manager before recording
+            self.path_manager.set_start_position(self.start_position, gripper_width=self.gripper_slider.value())
+
             # Start Recording
             freq = float(self.combo_rec_freq.currentData() or 30.0)
             success = self.path_manager.start_recording(
@@ -1475,7 +1978,7 @@ class ReferencePathStudio(QMainWindow):
                     QPushButton {
                         background-color: #dc2626;
                         color: #ffffff;
-                        font-size: 13px;
+                        font-size: 12px;
                         font-weight: 800;
                         border-radius: 5px;
                         border: 1px solid #ef4444;
@@ -1497,12 +2000,13 @@ class ReferencePathStudio(QMainWindow):
                 self.btn_play_path.setEnabled(False)
                 self.btn_save_path.setEnabled(False)
                 self.btn_load_path.setEnabled(False)
+                self.btn_delete_path.setEnabled(False)
 
                 # Auto-enable Gamepad Teleoperation if available
                 if self.gamepad_teleop and not self.gamepad_teleop.is_enabled():
                     self.btn_toggle_gamepad.setChecked(True)
 
-                self.status_bar.showMessage("Recording trajectory... Drive UR5e with gamepad or freedrive.")
+                self.status_bar.showMessage("Recording trajectory... Drive UR5e with gamepad.")
                 self.log(f"Started trajectory recording at {freq:.1f} Hz.")
         else:
             # Stop Recording
@@ -1514,7 +2018,7 @@ class ReferencePathStudio(QMainWindow):
                 QPushButton {
                     background-color: #16a34a;
                     color: #ffffff;
-                    font-size: 13px;
+                    font-size: 12px;
                     font-weight: 800;
                     border-radius: 5px;
                     border: 1px solid #22c55e;
@@ -1535,6 +2039,7 @@ class ReferencePathStudio(QMainWindow):
             self.combo_rec_freq.setEnabled(True)
             self.btn_save_path.setEnabled(True)
             self.btn_load_path.setEnabled(True)
+            self.btn_delete_path.setEnabled(True)
             self.btn_play_path.setEnabled(len(points) > 0)
 
             dur = self.path_manager.duration_s
@@ -1544,9 +2049,14 @@ class ReferencePathStudio(QMainWindow):
             self.status_bar.showMessage(f"Recording stopped. Captured {len(points)} waypoints ({dur:.2f}s).", 5000)
             self.log(f"Recording stopped. Total: {len(points)} points ({dur:.2f}s). Ready to save or play.")
 
+            # Feature 3: Auto-return to Start Position if checked
+            if self.chk_auto_return.isChecked():
+                self.log("[WORKFLOW] Auto-return active: commanding arm back to start position.")
+                self.status_bar.showMessage("Auto-returning arm to Start Position...", 3000)
+                self.move_to_start_pose()
+
     def _on_point_recorded(self, point: TrajectoryPoint, count: int):
-        """Background callback from PathManager on each recorded point."""
-        pass  # Stopwatch timer handles UI updates safely on the main thread
+        pass
 
     def update_recording_stopwatch(self):
         """Updates the recording stopwatch HUD at 20 Hz."""
@@ -1559,14 +2069,17 @@ class ReferencePathStudio(QMainWindow):
         self.lbl_rec_timer.setText(f"⏱ {mins:02d}:{secs:04.1f} ({pts} pts)")
 
     # -------------------------------------------------------------------------
-    # Save & Load Slots
+    # Save, Load & Delete Slots
     # -------------------------------------------------------------------------
 
     def save_recorded_path(self, show_dialog: bool = False):
-        """Saves active trajectory buffer to reference_paths/."""
+        """Saves active trajectory buffer and start position to reference_paths/."""
         if self.path_manager.point_count == 0:
             self.show_warning("Empty Buffer", "No trajectory points in buffer to save. Record or load a path first.")
             return
+
+        # Ensure start position and start gripper width are embedded
+        self.path_manager.set_start_position(self.start_position, gripper_width=self.gripper_slider.value())
 
         try:
             saved_path = self.path_manager.save_path(file_format="csv")
@@ -1580,6 +2093,7 @@ class ReferencePathStudio(QMainWindow):
                     "Trajectory Saved",
                     f"Successfully saved {self.path_manager.point_count} points to:\n\n{saved_path}",
                 )
+            return saved_path
         except Exception as e:
             self.show_error("Save Error", f"Failed to save reference trajectory:\n{e}")
             self.log(f"[ERROR] Failed to save path: {e}")
@@ -1601,7 +2115,7 @@ class ReferencePathStudio(QMainWindow):
             self.load_path_file(Path(filepath))
 
     def load_path_file(self, path: Path):
-        """Loads trajectory from disk into memory."""
+        """Loads trajectory from disk into memory and retrieves start position."""
         try:
             points = self.path_manager.load_path(path)
             dur = self.path_manager.duration_s
@@ -1613,6 +2127,13 @@ class ReferencePathStudio(QMainWindow):
             self.lbl_path_rate.setText(f"{rate:.1f} Hz")
             self.btn_play_path.setEnabled(True)
 
+            # Update Start Pose readout from file metadata (Feature 2)
+            sp_deg = self.path_manager.get_start_position_deg()
+            gw = self.path_manager.get_start_gripper_width()
+            if sp_deg is not None and len(sp_deg) == 6:
+                pose_str = ", ".join(f"{v:+.1f}°" for v in sp_deg)
+                self.lbl_file_start_pose.setText(f"File Start Pose: [{pose_str}] | Gripper: {gw:.1f} mm")
+
             self.prog_playback.setValue(0)
             self.prog_playback.setFormat(f"Loaded {len(points)} pts ({dur:.1f}s) — Ready")
 
@@ -1621,6 +2142,45 @@ class ReferencePathStudio(QMainWindow):
         except Exception as e:
             self.show_error("Load Error", f"Failed to load trajectory file '{path.name}':\n{e}")
             self.log(f"[ERROR] Failed to load path {path.name}: {e}")
+
+    def delete_selected_path(self):
+        """Deletes the selected trajectory file from disk after user confirmation (Feature 4)."""
+        item = self.list_saved_paths.currentItem()
+        if not item:
+            self.show_warning("No Selection", "Please select a reference path file from the list to delete.")
+            return
+
+        path_str = item.data(Qt.ItemDataRole.UserRole)
+        if not path_str:
+            return
+
+        target_path = Path(path_str)
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete Path",
+            f"Are you sure you want to permanently delete reference path:\n\n'{target_path.name}'?\n\nThis action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                self.path_manager.delete_path(target_path)
+                self.refresh_saved_paths_list()
+
+                if self.lbl_path_source.text() == target_path.name:
+                    self.lbl_path_source.setText("No Trajectory Loaded (Buffer Empty)")
+                    self.lbl_path_count.setText("0 points")
+                    self.lbl_path_duration.setText("0.00 s")
+                    self.btn_play_path.setEnabled(False)
+                    self.prog_playback.setValue(0)
+                    self.prog_playback.setFormat("Buffer Cleared")
+
+                self.status_bar.showMessage(f"Deleted {target_path.name}", 4000)
+                self.log(f"[FILE] Deleted reference path: {target_path.name}")
+            except Exception as e:
+                self.show_error("Delete Error", f"Failed to delete path:\n{e}")
+                self.log(f"[ERROR] Failed to delete path: {e}")
 
     def refresh_saved_paths_list(self):
         """Rescans reference_paths/ and populates quick-access list widget."""
@@ -1641,13 +2201,12 @@ class ReferencePathStudio(QMainWindow):
             self.list_saved_paths.addItem(item)
 
     def on_path_item_double_clicked(self, item: QListWidgetItem):
-        """Handles double clicking a path in the list."""
         path_str = item.data(Qt.ItemDataRole.UserRole)
         if path_str:
             self.load_path_file(Path(path_str))
 
     # -------------------------------------------------------------------------
-    # Playback & Emergency Stop Slots
+    # Playback & Emergency Stop Slots (Feature 2: Start Position Pre-Check & Auto-Move)
     # -------------------------------------------------------------------------
 
     def start_playback(self):
@@ -1672,6 +2231,7 @@ class ReferencePathStudio(QMainWindow):
         self.btn_record_toggle.setEnabled(False)
         self.btn_save_path.setEnabled(False)
         self.btn_load_path.setEnabled(False)
+        self.btn_delete_path.setEnabled(False)
 
         self.badge_mode.setText(f"MODE: PLAYING ({method})")
         self.badge_mode.setStyleSheet("""
@@ -1685,7 +2245,7 @@ class ReferencePathStudio(QMainWindow):
         """)
 
         self.prog_playback.setValue(0)
-        self.prog_playback.setFormat("Playing... 0%")
+        self.prog_playback.setFormat("Checking Start Position & Replaying...")
         self.status_bar.showMessage(f"Executing deterministic playback ({method})...")
         self.log(f"Starting playback: method={method}, speed={speed_scale:.2f}x, auto_align={auto_align}")
 
@@ -1738,15 +2298,12 @@ class ReferencePathStudio(QMainWindow):
         self._reset_playback_ui()
 
     def _on_playback_progress(self, idx: int, total: int, point: TrajectoryPoint):
-        """Progress callback invoked during playback streaming."""
-        # Throttle progress UI updates to ~20 Hz to avoid flooding Qt event loop
         now = time.perf_counter()
         if now - self._last_progress_update_time < 0.05 and idx < total - 1:
             return
         self._last_progress_update_time = now
 
         pct = int(round((idx / max(1, total - 1)) * 100))
-        # Use QTimer.singleShot to schedule safely on Qt main thread
         QTimer.singleShot(0, lambda: self._update_playback_hud(pct, idx, total, point))
 
     def _update_playback_hud(self, pct: int, idx: int, total: int, point: TrajectoryPoint):
@@ -1754,7 +2311,6 @@ class ReferencePathStudio(QMainWindow):
         self.prog_playback.setFormat(f"Playing: {pct}% ({idx}/{total} waypoints)")
 
     def _on_playback_completed(self, success: bool, message: str):
-        """Completion callback invoked when playback thread terminates."""
         QTimer.singleShot(0, lambda: self._handle_playback_finished(success, message))
 
     def _handle_playback_finished(self, success: bool, message: str):
@@ -1769,7 +2325,6 @@ class ReferencePathStudio(QMainWindow):
             self.status_bar.showMessage(f"Playback stopped: {message}", 5000)
             self.log(f"[PLAYBACK] {message}")
 
-        # Restore gamepad teleop inhibition
         if self.gamepad_teleop:
             self.gamepad_teleop.set_inhibited(False)
 
@@ -1778,6 +2333,7 @@ class ReferencePathStudio(QMainWindow):
         self.btn_record_toggle.setEnabled(True)
         self.btn_save_path.setEnabled(True)
         self.btn_load_path.setEnabled(True)
+        self.btn_delete_path.setEnabled(True)
 
         if not self.path_manager.is_recording:
             self.badge_mode.setText("MODE: IDLE")
@@ -1801,27 +2357,32 @@ class ReferencePathStudio(QMainWindow):
 
     def update_start_pose_display(self):
         pose_str = ", ".join(f"{self.start_position.get(j, 0.0):+.1f}°" for j in UR5E_JOINT_NAMES)
-        self.lbl_start_pose_info.setText(f"Start Pose: [{pose_str}]")
+        self.lbl_start_pose_info.setText(f"Start Pose: [{pose_str}] | Grip: {self.start_gripper_mm:.1f}mm")
 
     def set_current_as_start_position(self):
         """Captures current arm position as the active Start Position."""
         current_rads = self.robot_worker.get_latest_joints()
         for j in UR5E_JOINT_NAMES:
             self.start_position[j] = round(math.degrees(current_rads.get(j, 0.0)), 1)
+        self.start_gripper_mm = float(self.gripper_slider.value())
+
         self.update_start_pose_display()
+        self.path_manager.set_start_position(self.start_position, gripper_width=self.start_gripper_mm)
         pose_str = ", ".join(f"{self.start_position[j]:+.1f}°" for j in UR5E_JOINT_NAMES)
-        self.log(f"Active Start Position saved: [{pose_str}]")
+        self.lbl_file_start_pose.setText(f"Active Start: [{pose_str}] | Grip: {self.start_gripper_mm:.1f}mm")
+        self.log(f"Active Start Position saved: [{pose_str}] | Gripper: {self.start_gripper_mm:.1f}mm")
         self.status_bar.showMessage(f"Active Start Position saved: [{pose_str}]", 4000)
 
     def move_to_start_pose(self):
-        """Moves arm to stored Custom Start Position."""
+        """Moves arm to stored Custom Start Position and sets gripper to start width."""
         if self.gamepad_teleop and self.gamepad_teleop.is_enabled():
             self.gamepad_teleop.set_inhibited(True, "Moving to Start Pose")
 
         action = {f"{j}.pos": math.radians(self.start_position.get(j, 0.0)) for j in UR5E_JOINT_NAMES}
         pose_str = ", ".join(f"{self.start_position.get(j, 0.0):+.1f}°" for j in UR5E_JOINT_NAMES)
-        self.log(f"Commanding arm to Start Position [{pose_str}]...")
+        self.log(f"Commanding arm to Start Position [{pose_str}] and Gripper to {self.start_gripper_mm:.1f} mm...")
         self.status_bar.showMessage("Moving arm to Start Position...", 4000)
+        self.command_gripper_width(self.start_gripper_mm)
         self.robot_worker.request_move_pose(action)
 
     def move_to_home_pose(self):
@@ -1989,7 +2550,7 @@ class ReferencePathStudio(QMainWindow):
             """)
 
     # -------------------------------------------------------------------------
-    # Gamepad Slots & Integration
+    # Gamepad Slots & Integration (Feature 3: Analog Stick Inversions)
     # -------------------------------------------------------------------------
 
     def on_gamepad_toggle_clicked(self, checked: bool):
@@ -2071,11 +2632,13 @@ class ReferencePathStudio(QMainWindow):
 
     def on_invert_left_toggled(self, checked: bool):
         if self.gamepad_teleop:
-            self.gamepad_teleop.set_invert_left_stick_lr(checked)
+            self.gamepad_teleop.set_invert_left_horizontal(checked)
+            self.log(f"Invert Left Stick (L/R) set to: {checked}")
 
     def on_invert_right_toggled(self, checked: bool):
         if self.gamepad_teleop:
-            self.gamepad_teleop.set_invert_right_stick_lr(checked)
+            self.gamepad_teleop.set_invert_right_horizontal(checked)
+            self.log(f"Invert Right Stick (Base) set to: {checked}")
 
     def on_gamepad_speed_changed(self, val: int):
         self.lbl_gp_speed.setText(f"⚡ Speed: {val}%")
@@ -2169,6 +2732,9 @@ class ReferencePathStudio(QMainWindow):
         elif key == Qt.Key.Key_Escape:
             self.emergency_stop()
             event.accept()
+        elif key == Qt.Key.Key_Delete and self.list_saved_paths.hasFocus():
+            self.delete_selected_path()
+            event.accept()
         elif key == Qt.Key.Key_H:
             self.move_to_home_pose()
             event.accept()
@@ -2196,6 +2762,12 @@ class ReferencePathStudio(QMainWindow):
         self.log("Shutting down UR5e Reference Path Studio...")
         self.path_manager.disconnect()
 
+        if hasattr(self, "camera_worker_1") and self.camera_worker_1:
+            self.camera_worker_1.stop()
+
+        if hasattr(self, "camera_worker_2") and self.camera_worker_2:
+            self.camera_worker_2.stop()
+
         if self.gamepad_teleop:
             self.gamepad_teleop.stop()
 
@@ -2216,6 +2788,8 @@ def parse_args():
     parser.add_argument("--robot-ip", type=str, default=DEFAULT_ROBOT_IP, help=f"UR5e arm IP (default: {DEFAULT_ROBOT_IP})")
     parser.add_argument("--gripper-ip", type=str, default=DEFAULT_GRIPPER_IP, help=f"OnRobot Compute Box IP (default: {DEFAULT_GRIPPER_IP})")
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS, help=f"Recording frequency in Hz (default: {DEFAULT_FPS})")
+    parser.add_argument("--camera-1", type=int, default=DEFAULT_CAMERA_1_INDEX, help=f"Primary Workspace camera index (default: {DEFAULT_CAMERA_1_INDEX})")
+    parser.add_argument("--camera-2", type=int, default=DEFAULT_CAMERA_2_INDEX, help=f"Secondary Wrist Flange camera index (default: {DEFAULT_CAMERA_2_INDEX})")
     parser.add_argument("--mock", action="store_true", help="Launch in simulated mock mode without physical hardware")
     return parser.parse_args()
 
@@ -2229,6 +2803,8 @@ def main():
         robot_ip=args.robot_ip,
         gripper_ip=args.gripper_ip,
         target_fps=args.fps,
+        camera_1_index=args.camera_1,
+        camera_2_index=args.camera_2,
         mock_mode=args.mock,
     )
     window.show()

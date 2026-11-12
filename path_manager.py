@@ -78,6 +78,11 @@ UR5E_JOINT_NAMES = [
     "wrist_3",
 ]
 
+# Default System Start Position: -80, -45, -100, 150, -85, 60 (deg), Gripper: 105.0 mm (wide open)
+DEFAULT_START_JOINTS_DEG = [-80.0, -45.0, -100.0, 150.0, -85.0, 60.0]
+DEFAULT_START_JOINTS_RAD = [math.radians(v) for v in DEFAULT_START_JOINTS_DEG]
+DEFAULT_START_GRIPPER_MM = 105.0
+
 # Canonical CSV Header
 CSV_HEADER = [
     "timestamp",
@@ -231,6 +236,8 @@ class PathManager:
         self._trajectory: List[TrajectoryPoint] = []
         self._trajectory_lock = threading.Lock()
         self._loaded_filepath: Optional[Path] = None
+        self._start_position: Optional[List[float]] = list(DEFAULT_START_JOINTS_RAD)
+        self._start_gripper_width: float = DEFAULT_START_GRIPPER_MM
 
         # Hardware connection references
         self._rtde_rx: Optional[RTDEReceiveInterface] = None
@@ -255,9 +262,9 @@ class PathManager:
         self._play_thread: Optional[threading.Thread] = None
 
         # Simulation/mock state trackers
-        self._mock_q: List[float] = [0.0, -math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2, 0.0]
+        self._mock_q: List[float] = list(DEFAULT_START_JOINTS_RAD)
         self._mock_tcp: List[float] = [0.35, -0.20, 0.45, 2.22, -2.22, 0.0]
-        self._mock_gripper_width: float = 72.0
+        self._mock_gripper_width: float = DEFAULT_START_GRIPPER_MM
 
     # -------------------------------------------------------------------------
     # Properties & Status
@@ -291,6 +298,61 @@ class PathManager:
     @property
     def loaded_filepath(self) -> Optional[Path]:
         return self._loaded_filepath
+
+    def set_start_position(self, pos: Union[List[float], Dict[str, float]], gripper_width: Optional[float] = None):
+        """Sets the reference start position (radians or dict of radians/degrees)."""
+        if isinstance(pos, dict):
+            # Check if values are in degrees (> 2*pi or typical UR5e ranges)
+            q_rad = []
+            for j in UR5E_JOINT_NAMES:
+                val = float(pos.get(f"{j}.pos", pos.get(j, 0.0)))
+                # If absolute value > 7.0, it's degrees, convert to radians
+                if abs(val) > 7.0:
+                    val = math.radians(val)
+                q_rad.append(val)
+            self._start_position = q_rad
+            if gripper_width is None and ("gripper" in pos or "gripper_width" in pos):
+                self._start_gripper_width = float(pos.get("gripper_width", pos.get("gripper", DEFAULT_START_GRIPPER_MM)))
+        else:
+            self._start_position = [float(v) for v in pos]
+
+        if gripper_width is not None:
+            self._start_gripper_width = float(gripper_width)
+
+    def get_start_position(self) -> Optional[List[float]]:
+        """Returns the start position joint angles in radians."""
+        if self._start_position is not None:
+            return list(self._start_position)
+        with self._trajectory_lock:
+            if self._trajectory:
+                return list(self._trajectory[0].q)
+        return None
+
+    def get_start_position_deg(self) -> Optional[List[float]]:
+        """Returns the start position joint angles in degrees."""
+        sp = self.get_start_position()
+        if sp is not None:
+            return [round(math.degrees(v), 1) for v in sp]
+        return None
+
+    def get_start_gripper_width(self) -> float:
+        """Returns the start gripper width in millimeters."""
+        return self._start_gripper_width
+
+    def delete_path(self, filepath: Union[str, Path]) -> bool:
+        """Deletes a reference path file from disk."""
+        path = Path(filepath).resolve()
+        if path.is_file():
+            try:
+                path.unlink()
+                logger.info(f"Deleted reference path file: {path.name}")
+                if self._loaded_filepath == path:
+                    self._loaded_filepath = None
+                return True
+            except Exception as e:
+                logger.error(f"Failed to delete {path}: {e}")
+                raise
+        return False
 
     def _ensure_paths_directory(self) -> Path:
         """Ensures the reference_paths/ subfolder exists in the project root."""
@@ -617,17 +679,26 @@ class PathManager:
             raise
 
     def _save_csv(self, path: Path, points: List[TrajectoryPoint]):
-        """Serializes trajectory to CSV."""
+        """Serializes trajectory to CSV with start position metadata."""
+        start_q = self.get_start_position() or (points[0].q if points else None)
+        gw = self.get_start_gripper_width()
         with open(path, "w", newline="", encoding="utf-8") as f:
+            if start_q is not None:
+                start_deg = [math.degrees(v) for v in start_q]
+                f.write(f"# start_position_rad: {','.join(f'{v:.6f}' for v in start_q)}\n")
+                f.write(f"# start_position_deg: {','.join(f'{v:.1f}' for v in start_deg)}\n")
+                f.write(f"# start_gripper_mm: {gw:.1f}\n")
             writer = csv.writer(f)
             writer.writerow(CSV_HEADER)
             for pt in points:
                 writer.writerow(pt.to_csv_row())
 
     def _save_json(self, path: Path, points: List[TrajectoryPoint]):
-        """Serializes trajectory to JSON with rich metadata."""
+        """Serializes trajectory to JSON with rich metadata including start position."""
         duration = points[-1].timestamp - points[0].timestamp if points else 0.0
         avg_freq = len(points) / duration if duration > 0 else 0.0
+        start_q = self.get_start_position() or (points[0].q if points else None)
+        gw = self.get_start_gripper_width()
         payload = {
             "metadata": {
                 "created_at": datetime.datetime.now().isoformat(),
@@ -639,6 +710,13 @@ class PathManager:
             },
             "points": [pt.to_dict() for pt in points],
         }
+        if start_q is not None:
+            start_deg = [round(math.degrees(v), 2) for v in start_q]
+            payload["metadata"]["start_position"] = {
+                "joints_rad": [round(float(v), 6) for v in start_q],
+                "joints_deg": start_deg,
+                "gripper_width": round(gw, 1),
+            }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
 
@@ -676,23 +754,53 @@ class PathManager:
             raise
 
     def _load_csv(self, path: Path) -> List[TrajectoryPoint]:
-        """Parses CSV trajectory file."""
+        """Parses CSV trajectory file and extracts start position metadata."""
         points: List[TrajectoryPoint] = []
+        parsed_start_q = None
+
         with open(path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
+            # Check for header metadata comments
+            data_lines = []
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    if "start_position_rad:" in stripped:
+                        try:
+                            parts = stripped.split("start_position_rad:")[1].strip().split(",")
+                            parsed_start_q = [float(p.strip()) for p in parts if p.strip()]
+                        except Exception:
+                            pass
+                    elif "start_position_deg:" in stripped and parsed_start_q is None:
+                        try:
+                            parts = stripped.split("start_position_deg:")[1].strip().split(",")
+                            parsed_start_q = [math.radians(float(p.strip())) for p in parts if p.strip()]
+                        except Exception:
+                            pass
+                    elif "start_gripper_mm:" in stripped:
+                        try:
+                            self._start_gripper_width = float(stripped.split("start_gripper_mm:")[1].strip())
+                        except Exception:
+                            pass
+                elif stripped:
+                    data_lines.append(line)
+
+            reader = csv.DictReader(data_lines)
             if not reader.fieldnames:
                 raise ValueError("CSV file has no header row.")
 
-            # Validate header has minimal trajectory columns
-            headers = [h.strip().lower() for h in reader.fieldnames]
             for row in reader:
-                # Clean row dictionary keys
                 cleaned_row = {k.strip(): v.strip() for k, v in row.items() if k is not None}
                 points.append(TrajectoryPoint.from_csv_row(cleaned_row))
+
+        if points:
+            self._start_position = parsed_start_q if parsed_start_q is not None else list(points[0].q)
+            if parsed_start_q is None and hasattr(points[0], "gripper_width"):
+                self._start_gripper_width = points[0].gripper_width
+
         return points
 
     def _load_json(self, path: Path) -> List[TrajectoryPoint]:
-        """Parses JSON trajectory file."""
+        """Parses JSON trajectory file and extracts start position metadata."""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -704,6 +812,22 @@ class PathManager:
         for item in points_data:
             if isinstance(item, dict):
                 points.append(TrajectoryPoint.from_dict(item))
+
+        # Extract start position metadata
+        meta = data.get("metadata", {})
+        if "start_position" in meta:
+            sp_meta = meta["start_position"]
+            if isinstance(sp_meta, dict):
+                if "joints_rad" in sp_meta:
+                    self._start_position = [float(v) for v in sp_meta["joints_rad"]]
+                if "gripper_width" in sp_meta:
+                    self._start_gripper_width = float(sp_meta["gripper_width"])
+            elif isinstance(sp_meta, list):
+                self._start_position = [float(v) for v in sp_meta]
+        elif points:
+            self._start_position = list(points[0].q)
+            self._start_gripper_width = points[0].gripper_width
+
         return points
 
     def list_saved_paths(self) -> List[Path]:
@@ -859,21 +983,23 @@ class PathManager:
         )
 
         # ---------------------------------------------------------------------
-        # 1. Step 1: Pre-Playback Start Alignment
+        # 1. Step 1: Pre-Playback Start Alignment & Check
         # ---------------------------------------------------------------------
         start_pt = points[0]
+        target_start_q = self.get_start_position() or start_pt.q
         if auto_align_start:
-            logger.info("Aligning robot to starting waypoint...")
-            if not self._align_to_start_pose(start_pt):
+            logger.info("Checking if robot is at reference start position...")
+            if not self._align_to_start_pose(target_start_q):
                 logger.warning("Start position alignment cancelled or timed out.")
                 self.send_robot_stop()
                 self._is_playing = False
                 return False
 
         # Align initial gripper width
+        initial_gripper = self.get_start_gripper_width() if self.get_start_gripper_width() is not None else start_pt.gripper_width
         if self._gripper is not None:
             try:
-                self._gripper.grip(start_pt.gripper_width, wait=False)
+                self._gripper.grip(initial_gripper, wait=False)
             except Exception as e:
                 logger.warning(f"Failed to command initial gripper width: {e}")
 
@@ -977,24 +1103,32 @@ class PathManager:
             except Exception as e:
                 logger.error(f"Failed to transmit movej command: {e}")
 
-    def _align_to_start_pose(self, start_pt: TrajectoryPoint, max_wait_s: float = 8.0) -> bool:
+    def _align_to_start_pose(self, target_pose: Union[TrajectoryPoint, List[float]], max_wait_s: float = 8.0) -> bool:
         """
-        Smoothly positions the arm at the initial trajectory waypoint before
-        high-frequency streaming begins, avoiding harsh kinematic jerks.
+        Verifies if the robot is currently at the target start position. If not,
+        smoothly commands the arm to move there before high-frequency streaming begins.
         """
+        if hasattr(target_pose, "q"):
+            goal_q = target_pose.q
+        else:
+            goal_q = list(target_pose)
+
         curr_q, _, _ = self.get_current_state()
 
         # Check maximum joint error
-        max_err = max(abs(curr_q[i] - start_pt.q[i]) for i in range(6))
-        if max_err < 0.025:  # Within ~1.4 degrees, ready to proceed
-            logger.info("Arm already within tolerance of start waypoint.")
+        max_err = max(abs(curr_q[i] - goal_q[i]) for i in range(6))
+        if max_err < 0.025:  # Within ~1.4 degrees, robot is already at start position
+            logger.info(f"Robot is already at start position (max error: {math.degrees(max_err):.2f}°).")
             return True
 
-        logger.info(f"Moving arm to start waypoint (max joint displacement: {math.degrees(max_err):.1f}°)...")
+        logger.info(
+            f"Robot is NOT at start position (deviation: {math.degrees(max_err):.1f}°). "
+            f"Automatically moving arm to start position..."
+        )
 
         # Command movej with conservative speed & acceleration
         if self._sock is not None:
-            q_str = ", ".join(f"{val:.5f}" for val in start_pt.q)
+            q_str = ", ".join(f"{val:.5f}" for val in goal_q)
             cmd = f"movej([{q_str}], a=0.8, v=0.4)\n"
             try:
                 self._sock.sendall(cmd.encode("utf-8"))
@@ -1010,13 +1144,13 @@ class PathManager:
 
             time.sleep(0.05)
             if self.mock:
-                self._mock_q = list(start_pt.q)
+                self._mock_q = list(goal_q)
                 return True
 
             curr_q, _, _ = self.get_current_state()
-            err = max(abs(curr_q[i] - start_pt.q[i]) for i in range(6))
+            err = max(abs(curr_q[i] - goal_q[i]) for i in range(6))
             if err < 0.035:
-                logger.info(f"Arrived at start waypoint in {time.perf_counter() - t0:.2f}s.")
+                logger.info(f"Arrived at start position in {time.perf_counter() - t0:.2f}s.")
                 return True
 
         logger.warning("Start waypoint alignment reached timeout, proceeding with playback.")
@@ -1074,18 +1208,25 @@ def run_self_test():
     loaded_json = pm.load_path(saved_json)
     print(f"Loaded {len(loaded_json)} points from JSON.")
     assert len(loaded_json) == len(pts), "Loaded JSON point count mismatch!"
+    assert pm.get_start_position() is not None, "Start position was not recovered from JSON!"
 
-    # 4. Test Playback in Mock Mode
-    print("\n4. Testing Mock Playback...")
+    # 4. Test Start Position Check & Auto-Move in Playback
+    print("\n4. Testing Start Position Check & Playback...")
+    # Intentionally disturb mock joints away from start position
+    pm._mock_q = [0.5, -1.0, 1.0, -1.0, -1.0, 0.5]
     progress_count = 0
 
     def on_progress(idx, total, pt):
         nonlocal progress_count
         progress_count += 1
 
-    success = pm.play_path(method="servoj", speed_scale=2.0, auto_align_start=False, progress_callback=on_progress)
+    success = pm.play_path(method="servoj", speed_scale=2.0, auto_align_start=True, progress_callback=on_progress)
     print(f"Playback finished: success={success}, progress updates={progress_count}")
     assert success, "Playback failed!"
+
+    # 5. Clean up test files
+    pm.delete_path(saved_csv)
+    pm.delete_path(saved_json)
 
     print("\nAll PathManager self-tests PASSED successfully!")
     print("=" * 70)

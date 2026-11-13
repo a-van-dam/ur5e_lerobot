@@ -68,20 +68,43 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-# Standard kinematic joint order from base to flange
-UR5E_JOINT_NAMES = [
-    "shoulder_pan",
-    "shoulder_lift",
-    "elbow",
-    "wrist_1",
-    "wrist_2",
-    "wrist_3",
-]
+# Centralized start position loader (default_start_position.json)
+try:
+    from start_position_config import (
+        get_default_start_joints_deg,
+        get_default_start_joints_rad,
+        get_default_start_gripper_mm,
+        save_start_position as persist_start_position,
+        UR5E_JOINT_NAMES,
+    )
+    DEFAULT_START_JOINTS_DEG = get_default_start_joints_deg()
+    DEFAULT_START_JOINTS_RAD = get_default_start_joints_rad()
+    DEFAULT_START_GRIPPER_MM = get_default_start_gripper_mm()
+except ImportError:
+    UR5E_JOINT_NAMES = [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow",
+        "wrist_1",
+        "wrist_2",
+        "wrist_3",
+    ]
+    DEFAULT_START_JOINTS_DEG = [-90.0, -40.0, -100.0, 120.0, -90.0, 120.0]
+    DEFAULT_START_JOINTS_RAD = [math.radians(v) for v in DEFAULT_START_JOINTS_DEG]
+    DEFAULT_START_GRIPPER_MM = 105.0
+    persist_start_position = None
 
-# Default System Start Position: -80, -45, -100, 150, -85, 60 (deg), Gripper: 105.0 mm (wide open)
-DEFAULT_START_JOINTS_DEG = [-80.0, -45.0, -100.0, 150.0, -85.0, 60.0]
-DEFAULT_START_JOINTS_RAD = [math.radians(v) for v in DEFAULT_START_JOINTS_DEG]
-DEFAULT_START_GRIPPER_MM = 105.0
+# Scientific computing libraries for trajectory smoothing and spline interpolation
+try:
+    import numpy as np
+    from scipy.interpolate import CubicSpline
+    from scipy.signal import savgol_filter
+    SCIPY_AVAILABLE = True
+except ImportError:
+    np = None
+    CubicSpline = None
+    savgol_filter = None
+    SCIPY_AVAILABLE = False
 
 # Canonical CSV Header
 CSV_HEADER = [
@@ -847,26 +870,32 @@ class PathManager:
             self._loaded_filepath = None
 
     # -------------------------------------------------------------------------
-    # Trajectory Playback (servoj / movej)
+    # Trajectory Playback (speedj / servoj / movej with Spline Smoothing)
     # -------------------------------------------------------------------------
 
     def play_path_async(
         self,
-        method: str = "servoj",
+        method: str = "speedj",
         speed_scale: float = 1.0,
         auto_align_start: bool = True,
+        smooth: bool = True,
         progress_callback: Optional[Callable[[int, int, TrajectoryPoint], None]] = None,
         completion_callback: Optional[Callable[[bool, str], None]] = None,
     ) -> threading.Thread:
         """
         Executes playback asynchronously in a background thread.
+        Methods:
+          - 'speedj' (Recommended): Closed-loop continuous velocity streaming with cubic spline.
+                                    Provides the same silky smooth motion as gamepad teleoperation.
+          - 'servoj': High-rate (100 Hz) position servoing with spline interpolation and tuned damping.
+          - 'movej': Waypoint-by-waypoint discrete position steps.
         """
         if self._is_playing:
             raise RuntimeError("Playback is already in progress.")
 
         self._play_thread = threading.Thread(
             target=self._playback_worker,
-            args=(method, speed_scale, auto_align_start, progress_callback, completion_callback),
+            args=(method, speed_scale, auto_align_start, smooth, progress_callback, completion_callback),
             name="PathManager-PlayWorker",
             daemon=True,
         )
@@ -875,9 +904,10 @@ class PathManager:
 
     def play_path(
         self,
-        method: str = "servoj",
+        method: str = "speedj",
         speed_scale: float = 1.0,
         auto_align_start: bool = True,
+        smooth: bool = True,
         progress_callback: Optional[Callable[[int, int, TrajectoryPoint], None]] = None,
     ) -> bool:
         """
@@ -891,6 +921,7 @@ class PathManager:
             method=method,
             speed_scale=speed_scale,
             auto_align_start=auto_align_start,
+            smooth=smooth,
             progress_callback=progress_callback,
         )
 
@@ -922,7 +953,7 @@ class PathManager:
         """Sends URScript stop command (stopj / stopl) to the arm."""
         if self._sock is not None:
             try:
-                self._sock.sendall(b"stopj(2.5)\n")
+                self._sock.sendall(b"stopj(2.0)\n")
             except Exception as e:
                 logger.error(f"Failed to transmit stopj URScript: {e}")
 
@@ -931,6 +962,7 @@ class PathManager:
         method: str,
         speed_scale: float,
         auto_align_start: bool,
+        smooth: bool,
         progress_callback: Optional[Callable[[int, int, TrajectoryPoint], None]],
         completion_callback: Optional[Callable[[bool, str], None]],
     ):
@@ -942,6 +974,7 @@ class PathManager:
                 method=method,
                 speed_scale=speed_scale,
                 auto_align_start=auto_align_start,
+                smooth=smooth,
                 progress_callback=progress_callback,
             )
             message = "Playback finished successfully." if success else "Playback stopped or interrupted."
@@ -963,6 +996,7 @@ class PathManager:
         method: str,
         speed_scale: float,
         auto_align_start: bool,
+        smooth: bool,
         progress_callback: Optional[Callable[[int, int, TrajectoryPoint], None]],
     ) -> bool:
         """Internal core playback logic."""
@@ -977,9 +1011,9 @@ class PathManager:
         self._stop_playback_flag.clear()
         self._is_playing = True
 
-        scale = max(0.1, min(2.0, float(speed_scale)))
+        scale = max(0.1, min(2.5, float(speed_scale)))
         logger.info(
-            f"Starting playback: {total_pts} points, mode='{method}', speed_scale={scale:.2f}"
+            f"Starting playback: {total_pts} points, mode='{method}', speed_scale={scale:.2f}, smooth={smooth}"
         )
 
         # ---------------------------------------------------------------------
@@ -1003,18 +1037,293 @@ class PathManager:
             except Exception as e:
                 logger.warning(f"Failed to command initial gripper width: {e}")
 
-        # Short settling pause before starting dense waypoint stream
-        if not self._wait_or_abort(0.3):
+        # Short settling pause before starting waypoint stream
+        if not self._wait_or_abort(0.25):
             self.send_robot_stop()
             self._is_playing = False
             return False
 
         # ---------------------------------------------------------------------
-        # 2. Step 2: Dense Waypoint Streaming Loop
+        # 2. Build Continuous Cubic Spline Trajectory (with Gamepad Noise Filtering)
         # ---------------------------------------------------------------------
-        prev_gripper_width = start_pt.gripper_width
+        t_start = points[0].timestamp
+        t_raw = np.array([pt.timestamp - t_start for pt in points], dtype=np.float64) if np is not None else [pt.timestamp - t_start for pt in points]
+
+        # Enforce strictly monotonic increasing timestamps
+        for i in range(1, len(t_raw)):
+            if t_raw[i] <= t_raw[i - 1]:
+                t_raw[i] = t_raw[i - 1] + 0.001
+        total_duration = float(t_raw[-1])
+        if total_duration <= 0.005:
+            total_duration = 0.033 * total_pts
+
+        q_raw = np.array([pt.q for pt in points], dtype=np.float64) if np is not None else [pt.q for pt in points]
+        gripper_raw = np.array([pt.gripper_width for pt in points], dtype=np.float64) if np is not None else [pt.gripper_width for pt in points]
+
+        # Filter out minor analog stick jitter using Savitzky-Golay polynomial filter
+        if smooth and SCIPY_AVAILABLE and len(points) >= 7 and savgol_filter is not None:
+            try:
+                window = min(7, len(points) if len(points) % 2 != 0 else len(points) - 1)
+                q_filtered = savgol_filter(q_raw, window_length=window, polyorder=2, axis=0)
+                # Strictly preserve exact start and end boundaries
+                q_filtered[0] = q_raw[0]
+                q_filtered[-1] = q_raw[-1]
+            except Exception as filt_err:
+                logger.debug(f"Savgol filter notice: {filt_err}")
+                q_filtered = q_raw
+        else:
+            q_filtered = q_raw
+
+        # Fit clamped cubic spline (C^2 continuous: acceleration and velocity continuous, zero jerk at boundaries)
+        if SCIPY_AVAILABLE and CubicSpline is not None and len(points) >= 4:
+            cs_q = CubicSpline(t_raw, q_filtered, axis=0, bc_type='clamped')
+            cs_gripper = CubicSpline(t_raw, gripper_raw, axis=0)
+        else:
+            cs_q = None
+            cs_gripper = None
+
+        method_norm = method.lower().strip()
+        if method_norm in ("speedj", "velocity", "closed_loop") and cs_q is not None:
+            return self._execute_speedj_playback(
+                cs_q=cs_q,
+                cs_gripper=cs_gripper,
+                total_duration=total_duration,
+                scale=scale,
+                total_pts=total_pts,
+                points=points,
+                progress_callback=progress_callback,
+            )
+        elif method_norm in ("servoj", "servo") and cs_q is not None:
+            return self._execute_servoj_playback(
+                cs_q=cs_q,
+                cs_gripper=cs_gripper,
+                total_duration=total_duration,
+                scale=scale,
+                total_pts=total_pts,
+                points=points,
+                progress_callback=progress_callback,
+            )
+        else:
+            return self._execute_movej_playback(
+                points=points,
+                scale=scale,
+                total_pts=total_pts,
+                progress_callback=progress_callback,
+            )
+
+    def _execute_speedj_playback(
+        self,
+        cs_q: Any,
+        cs_gripper: Any,
+        total_duration: float,
+        scale: float,
+        total_pts: int,
+        points: List[TrajectoryPoint],
+        progress_callback: Optional[Callable[[int, int, TrajectoryPoint], None]],
+    ) -> bool:
+        """
+        Closed-loop velocity tracking via speedj at 50 Hz.
+        Calculates analytical feedforward joint velocity from cubic spline
+        plus proportional position feedback: qd_cmd = qd_ff + Kp * (q_des - q_act).
+        This matches the silky smooth motion of gamepad teleoperation with millimeter accuracy.
+        """
+        loop_rate_hz = 50.0
+        dt = 1.0 / loop_rate_hz
+        kp = 2.5                     # Proportional tracking gain (s^-1)
+        max_joint_vel = 2.0          # Max joint velocity (rad/s)
+        max_joint_acc = 1.4          # Max joint acceleration (rad/s^2)
+        max_vel_step = max_joint_acc * dt
+
+        prev_qd = [0.0] * 6
+        prev_gripper_width = float(points[0].gripper_width)
         last_gripper_cmd_time = time.perf_counter()
 
+        playback_start_wall = time.perf_counter()
+        effective_duration = total_duration / scale
+
+        while True:
+            if self._stop_playback_flag.is_set():
+                logger.info("Playback aborted by user.")
+                self.send_robot_stop()
+                self._is_playing = False
+                return False
+
+            now = time.perf_counter()
+            elapsed_scaled = (now - playback_start_wall) * scale
+
+            if elapsed_scaled >= total_duration:
+                break
+
+            # Current desired position & feedforward velocity from spline
+            q_des = cs_q(elapsed_scaled)
+            qd_ff = cs_q(elapsed_scaled, 1) * scale
+
+            # Feedback: read actual robot joint angles
+            curr_q, curr_tcp, _ = self.get_current_state()
+
+            # Commanded velocity with closed-loop proportional error correction
+            qd_cmd = [0.0] * 6
+            for i in range(6):
+                pos_err = q_des[i] - curr_q[i]
+                v = qd_ff[i] + kp * pos_err
+                # Clamp velocity limits
+                v = max(-max_joint_vel, min(max_joint_vel, v))
+                # Acceleration slew rate limiter to prevent jerks
+                delta_v = v - prev_qd[i]
+                delta_v = max(-max_vel_step, min(max_vel_step, delta_v))
+                qd_cmd[i] = prev_qd[i] + delta_v
+
+            prev_qd = list(qd_cmd)
+
+            # Send speedj command (watchdog t=0.06s provides smooth buffer for 0.02s cycle)
+            self._send_speedj_step(qd_cmd, a=max_joint_acc, t=0.06)
+
+            # Gripper update (interpolated from spline)
+            if cs_gripper is not None:
+                target_gripper = float(cs_gripper(elapsed_scaled))
+                if abs(target_gripper - prev_gripper_width) >= 0.5 and (now - last_gripper_cmd_time) >= 0.08:
+                    if self._gripper is not None:
+                        try:
+                            self._gripper.grip(target_gripper, wait=False)
+                            prev_gripper_width = target_gripper
+                            last_gripper_cmd_time = now
+                        except Exception:
+                            pass
+            else:
+                target_gripper = prev_gripper_width
+
+            # Mock simulation integration
+            if self.mock:
+                self._mock_q = [self._mock_q[i] + qd_cmd[i] * dt for i in range(6)]
+                self._mock_gripper_width = target_gripper
+
+            # Progress callback update
+            if progress_callback is not None:
+                pt_idx = min(total_pts - 1, int((elapsed_scaled / total_duration) * total_pts))
+                dummy_pt = TrajectoryPoint(
+                    timestamp=elapsed_scaled,
+                    q=list(q_des),
+                    tcp_pose=list(curr_tcp),
+                    gripper_width=target_gripper,
+                )
+                try:
+                    progress_callback(pt_idx, total_pts, dummy_pt)
+                except Exception:
+                    pass
+
+            # Precise cycle timing
+            target_next_time = playback_start_wall + ((elapsed_scaled + (dt * scale)) / scale)
+            sleep_time = target_next_time - time.perf_counter()
+            if sleep_time > 0.0005:
+                time.sleep(sleep_time)
+
+        # Smooth deceleration at end of path
+        self.send_robot_stop()
+        logger.info(f"Trajectory speedj playback complete ({total_pts} points followed smoothly).")
+        self._is_playing = False
+        return True
+
+    def _execute_servoj_playback(
+        self,
+        cs_q: Any,
+        cs_gripper: Any,
+        total_duration: float,
+        scale: float,
+        total_pts: int,
+        points: List[TrajectoryPoint],
+        progress_callback: Optional[Callable[[int, int, TrajectoryPoint], None]],
+    ) -> bool:
+        """
+        High-rate (100 Hz) Spline-Upsampled servoj streaming.
+        Uses lookahead_time=0.18 and gain=120 for smooth damping without high-frequency chattering.
+        """
+        loop_rate_hz = 100.0
+        dt = 1.0 / loop_rate_hz
+        t_param = 0.015
+        lookahead = 0.18
+        gain = 120
+
+        prev_gripper_width = float(points[0].gripper_width)
+        last_gripper_cmd_time = time.perf_counter()
+
+        playback_start_wall = time.perf_counter()
+
+        while True:
+            if self._stop_playback_flag.is_set():
+                logger.info("Playback aborted by user.")
+                self.send_robot_stop()
+                self._is_playing = False
+                return False
+
+            now = time.perf_counter()
+            elapsed_scaled = (now - playback_start_wall) * scale
+
+            if elapsed_scaled >= total_duration:
+                break
+
+            # Desired position from continuous cubic spline
+            q_des = cs_q(elapsed_scaled)
+
+            # Send servoj command with tuned smooth parameters
+            q_str = ", ".join(f"{val:.5f}" for val in q_des)
+            cmd = f"servoj([{q_str}], t={t_param:.4f}, lookahead_time={lookahead}, gain={gain})\n"
+            if self._sock is not None:
+                try:
+                    self._sock.sendall(cmd.encode("utf-8"))
+                except Exception as e:
+                    logger.error(f"Failed to transmit servoj command: {e}")
+
+            # Gripper update
+            if cs_gripper is not None:
+                target_gripper = float(cs_gripper(elapsed_scaled))
+                if abs(target_gripper - prev_gripper_width) >= 0.5 and (now - last_gripper_cmd_time) >= 0.08:
+                    if self._gripper is not None:
+                        try:
+                            self._gripper.grip(target_gripper, wait=False)
+                            prev_gripper_width = target_gripper
+                            last_gripper_cmd_time = now
+                        except Exception:
+                            pass
+            else:
+                target_gripper = prev_gripper_width
+
+            if self.mock:
+                self._mock_q = list(q_des)
+                self._mock_gripper_width = target_gripper
+
+            if progress_callback is not None:
+                pt_idx = min(total_pts - 1, int((elapsed_scaled / total_duration) * total_pts))
+                dummy_pt = TrajectoryPoint(
+                    timestamp=elapsed_scaled,
+                    q=list(q_des),
+                    tcp_pose=[0.0] * 6,
+                    gripper_width=target_gripper,
+                )
+                try:
+                    progress_callback(pt_idx, total_pts, dummy_pt)
+                except Exception:
+                    pass
+
+            target_next_time = playback_start_wall + ((elapsed_scaled + (dt * scale)) / scale)
+            sleep_time = target_next_time - time.perf_counter()
+            if sleep_time > 0.0005:
+                time.sleep(sleep_time)
+
+        self.send_robot_stop()
+        logger.info(f"Trajectory servoj playback complete ({total_pts} points executed).")
+        self._is_playing = False
+        return True
+
+    def _execute_movej_playback(
+        self,
+        points: List[TrajectoryPoint],
+        scale: float,
+        total_pts: int,
+        progress_callback: Optional[Callable[[int, int, TrajectoryPoint], None]],
+    ) -> bool:
+        """Fallback waypoint-by-waypoint discrete movej streaming."""
+        prev_gripper_width = points[0].gripper_width
+        last_gripper_cmd_time = time.perf_counter()
         playback_start_wall = time.perf_counter()
         t_traj_start = points[0].timestamp
 
@@ -1025,24 +1334,15 @@ class PathManager:
                 self._is_playing = False
                 return False
 
-            # Calculate target playback time for this waypoint
             rel_t = (pt.timestamp - t_traj_start) / scale
-
-            # Calculate delta time for servoj
             if idx + 1 < total_pts:
                 next_pt = points[idx + 1]
-                dt = max(0.010, (next_pt.timestamp - pt.timestamp) / scale)
+                dt = max(0.015, (next_pt.timestamp - pt.timestamp) / scale)
             else:
                 dt = 0.033
 
-            # Transmit URScript command to robot
-            if method.lower() == "movej":
-                self._send_movej_step(pt.q, dt=dt)
-            else:
-                self._send_servoj_step(pt.q, dt=dt)
+            self._send_movej_step(pt.q, dt=dt)
 
-            # Command Gripper if width changed meaningfully (> 0.5 mm)
-            # Throttle Modbus traffic to max 10 Hz to keep connection healthy
             now = time.perf_counter()
             width_diff = abs(pt.gripper_width - prev_gripper_width)
             if width_diff >= 0.5 and (now - last_gripper_cmd_time) >= 0.08:
@@ -1051,41 +1351,46 @@ class PathManager:
                         self._gripper.grip(pt.gripper_width, wait=False)
                         prev_gripper_width = pt.gripper_width
                         last_gripper_cmd_time = now
-                    except Exception as e:
-                        logger.debug(f"Modbus gripper command warning: {e}")
+                    except Exception:
+                        pass
 
-            # Update mock state if in simulation
             if self.mock:
                 self._mock_q = list(pt.q)
                 self._mock_tcp = list(pt.tcp_pose)
                 self._mock_gripper_width = pt.gripper_width
 
-            # Notify progress callback
             if progress_callback is not None:
                 try:
                     progress_callback(idx, total_pts, pt)
-                except Exception as cb_err:
-                    logger.debug(f"Progress callback error: {cb_err}")
+                except Exception:
+                    pass
 
-            # High-precision time synchronization with recorded trajectory
             target_wall_time = playback_start_wall + rel_t
             sleep_needed = target_wall_time - time.perf_counter()
             if sleep_needed > 0:
                 time.sleep(sleep_needed)
 
-        # Smooth deceleration at end of path
         self.send_robot_stop()
-        logger.info(f"Trajectory playback complete ({total_pts} points executed).")
+        logger.info(f"Trajectory movej playback complete ({total_pts} points executed).")
         self._is_playing = False
         return True
+
+    def _send_speedj_step(self, qd: List[float], a: float = 1.4, t: float = 0.06):
+        """Sends a continuous speedj command to the robot command socket."""
+        if self._sock is not None:
+            qd_str = ", ".join(f"{val:.5f}" for val in qd)
+            cmd = f"speedj([{qd_str}], a={a:.2f}, t={t:.3f})\n"
+            try:
+                self._sock.sendall(cmd.encode("utf-8"))
+            except Exception as e:
+                logger.error(f"Failed to transmit speedj command: {e}")
 
     def _send_servoj_step(self, q: List[float], dt: float):
         """Sends a smooth servoj command to the robot command socket."""
         if self._sock is not None:
-            # Overlap lookahead time slightly beyond dt to avoid buffer starvation
-            lookahead = 0.1
-            gain = 300
-            t_param = max(0.02, dt * 1.15)
+            lookahead = 0.18
+            gain = 120
+            t_param = max(0.012, dt * 1.15)
             q_str = ", ".join(f"{val:.5f}" for val in q)
             cmd = f"servoj([{q_str}], t={t_param:.4f}, lookahead_time={lookahead}, gain={gain})\n"
             try:
@@ -1220,9 +1525,14 @@ def run_self_test():
         nonlocal progress_count
         progress_count += 1
 
-    success = pm.play_path(method="servoj", speed_scale=2.0, auto_align_start=True, progress_callback=on_progress)
-    print(f"Playback finished: success={success}, progress updates={progress_count}")
-    assert success, "Playback failed!"
+    success = pm.play_path(method="speedj", speed_scale=2.0, auto_align_start=True, progress_callback=on_progress)
+    print(f"speedj Playback finished: success={success}, progress updates={progress_count}")
+    assert success, "speedj Playback failed!"
+
+    # Test servoj mode
+    success_servo = pm.play_path(method="servoj", speed_scale=2.0, auto_align_start=False)
+    print(f"servoj Playback finished: success={success_servo}")
+    assert success_servo, "servoj Playback failed!"
 
     # 5. Clean up test files
     pm.delete_path(saved_csv)

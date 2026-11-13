@@ -151,17 +151,29 @@ HOME_JOINTS_DICT = {
     "wrist_3": 0.0,
 }
 
-# Default Start Position: [-80°, -45°, -100°, 150°, -85°, 60°], Gripper 105.0 mm (wide open)
-DEFAULT_START_JOINTS = [-80.0, -45.0, -100.0, 150.0, -85.0, 60.0]
-DEFAULT_START_JOINTS_DICT = {
-    "shoulder_pan": -80.0,
-    "shoulder_lift": -45.0,
-    "elbow": -100.0,
-    "wrist_1": 150.0,
-    "wrist_2": -85.0,
-    "wrist_3": 60.0,
-}
-DEFAULT_START_GRIPPER_MM = 105.0
+# Default Start Position loaded dynamically from default_start_position.json
+try:
+    from start_position_config import (
+        get_default_start_joints_dict,
+        get_default_start_joints_deg,
+        get_default_start_gripper_mm,
+        save_start_position as persist_start_position,
+    )
+    DEFAULT_START_JOINTS = get_default_start_joints_deg()
+    DEFAULT_START_JOINTS_DICT = get_default_start_joints_dict()
+    DEFAULT_START_GRIPPER_MM = get_default_start_gripper_mm()
+except ImportError:
+    DEFAULT_START_JOINTS = [-90.0, -40.0, -100.0, 120.0, -90.0, 120.0]
+    DEFAULT_START_JOINTS_DICT = {
+        "shoulder_pan": -90.0,
+        "shoulder_lift": -40.0,
+        "elbow": -100.0,
+        "wrist_1": 120.0,
+        "wrist_2": -90.0,
+        "wrist_3": 120.0,
+    }
+    DEFAULT_START_GRIPPER_MM = 105.0
+    persist_start_position = None
 
 
 def detect_available_cameras() -> List[Tuple[int, str]]:
@@ -457,13 +469,18 @@ class RobotRTDEWorker(QThread):
         self._motion_last_disp = 999.0
         self._motion_last_progress_time = 0.0
 
-        # Latest joint states (radians)
+        # Latest joint states (radians) and TCP pose [x, y, z, rx, ry, rz]
         self._latest_q = {j: 0.0 for j in UR5E_JOINTS}
+        self._latest_tcp: List[float] = [-0.1334, -0.0631, 0.5503, 1.0980, -1.8947, 1.3240]
         self._mock_cartesian_v: List[float] = [0.0] * 6
 
     def get_latest_joints(self) -> Dict[str, float]:
         with QMutexLocker(self._cmd_lock):
             return dict(self._latest_q)
+
+    def get_latest_tcp(self) -> List[float]:
+        with QMutexLocker(self._cmd_lock):
+            return list(self._latest_tcp)
 
     def set_mock_cartesian_velocity(self, v: List[float]):
         with QMutexLocker(self._cmd_lock):
@@ -602,6 +619,12 @@ class RobotRTDEWorker(QThread):
                     q_list = self._robot.rx.getActualQ()
                     for idx, j_name in enumerate(UR5E_JOINTS):
                         self._latest_q[j_name] = float(q_list[idx])
+                    try:
+                        tcp_pose = self._robot.rx.getActualTCPPose()
+                        if tcp_pose and len(tcp_pose) == 6:
+                            self._latest_tcp = [float(v) for v in tcp_pose]
+                    except Exception:
+                        pass
                 except Exception as err:
                     print(f"[WARNING] RTDE read exception: {err}")
 
@@ -674,6 +697,9 @@ class RobotRTDEWorker(QThread):
                     mock_angles[1] -= vz * dt * 1.2
                     mock_angles[4] += w_wrist2 * dt
                     mock_angles[5] += w_wrist3 * dt
+                    self._latest_tcp[0] += vx * dt
+                    self._latest_tcp[1] += vy * dt
+                    self._latest_tcp[2] += vz * dt
                 for idx, j_name in enumerate(UR5E_JOINTS):
                     self._latest_q[j_name] = mock_angles[idx]
 
@@ -1169,6 +1195,9 @@ class UR5ePolicyTesterStudio(QMainWindow):
                 )
                 self.gamepad_teleop.set_joint_positions_provider(
                     lambda: self.robot_worker.get_latest_joints()
+                )
+                self.gamepad_teleop.set_tcp_pose_provider(
+                    lambda: self.robot_worker.get_latest_tcp()
                 )
                 if hasattr(self, "slider_gamepad_speed"):
                     self.gamepad_teleop.set_speed_percentage(self.slider_gamepad_speed.value())
@@ -1714,7 +1743,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
         """)
         self.btn_toggle_gamepad.setToolTip(
             "Toggle real-time Cartesian teleoperation & direct joint control via gamepad.\n"
-            "• Left Stick (XY): TCP Forward/Backward (+X/-X) and Left/Right (+Y/-Y)\n"
+            "• Left Stick (XY): Tool-Gaze Forward/Backward (gripper pointing direction) & Strafe Left/Right\n"
             "• Right Stick (Y): TCP Vertical Up/Down (+Z/-Z)\n"
             "• Right Stick (X): Direct Base Motor Rotation (shoulder_pan)\n"
             "• Shoulders (LB/RB / L1/R1): Direct Wrist 2 Rotation\n"
@@ -3006,6 +3035,10 @@ class UR5ePolicyTesterStudio(QMainWindow):
         current_rads = self.robot_worker.get_latest_joints()
         for j in UR5E_JOINTS:
             self.start_position[j] = round(math.degrees(current_rads.get(j, 0.0)), 1)
+        gripper_w = float(self.gripper_slider.value()) if hasattr(self, "gripper_slider") else DEFAULT_START_GRIPPER_MM
+        if persist_start_position is not None:
+            persist_start_position(self.start_position, gripper_w)
+            print("[CONFIG] Persisted new start position to default_start_position.json")
         self.update_start_pose_display()
         pose_str = ", ".join(f"{self.start_position[j]:+.1f}°" for j in UR5E_JOINTS)
         print(f"[POSITION] Active Start Position set to: [{pose_str}]")

@@ -134,14 +134,19 @@ class MockUR5eRobot:
         self.is_connected = False
         self._freedrive_active = False
         self.sock = None
-        self._joints = {
-            "shoulder_pan.pos": math.radians(-80.0),
-            "shoulder_lift.pos": math.radians(-45.0),
-            "elbow.pos": math.radians(-100.0),
-            "wrist_1.pos": math.radians(150.0),
-            "wrist_2.pos": math.radians(-85.0),
-            "wrist_3.pos": math.radians(60.0),
-        }
+        try:
+            from start_position_config import get_default_start_joints_dict
+            _sp_dict = get_default_start_joints_dict()
+            self._joints = {f"{k}.pos": math.radians(v) for k, v in _sp_dict.items()}
+        except Exception:
+            self._joints = {
+                "shoulder_pan.pos": math.radians(-90.0),
+                "shoulder_lift.pos": math.radians(-40.0),
+                "elbow.pos": math.radians(-100.0),
+                "wrist_1.pos": math.radians(120.0),
+                "wrist_2.pos": math.radians(-90.0),
+                "wrist_3.pos": math.radians(120.0),
+            }
 
     def connect(self):
         self.is_connected = True

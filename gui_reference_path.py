@@ -147,17 +147,28 @@ HOME_JOINTS_DICT: Dict[str, float] = {
     "wrist_3": 0.0,
 }
 
-# Requested Default Start Coordinates: -80, -45, -100, 150, -85, 60 (deg), Gripper wide open (105.0 mm)
-DEFAULT_START_JOINTS_DICT: Dict[str, float] = {
-    "shoulder_pan": -80.0,
-    "shoulder_lift": -45.0,
-    "elbow": -100.0,
-    "wrist_1": 150.0,
-    "wrist_2": -85.0,
-    "wrist_3": 60.0,
-}
-
-DEFAULT_START_GRIPPER_MM: float = 105.0  # As wide open as possible for OnRobot 2FG
+# Centralized start position loader from default_start_position.json
+try:
+    from start_position_config import (
+        get_default_start_joints_dict,
+        get_default_start_gripper_mm,
+        save_start_position as persist_start_position,
+        load_start_position,
+        UR5E_JOINT_NAMES,
+    )
+    DEFAULT_START_JOINTS_DICT = get_default_start_joints_dict()
+    DEFAULT_START_GRIPPER_MM = get_default_start_gripper_mm()
+except ImportError:
+    DEFAULT_START_JOINTS_DICT: Dict[str, float] = {
+        "shoulder_pan": -90.0,
+        "shoulder_lift": -40.0,
+        "elbow": -100.0,
+        "wrist_1": 120.0,
+        "wrist_2": -90.0,
+        "wrist_3": 120.0,
+    }
+    DEFAULT_START_GRIPPER_MM: float = 105.0
+    persist_start_position = None
 
 
 def detect_available_cameras() -> List[Tuple[int, str]]:
@@ -489,7 +500,7 @@ class RobotRTDEWorker(QThread):
         self._latest_q: Dict[str, float] = {
             j: math.radians(DEFAULT_START_JOINTS_DICT[j]) for j in UR5E_JOINT_NAMES
         }
-        self._latest_tcp: List[float] = [0.35, -0.20, 0.45, 2.22, -2.22, 0.0]
+        self._latest_tcp: List[float] = [-0.1334, -0.0631, 0.5503, 1.0980, -1.8947, 1.3240]
         self._mock_velocity: List[float] = [0.0] * 6
 
     @property
@@ -909,6 +920,9 @@ class ReferencePathStudio(QMainWindow):
             )
             self.gamepad_teleop.set_joint_positions_provider(
                 lambda: self.robot_worker.get_latest_joints()
+            )
+            self.gamepad_teleop.set_tcp_pose_provider(
+                lambda: self.robot_worker.get_latest_tcp()
             )
 
             if hasattr(self, "slider_gamepad_speed"):
@@ -1385,7 +1399,7 @@ class ReferencePathStudio(QMainWindow):
         play_btn_row = QHBoxLayout()
         play_btn_row.setSpacing(10)
 
-        self.btn_play_path = QPushButton("▶ Play Path (servoj)")
+        self.btn_play_path = QPushButton("▶ Play Path (Smooth)")
         self.btn_play_path.setFixedHeight(40)
         self.btn_play_path.setStyleSheet("""
             QPushButton {
@@ -1432,17 +1446,26 @@ class ReferencePathStudio(QMainWindow):
         play_opt_row = QHBoxLayout()
         play_opt_row.setSpacing(10)
 
-        self.chk_auto_align = QCheckBox("Auto-align to Start Position if not at start")
+        self.chk_auto_align = QCheckBox("Auto-align to Start Position")
         self.chk_auto_align.setChecked(True)
         self.chk_auto_align.setToolTip(
             "Checks if the robot is currently at the file's start position. If not, smoothly navigates there before waypoint streaming."
         )
         play_opt_row.addWidget(self.chk_auto_align)
 
+        self.chk_smooth_traj = QCheckBox("Smooth Gamepad Tremor")
+        self.chk_smooth_traj.setChecked(True)
+        self.chk_smooth_traj.setStyleSheet("color: #38bdf8; font-weight: 600;")
+        self.chk_smooth_traj.setToolTip(
+            "Applies continuous cubic spline interpolation and polynomial noise filtering to eliminate choppy discrete steps."
+        )
+        play_opt_row.addWidget(self.chk_smooth_traj)
+
         play_opt_row.addWidget(QLabel("Method:"))
         self.combo_play_method = QComboBox()
-        self.combo_play_method.addItem("servoj (Streaming)", "servoj")
-        self.combo_play_method.addItem("movej (Waypoints)", "movej")
+        self.combo_play_method.addItem("speedj (Smooth Closed-Loop Velocity) [Recommended]", "speedj")
+        self.combo_play_method.addItem("servoj (Spline-Smoothed 100 Hz)", "servoj")
+        self.combo_play_method.addItem("movej (Dense Waypoints)", "movej")
         play_opt_row.addWidget(self.combo_play_method)
 
         play_opt_row.addWidget(QLabel("Speed:"))
@@ -1801,6 +1824,15 @@ class ReferencePathStudio(QMainWindow):
         self.btn_toggle_gamepad = QPushButton("🎮 Enable Gamepad Teleop")
         self.btn_toggle_gamepad.setCheckable(True)
         self.btn_toggle_gamepad.setFixedHeight(30)
+        self.btn_toggle_gamepad.setToolTip(
+            "Toggle real-time Cartesian teleoperation & direct joint control via gamepad.\n"
+            "• Left Stick: Tool-Gaze Forward/Backward (gripper pointing direction) & Strafe Left/Right\n"
+            "• Right Stick (Y): TCP Vertical Up/Down (+Z/-Z)\n"
+            "• Right Stick (X): Direct Base Motor Rotation (shoulder_pan)\n"
+            "• Shoulders (LB/RB): Direct Wrist 2 Rotation\n"
+            "• Triggers (LT/RT): Direct Wrist 3 Rotation\n"
+            "• [A]/[B]: Close/Open Gripper"
+        )
         self.btn_toggle_gamepad.setStyleSheet("""
             QPushButton {
                 background-color: #1e293b;
@@ -2223,9 +2255,10 @@ class ReferencePathStudio(QMainWindow):
         if self.gamepad_teleop and self.gamepad_teleop.is_enabled():
             self.gamepad_teleop.set_inhibited(True, "Deterministic playback in progress")
 
-        method = str(self.combo_play_method.currentData() or "servoj")
+        method = str(self.combo_play_method.currentData() or "speedj")
         speed_scale = self.slider_play_speed.value() / 100.0
         auto_align = self.chk_auto_align.isChecked()
+        smooth = self.chk_smooth_traj.isChecked()
 
         self.btn_play_path.setEnabled(False)
         self.btn_record_toggle.setEnabled(False)
@@ -2246,13 +2279,14 @@ class ReferencePathStudio(QMainWindow):
 
         self.prog_playback.setValue(0)
         self.prog_playback.setFormat("Checking Start Position & Replaying...")
-        self.status_bar.showMessage(f"Executing deterministic playback ({method})...")
-        self.log(f"Starting playback: method={method}, speed={speed_scale:.2f}x, auto_align={auto_align}")
+        self.status_bar.showMessage(f"Executing smooth deterministic playback ({method})...")
+        self.log(f"Starting playback: method={method}, speed={speed_scale:.2f}x, auto_align={auto_align}, smooth={smooth}")
 
         self.path_manager.play_path_async(
             method=method,
             speed_scale=speed_scale,
             auto_align_start=auto_align,
+            smooth=smooth,
             progress_callback=self._on_playback_progress,
             completion_callback=self._on_playback_completed,
         )
@@ -2368,6 +2402,9 @@ class ReferencePathStudio(QMainWindow):
 
         self.update_start_pose_display()
         self.path_manager.set_start_position(self.start_position, gripper_width=self.start_gripper_mm)
+        if persist_start_position is not None:
+            persist_start_position(self.start_position, self.start_gripper_mm)
+            self.log("[CONFIG] Persisted new start position to default_start_position.json")
         pose_str = ", ".join(f"{self.start_position[j]:+.1f}°" for j in UR5E_JOINT_NAMES)
         self.lbl_file_start_pose.setText(f"Active Start: [{pose_str}] | Grip: {self.start_gripper_mm:.1f}mm")
         self.log(f"Active Start Position saved: [{pose_str}] | Gripper: {self.start_gripper_mm:.1f}mm")

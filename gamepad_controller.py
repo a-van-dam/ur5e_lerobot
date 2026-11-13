@@ -125,17 +125,29 @@ except ImportError:
             self.mutex.unlock()
 
 
-# Standard default start pose in degrees and radians: [-80, -45, -100, 150, -85, 60]
-DEFAULT_START_JOINTS_DEG = [-80.0, -45.0, -100.0, 150.0, -85.0, 60.0]
-DEFAULT_START_JOINTS_RAD = [math.radians(x) for x in DEFAULT_START_JOINTS_DEG]
-UR5E_JOINT_NAMES = [
-    "shoulder_pan",
-    "shoulder_lift",
-    "elbow",
-    "wrist_1",
-    "wrist_2",
-    "wrist_3",
-]
+# Standard default start pose loaded dynamically from default_start_position.json
+try:
+    from start_position_config import (
+        get_default_start_joints_deg,
+        get_default_start_joints_rad,
+        get_default_start_gripper_mm,
+        UR5E_JOINT_NAMES,
+    )
+    DEFAULT_START_JOINTS_DEG = get_default_start_joints_deg()
+    DEFAULT_START_JOINTS_RAD = get_default_start_joints_rad()
+    DEFAULT_START_GRIPPER_MM = get_default_start_gripper_mm()
+except ImportError:
+    DEFAULT_START_JOINTS_DEG = [-90.0, -40.0, -100.0, 120.0, -90.0, 120.0]
+    DEFAULT_START_JOINTS_RAD = [math.radians(x) for x in DEFAULT_START_JOINTS_DEG]
+    DEFAULT_START_GRIPPER_MM = 105.0
+    UR5E_JOINT_NAMES = [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow",
+        "wrist_1",
+        "wrist_2",
+        "wrist_3",
+    ]
 
 
 # =============================================================================
@@ -189,28 +201,31 @@ class GamepadConfig:
     invert_left_horizontal: bool = False
     invert_right_horizontal: bool = False
 
-    # Heading-relative transformation
+    # Direction & Frame modes
+    direction_mode: str = "tool_gaze"        # 'tool_gaze' (moves in gripper pointing direction) or 'base_heading'
     heading_relative: bool = True
     heading_offset_rad: float = 0.0
 
-    # Filtering & Response curve
-    deadzone: float = 0.10
+    # Filtering & Response curve (smooth, responsive, intuitive control)
+    deadzone: float = 0.08                     # Deadzone threshold (starts smoothly)
     trigger_deadzone: float = 0.05
-    velocity_curve_exponent: float = 1.0
+    velocity_curve_exponent: float = 1.4       # Responsive curve for fine & brisk control
+    left_stick_curve_exponent: float = 1.4     # Left stick responsive curve (smooth near center, brisk when pushed)
+    left_stick_speed_mult: float = 0.85        # Active forward/backward reach (moves gripper head clearly in space)
 
     # Master Scaling Factors (0.10 to 1.00, default 0.50 = 50%)
     speed_scale: float = 0.50
     accel_scale: float = 0.50
 
     # Baseline Velocities at 100% scale
-    base_linear_velocity: float = 0.15      # m/s -> 0.075 m/s at 50%
-    base_base_velocity: float = 0.50        # rad/s -> 0.25 rad/s at 50%
-    base_wrist2_velocity: float = 0.50      # rad/s -> 0.25 rad/s at 50%
-    base_wrist3_velocity: float = 0.75      # rad/s -> 0.375 rad/s at 50%
+    base_linear_velocity: float = 0.15         # m/s -> at 50% scale, 0.075 m/s (~6.4 cm/s with left mult)
+    base_base_velocity: float = 0.50           # rad/s -> 0.25 rad/s at 50% (Right stick X: unchanged)
+    base_wrist2_velocity: float = 0.50         # rad/s -> 0.25 rad/s at 50%
+    base_wrist3_velocity: float = 0.75         # rad/s -> 0.375 rad/s at 50%
 
     # Baseline Accelerations at 100% scale (gentle defaults eliminate protective stops)
-    base_linear_acceleration: float = 0.35  # m/s^2 -> 0.175 m/s^2 at 50%
-    base_joint_acceleration: float = 0.60   # rad/s^2 -> 0.30 rad/s^2 at 50%
+    base_linear_acceleration: float = 0.40     # m/s^2 -> responsive linear acceleration ramp
+    base_joint_acceleration: float = 0.60      # rad/s^2 -> 0.30 rad/s^2 at 50%
 
     # URScript execution parameters
     time_step: float = 0.08                 # URScript watchdog duration (seconds)
@@ -317,6 +332,25 @@ def apply_deadzone(value: float, deadzone: float, exponent: float = 1.0) -> floa
     return math.copysign(scaled, value)
 
 
+def rotvec_to_matrix(rotvec: Union[List[float], Tuple[float, ...]]) -> List[List[float]]:
+    """Converts a 3D rotation vector [rx, ry, rz] to a 3x3 rotation matrix using Rodrigues' formula."""
+    rx, ry, rz = float(rotvec[0]), float(rotvec[1]), float(rotvec[2])
+    theta = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if theta < 1e-6:
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+    kx, ky, kz = rx / theta, ry / theta, rz / theta
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    v = 1.0 - cos_t
+
+    return [
+        [cos_t + kx * kx * v, kx * ky * v - kz * sin_t, kx * kz * v + ky * sin_t],
+        [ky * kx * v + kz * sin_t, cos_t + ky * ky * v, ky * kz * v - kx * sin_t],
+        [kz * kx * v - ky * sin_t, kz * ky * v + kx * sin_t, cos_t + kz * kz * v],
+    ]
+
+
 def format_speedl(v: List[float], a: float = 0.35, t: float = 0.08) -> str:
     """Formats a Cartesian TCP velocity command as a standard URScript string ending with newline."""
     v_str = ", ".join(f"{val:.4f}" for val in v)
@@ -420,9 +454,13 @@ class UR5eGamepadTeleop(QThread):
         self._current_base_angle: float = self._current_joints[0]
         self._base_angle_provider: Optional[Callable[[], float]] = None
 
+        # 6-DoF TCP pose tracking for Tool-Gaze frame directional control [x, y, z, rx, ry, rz]
+        self._tcp_pose: List[float] = [-0.1334, -0.0631, 0.5503, 1.098, -1.8947, 1.324]
+        self._tcp_pose_provider: Optional[Callable[[], List[float]]] = None
+
         # Gripper control state
         self.gripper: Optional[Any] = None
-        self._gripper_target_width: float = 105.0  # Default wide open (105.0 mm)
+        self._gripper_target_width: float = DEFAULT_START_GRIPPER_MM  # Default wide open (105.0 mm)
         self._last_gripper_cmd_time: float = 0.0
         self._gripper_button_active: bool = False
 
@@ -508,6 +546,29 @@ class UR5eGamepadTeleop(QThread):
     def set_base_angle_provider(self, provider_fn: Callable[[], float]):
         with QMutexLocker(self._lock):
             self._base_angle_provider = provider_fn
+
+    def set_tcp_pose_provider(self, provider_fn: Callable[[], List[float]]):
+        """Attaches an external callable providing live [x, y, z, rx, ry, rz] TCP pose."""
+        with QMutexLocker(self._lock):
+            self._tcp_pose_provider = provider_fn
+
+    def set_tcp_pose(self, pose: List[float]):
+        """Sets cached 6-DoF TCP pose."""
+        with QMutexLocker(self._lock):
+            if isinstance(pose, (list, tuple)) and len(pose) >= 6:
+                self._tcp_pose = [float(x) for x in pose[:6]]
+
+    def get_tcp_pose(self) -> List[float]:
+        """Returns the current 6-DoF TCP pose [x, y, z, rx, ry, rz]."""
+        with QMutexLocker(self._lock):
+            if self._tcp_pose_provider is not None:
+                try:
+                    p = self._tcp_pose_provider()
+                    if isinstance(p, (list, tuple)) and len(p) >= 6:
+                        return [float(x) for x in p[:6]]
+                except Exception:
+                    pass
+            return list(self._tcp_pose)
 
     def set_gripper(self, gripper: Any):
         """Attaches an OnRobot2FGModbus instance for gamepad gripper control."""
@@ -814,27 +875,60 @@ class UR5eGamepadTeleop(QThread):
         raw_ly = self._joystick.get_axis(self.config.axis_left_y) if self.config.axis_left_y < num_axes else 0.0
         raw_ry = self._joystick.get_axis(self.config.axis_right_y) if self.config.axis_right_y < num_axes else 0.0
 
-        scale_x = apply_deadzone(raw_ly, self.config.deadzone, self.config.velocity_curve_exponent)
-        scale_y = apply_deadzone(raw_lx, self.config.deadzone, self.config.velocity_curve_exponent)
+        # Dedicated exponential response curve for Left Stick (fine, non-twitchy control near center)
+        left_exp = getattr(self.config, "left_stick_curve_exponent", 2.2)
+        scale_x = apply_deadzone(raw_ly, self.config.deadzone, left_exp)
+        scale_y = apply_deadzone(raw_lx, self.config.deadzone, left_exp)
+
+        # Right stick Z uses standard exponent (preserving user-approved Right Stick feel)
         scale_z = apply_deadzone(raw_ry, self.config.deadzone, self.config.velocity_curve_exponent)
 
         left_lr_mult = -1.0 if self.config.invert_left_horizontal else 1.0
         right_lr_mult = -1.0 if self.config.invert_right_horizontal else 1.0
 
-        vfwd = scale_x * self.config.invert_x * self.config.max_linear_velocity
-        vlat = scale_y * self.config.invert_y * self.config.max_linear_velocity * left_lr_mult
+        # Left stick translational speed scaled down for smooth, calm, controllable teleoperation
+        left_v_max = self.config.max_linear_velocity * getattr(self.config, "left_stick_speed_mult", 0.45)
+        vfwd = scale_x * self.config.invert_x * left_v_max
+        vlat = scale_y * self.config.invert_y * left_v_max * left_lr_mult
         vz = scale_z * self.config.invert_z * self.config.max_linear_velocity
 
-        # Transform (vfwd, vlat) into robot base frame coordinates based on active arm heading
-        theta = self.get_base_angle() + self.config.heading_offset_rad
-        if self.config.heading_relative:
-            vx = vfwd * math.cos(theta) - vlat * math.sin(theta)
-            vy = vfwd * math.sin(theta) + vlat * math.cos(theta)
-        else:
-            vx = vfwd
-            vy = vlat
+        # Gripper Tool-Gaze Directional Mapping:
+        # Pushing UP moves forward along the actual line of sight / pointing direction of the gripper
+        tcp_pose = self.get_tcp_pose()
+        has_tool_rot = tcp_pose is not None and len(tcp_pose) >= 6 and any(abs(x) > 1e-4 for x in tcp_pose[3:6])
 
-        cart_vel = [vx, vy, vz, 0.0, 0.0, 0.0]
+        if has_tool_rot and getattr(self.config, "direction_mode", "tool_gaze") == "tool_gaze":
+            R_mat = rotvec_to_matrix(tcp_pose[3:6])
+            # Tool Z axis (column 2) is the pointing / gaze direction of the gripper
+            u_fwd = [R_mat[0][2], R_mat[1][2], R_mat[2][2]]
+
+            # Lateral vector: horizontal right relative to gripper gaze (u_fwd x [0,0,1])
+            u_right = [
+                u_fwd[1] * 1.0 - u_fwd[2] * 0.0,
+                u_fwd[2] * 0.0 - u_fwd[0] * 1.0,
+                0.0,
+            ]
+            norm_r = math.sqrt(u_right[0]**2 + u_right[1]**2)
+            if norm_r > 1e-3:
+                u_lat = [u_right[0] / norm_r, u_right[1] / norm_r, 0.0]
+            else:
+                u_lat = [R_mat[0][0], R_mat[1][0], R_mat[2][0]]
+
+            vx = vfwd * u_fwd[0] + vlat * u_lat[0]
+            vy = vfwd * u_fwd[1] + vlat * u_lat[1]
+            vz_total = vz + (vfwd * u_fwd[2] + vlat * u_lat[2])
+        else:
+            # Fallback to heading-relative cylindrical transformation
+            theta = self.get_base_angle() + self.config.heading_offset_rad
+            if self.config.heading_relative:
+                vx = vfwd * math.cos(theta) - vlat * math.sin(theta)
+                vy = vfwd * math.sin(theta) + vlat * math.cos(theta)
+            else:
+                vx = vfwd
+                vy = vlat
+            vz_total = vz
+
+        cart_vel = [vx, vy, vz_total, 0.0, 0.0, 0.0]
 
         # ---------------------------------------------------------------------
         # 2. Direct Base Motor Rotation: Right Stick (X) -> shoulder_pan

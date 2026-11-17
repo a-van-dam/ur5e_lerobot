@@ -649,6 +649,35 @@ class UR5eGamepadTeleop(QThread):
         with QMutexLocker(self._lock):
             return self._is_controller_connected
 
+    def has_active_teleop_input(self) -> bool:
+        """
+        Returns True if the user is actively commanding the robot via gamepad:
+        any analog stick deflected beyond deadzone, trigger squeezed, bumper held,
+        or gripper button (A/B) pressed.
+        """
+        with QMutexLocker(self._lock):
+            if self.mock:
+                return any(abs(x) > 1e-4 for x in self._latest_state)
+            if not self._is_controller_connected or self._joystick is None:
+                return False
+            # Check non-zero analog velocity axes: [vx, vy, vz, w_base, w_wrist2, w_wrist3]
+            if any(abs(x) > 1e-4 for x in self._latest_state):
+                return True
+            # Check gripper buttons (A / B) or shoulder buttons
+            try:
+                num_buttons = self._joystick.get_numbuttons()
+                if self.config.button_gripper_close < num_buttons and bool(self._joystick.get_button(self.config.button_gripper_close)):
+                    return True
+                if self.config.button_gripper_open < num_buttons and bool(self._joystick.get_button(self.config.button_gripper_open)):
+                    return True
+                if self.config.button_shoulder_left < num_buttons and bool(self._joystick.get_button(self.config.button_shoulder_left)):
+                    return True
+                if self.config.button_shoulder_right < num_buttons and bool(self._joystick.get_button(self.config.button_shoulder_right)):
+                    return True
+            except Exception:
+                pass
+            return False
+
     def get_controller_name(self) -> str:
         with QMutexLocker(self._lock):
             return self._controller_name

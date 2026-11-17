@@ -120,6 +120,19 @@ except ImportError:
     OnRobot2FGModbus = None
     ONROBOT_GRIPPER_AVAILABLE = False
 
+# Hybrid Trajectory Assist & Min-Jerk Recovery
+try:
+    from path_manager import PathManager, TrajectoryPoint
+    from hybrid_path_runner import HybridPathWorker, HybridState
+    HYBRID_AVAILABLE = True
+except ImportError as err:
+    HYBRID_AVAILABLE = False
+    PathManager = None
+    TrajectoryPoint = None
+    HybridPathWorker = None
+    HybridState = None
+    print(f"[HYBRID WARNING] Could not import hybrid components: {err}")
+
 
 
 # Default Configuration
@@ -527,6 +540,42 @@ class RobotRTDEWorker(QThread):
     def request_disconnect(self):
         with QMutexLocker(self._cmd_lock):
             self._cmd_disconnect = True
+
+    def stream_servoj(self, target_q: List[float], dt: float = 0.02):
+        """Streams a servoj position command smoothly to the physical arm or mock model."""
+        if not self.mock and self._robot and hasattr(self._robot, "sock") and self._robot.sock:
+            q_str = ", ".join(f"{val:.5f}" for val in target_q)
+            cmd = f"servoj([{q_str}], t={dt:.3f}, lookahead_time=0.1, gain=300)\n"
+            try:
+                self._robot.sock.sendall(cmd.encode("utf-8"))
+            except Exception as e:
+                print(f"[ERROR] servoj transmission failed: {e}")
+        elif self.mock:
+            with QMutexLocker(self._cmd_lock):
+                for idx, j_name in enumerate(UR5E_JOINTS):
+                    self._latest_q[j_name] = float(target_q[idx])
+
+    def stream_speedj(self, qd: List[float], a: float = 1.4, t: float = 0.06):
+        """Streams a speedj joint velocity command smoothly to the physical arm or mock model."""
+        if not self.mock and self._robot and hasattr(self._robot, "sock") and self._robot.sock:
+            qd_str = ", ".join(f"{val:.4f}" for val in qd)
+            cmd = f"speedj([{qd_str}], a={a:.2f}, t={t:.2f})\n"
+            try:
+                self._robot.sock.sendall(cmd.encode("utf-8"))
+            except Exception as e:
+                print(f"[ERROR] speedj transmission failed: {e}")
+        elif self.mock:
+            with QMutexLocker(self._cmd_lock):
+                for idx, j_name in enumerate(UR5E_JOINTS):
+                    self._latest_q[j_name] += float(qd[idx]) * t
+
+    def stop_motion(self, a: float = 2.0):
+        """Halts motion immediately on the physical arm."""
+        if not self.mock and self._robot and hasattr(self._robot, "sock") and self._robot.sock:
+            try:
+                self._robot.sock.sendall(f"stopj({a:.2f})\n".encode("utf-8"))
+            except Exception:
+                pass
 
     def run(self):
         self._running = True
@@ -1045,6 +1094,13 @@ class UR5eRecorderStudio(QMainWindow):
         self.camera_width = 320
         self.camera_height = 240
 
+        # Hybrid Control, Reference Path Playback & Min-Jerk Recovery
+        self.path_manager: Optional[PathManager] = PathManager(robot_ip=self.robot_ip, mock=self.mock_mode) if PathManager else None
+        self.loaded_ref_path: Optional[Path] = None
+        self.loaded_ref_waypoints: List[Any] = []
+        self.override_delay_s: float = 0.50
+        self.hybrid_worker: Optional[Any] = None
+
         # Apply dark industrial visual styling
         self.apply_theme()
 
@@ -1164,6 +1220,9 @@ class UR5eRecorderStudio(QMainWindow):
 
         # Scan initial dataset directory
         self.rescan_dataset_directory()
+
+        # Scan available pre-recorded reference paths
+        self.rescan_reference_paths()
 
         print(f"[SYSTEM] UR5e Studio initialized. Target IP: {self.robot_ip} | Camera: /dev/video{self.camera_index}")
         if self.mock_mode:
@@ -1725,6 +1784,150 @@ class UR5eRecorderStudio(QMainWindow):
         gamepad_main_layout.addLayout(gamepad_row2)
 
         rec_layout.addWidget(gamepad_panel)
+
+        # =====================================================================
+        # Hybrid Assist & Pre-Recorded Reference Path Panel
+        # =====================================================================
+        hybrid_panel = QFrame()
+        hybrid_panel.setStyleSheet("""
+            QFrame {
+                background-color: #0b1120;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 4px;
+            }
+        """)
+        hybrid_main_layout = QVBoxLayout(hybrid_panel)
+        hybrid_main_layout.setContentsMargins(8, 6, 8, 6)
+        hybrid_main_layout.setSpacing(6)
+
+        # Row 1: Header, Path Selector Combo, Browse Button, Clear Button
+        hybrid_row1 = QHBoxLayout()
+        hybrid_row1.setSpacing(8)
+
+        lbl_hybrid_title = QLabel("🤖 HYBRID CONTROL:")
+        lbl_hybrid_title.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
+        lbl_hybrid_title.setToolTip("Execute pre-recorded golden trajectory with seamless real-time gamepad override and minimum-jerk snapback.")
+        hybrid_row1.addWidget(lbl_hybrid_title)
+
+        self.combo_ref_path = QComboBox()
+        self.combo_ref_path.setMinimumHeight(28)
+        self.combo_ref_path.setStyleSheet("""
+            QComboBox {
+                background-color: #1e293b;
+                color: #f8fafc;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 2px 8px;
+                font-size: 11px;
+                min-width: 220px;
+            }
+            QComboBox:hover {
+                border-color: #38bdf8;
+            }
+        """)
+        self.combo_ref_path.setToolTip("Select pre-recorded trajectory from reference_paths/")
+        self.combo_ref_path.currentIndexChanged.connect(self.on_ref_path_combo_changed)
+        hybrid_row1.addWidget(self.combo_ref_path, stretch=1)
+
+        self.btn_browse_ref_path = QPushButton("📂 Browse...")
+        self.btn_browse_ref_path.setMinimumHeight(28)
+        self.btn_browse_ref_path.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #cbd5e1;
+                border: 1px solid #475569;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 2px 10px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #ffffff;
+            }
+        """)
+        self.btn_browse_ref_path.setToolTip("Open pre-recorded reference path (.csv or .json) from disk")
+        self.btn_browse_ref_path.clicked.connect(self.browse_reference_path)
+        hybrid_row1.addWidget(self.btn_browse_ref_path)
+
+        self.btn_clear_ref_path = QPushButton("✕ Clear")
+        self.btn_clear_ref_path.setMinimumHeight(28)
+        self.btn_clear_ref_path.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #94a3b8;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                font-size: 11px;
+                padding: 2px 8px;
+            }
+            QPushButton:hover {
+                background-color: #7f1d1d;
+                color: #fca5a5;
+            }
+        """)
+        self.btn_clear_ref_path.setToolTip("Clear loaded reference path to switch to manual demonstration recording")
+        self.btn_clear_ref_path.clicked.connect(self.clear_reference_path)
+        hybrid_row1.addWidget(self.btn_clear_ref_path)
+
+        hybrid_main_layout.addLayout(hybrid_row1)
+
+        # Row 2: Return Delay Dropdown, State Badge, Progress Readout
+        hybrid_row2 = QHBoxLayout()
+        hybrid_row2.setSpacing(10)
+
+        lbl_delay = QLabel("⏱ Return Delay:")
+        lbl_delay.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold;")
+        lbl_delay.setToolTip("Grace period: duration of zero gamepad input required before robot transitions to State 3 (Recovery) and snaps back to the path.")
+        hybrid_row2.addWidget(lbl_delay)
+
+        self.combo_override_delay = QComboBox()
+        self.combo_override_delay.setMinimumHeight(26)
+        self.combo_override_delay.setStyleSheet("""
+            QComboBox {
+                background-color: #1e293b;
+                color: #f8fafc;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-size: 11px;
+                min-width: 125px;
+            }
+        """)
+        self.combo_override_delay.addItem("300 ms", 0.30)
+        self.combo_override_delay.addItem("500 ms (Default)", 0.50)
+        self.combo_override_delay.addItem("750 ms", 0.75)
+        self.combo_override_delay.addItem("1000 ms (1.0 s)", 1.00)
+        self.combo_override_delay.addItem("1500 ms (1.5 s)", 1.50)
+        self.combo_override_delay.addItem("2000 ms (2.0 s)", 2.00)
+        self.combo_override_delay.addItem("0 ms (Immediate)", 0.00)
+        self.combo_override_delay.setCurrentIndex(1)  # 500 ms default
+        self.combo_override_delay.currentIndexChanged.connect(self.on_override_delay_changed)
+        hybrid_row2.addWidget(self.combo_override_delay)
+
+        self.lbl_hybrid_state = QLabel("HYBRID: IDLE")
+        self.lbl_hybrid_state.setStyleSheet("""
+            color: #64748b;
+            background-color: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 4px;
+            padding: 3px 8px;
+            font-size: 11px;
+            font-weight: bold;
+        """)
+        hybrid_row2.addWidget(self.lbl_hybrid_state)
+
+        self.lbl_hybrid_progress = QLabel("Path: None (Manual Demo Mode)")
+        self.lbl_hybrid_progress.setStyleSheet("""
+            color: #94a3b8;
+            font-family: monospace;
+            font-size: 11px;
+        """)
+        hybrid_row2.addWidget(self.lbl_hybrid_progress, stretch=1)
+
+        hybrid_main_layout.addLayout(hybrid_row2)
+        rec_layout.addWidget(hybrid_panel)
 
         # Task Description Input
         task_row = QHBoxLayout()
@@ -3419,6 +3622,166 @@ class UR5eRecorderStudio(QMainWindow):
                 self.gripper_input.setText(f"{width_mm:.1f}")
 
     # -------------------------------------------------------------------------
+    # Hybrid Control, Reference Path Management & Min-Jerk Snapback
+    # -------------------------------------------------------------------------
+    def rescan_reference_paths(self):
+        """Scans the reference_paths/ directory and populates the combo box."""
+        if not hasattr(self, "combo_ref_path"):
+            return
+        self.combo_ref_path.blockSignals(True)
+        self.combo_ref_path.clear()
+        self.combo_ref_path.addItem("None (Manual Recording Mode)", None)
+
+        paths_dir = Path(__file__).resolve().parent / "reference_paths"
+        if paths_dir.is_dir():
+            csv_files = sorted(list(paths_dir.glob("*.csv")) + list(paths_dir.glob("*.json")), reverse=True)
+            for f in csv_files:
+                self.combo_ref_path.addItem(f"📁 {f.name}", str(f))
+
+        # Reselect loaded path if still valid
+        if self.loaded_ref_path and self.loaded_ref_path.is_file():
+            for idx in range(self.combo_ref_path.count()):
+                if self.combo_ref_path.itemData(idx) == str(self.loaded_ref_path):
+                    self.combo_ref_path.setCurrentIndex(idx)
+                    break
+        else:
+            self.combo_ref_path.setCurrentIndex(0)
+        self.combo_ref_path.blockSignals(False)
+
+    def on_ref_path_combo_changed(self, index: int):
+        filepath_str = self.combo_ref_path.currentData()
+        if not filepath_str:
+            self.clear_reference_path()
+        else:
+            self.load_reference_path(Path(filepath_str))
+
+    def browse_reference_path(self):
+        default_dir = str(Path(__file__).resolve().parent / "reference_paths")
+        filepath_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Pre-Recorded Reference Path",
+            default_dir,
+            "Trajectory Files (*.csv *.json);;CSV Files (*.csv);;JSON Files (*.json);;All Files (*)",
+        )
+        if filepath_str:
+            target_path = Path(filepath_str)
+            self.load_reference_path(target_path)
+            self.rescan_reference_paths()
+            # Select it in combo
+            for idx in range(self.combo_ref_path.count()):
+                if self.combo_ref_path.itemData(idx) == str(target_path):
+                    self.combo_ref_path.blockSignals(True)
+                    self.combo_ref_path.setCurrentIndex(idx)
+                    self.combo_ref_path.blockSignals(False)
+                    break
+
+    def load_reference_path(self, filepath: Path):
+        """Loads reference path into memory and prepares hybrid assist."""
+        if not filepath.is_file():
+            QMessageBox.warning(self, "Load Error", f"Reference path file not found:\n{filepath}")
+            return
+        try:
+            if not self.path_manager:
+                self.path_manager = PathManager(robot_ip=self.robot_ip, mock=self.mock_mode)
+
+            points = self.path_manager.load_path(filepath)
+            if not points or len(points) < 2:
+                QMessageBox.warning(self, "Load Error", f"Reference path has insufficient waypoints ({len(points)}).")
+                return
+
+            self.loaded_ref_path = filepath
+            self.loaded_ref_waypoints = points
+            dur = self.path_manager.duration_s
+
+            msg = f"Path: {filepath.name} ({len(points)} pts, {dur:.1f}s)"
+            self.lbl_hybrid_progress.setText(msg)
+            self.lbl_hybrid_state.setText("HYBRID: READY")
+            self.lbl_hybrid_state.setStyleSheet("""
+                color: #38bdf8;
+                background-color: #0369a1;
+                border: 1px solid #38bdf8;
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: bold;
+            """)
+            print(f"[HYBRID] Loaded reference path: {filepath.name} ({len(points)} waypoints, {dur:.2f}s). Ready for hybrid assist recording.")
+            self.status_bar.showMessage(f"Loaded reference path: {filepath.name} ({len(points)} waypoints).", 5000)
+
+            # Check if start pose is defined
+            start_deg = self.path_manager.get_start_position_deg()
+            if start_deg:
+                print(f"[HYBRID] Reference path start pose: {[round(x, 1) for x in start_deg]}°")
+        except Exception as e:
+            print(f"[HYBRID ERROR] Failed to load reference path: {e}")
+            QMessageBox.critical(self, "Load Error", f"Failed to load reference path:\n\n{e}")
+
+    def clear_reference_path(self):
+        """Clears loaded reference path and restores pure manual demonstration mode."""
+        self.loaded_ref_path = None
+        self.loaded_ref_waypoints = []
+        if hasattr(self, "combo_ref_path"):
+            self.combo_ref_path.blockSignals(True)
+            self.combo_ref_path.setCurrentIndex(0)
+            self.combo_ref_path.blockSignals(False)
+        if hasattr(self, "lbl_hybrid_progress"):
+            self.lbl_hybrid_progress.setText("Path: None (Manual Demo Mode)")
+        if hasattr(self, "lbl_hybrid_state"):
+            self.lbl_hybrid_state.setText("HYBRID: IDLE")
+            self.lbl_hybrid_state.setStyleSheet("""
+                color: #64748b;
+                background-color: #0f172a;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: bold;
+            """)
+        print("[HYBRID] Cleared reference path. Mode: Normal manual recording.")
+        self.status_bar.showMessage("Reference path cleared. Normal manual recording mode active.", 3000)
+
+    def on_override_delay_changed(self, index: int):
+        val = self.combo_override_delay.currentData()
+        if val is not None:
+            self.override_delay_s = float(val)
+            if self.hybrid_worker:
+                self.hybrid_worker.set_override_delay_s(self.override_delay_s)
+            print(f"[HYBRID] Override return delay set to {self.override_delay_s*1000:.0f} ms.")
+
+    @pyqtSlot(str, str, str)
+    def on_hybrid_state_changed(self, state_name: str, color_hex: str, desc: str):
+        if hasattr(self, "lbl_hybrid_state"):
+            self.lbl_hybrid_state.setText(state_name)
+            self.lbl_hybrid_state.setStyleSheet(f"""
+                color: #ffffff;
+                background-color: {color_hex};
+                border: 1px solid {color_hex};
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: bold;
+            """)
+        self.status_bar.showMessage(desc, 4000)
+
+    @pyqtSlot(int, int, float, float)
+    def on_hybrid_progress_updated(self, curr_idx: int, total_pts: int, pct: float, dist_cm: float):
+        if hasattr(self, "lbl_hybrid_progress"):
+            self.lbl_hybrid_progress.setText(f"Waypoint {curr_idx}/{total_pts} ({pct:.1f}%) | Offset: {dist_cm:.1f} cm")
+
+    @pyqtSlot(int, float, float)
+    def on_hybrid_snapback_started(self, target_idx: int, duration_s: float, max_dq_deg: float):
+        print(f"[HYBRID] >>> Snapping back to Waypoint #{target_idx} via Minimum-Jerk polynomial in {duration_s:.2f}s (max Δq: {max_dq_deg:.1f}°) <<<")
+
+    @pyqtSlot(bool, str)
+    def on_hybrid_playback_finished(self, success: bool, message: str):
+        print(f"[HYBRID] Playback finished: success={success}, msg={message}")
+        if self.is_recording and success:
+            print("[HYBRID] Reference path playback completed. Automatically saving episode demonstration...")
+            self.end_episode_and_save()
+        elif hasattr(self, "lbl_hybrid_state"):
+            self.lbl_hybrid_state.setText("COMPLETED" if success else "STOPPED")
+
+    # -------------------------------------------------------------------------
     # Recording Workflow & Guard Logic
     # -------------------------------------------------------------------------
     def on_space_hotkey(self):
@@ -3434,9 +3797,12 @@ class UR5eRecorderStudio(QMainWindow):
             self.end_episode_and_save()
 
     def start_recording(self):
-        # Demonstrations can be recorded via Gamepad Cartesian Teleoperation,
-        # physical Freedrive hand-guiding, or precision axis controls.
-        if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled() and not self.gamepad_teleop.is_inhibited():
+        # Demonstrations can be recorded via Hybrid Assist (Pre-recorded Trajectory Playback),
+        # Gamepad Cartesian Teleoperation, physical Freedrive hand-guiding, or precision axis controls.
+        is_hybrid = bool(self.loaded_ref_waypoints and len(self.loaded_ref_waypoints) >= 2)
+        if is_hybrid:
+            mode_desc = f"Hybrid Path Assist ({len(self.loaded_ref_waypoints)} waypoints, return delay {self.override_delay_s*1000:.0f}ms)"
+        elif hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled() and not self.gamepad_teleop.is_inhibited():
             mode_desc = f"Gamepad Teleoperation ({self.gamepad_teleop.get_controller_name()})"
         elif self.freedrive_active:
             mode_desc = "Freedrive Hand-Guiding"
@@ -3465,7 +3831,8 @@ class UR5eRecorderStudio(QMainWindow):
             self.btn_toggle_cam2.setEnabled(False)
 
         # Update UI Controls to Active Recording State
-        self.btn_record.setText("⏸  END EPISODE (Space)")
+        btn_text = "⏸  END HYBRID EPISODE (Space)" if is_hybrid else "⏸  END EPISODE (Space)"
+        self.btn_record.setText(btn_text)
         self.btn_record.setStyleSheet("""
             QPushButton {
                 background-color: #d97706;
@@ -3482,6 +3849,34 @@ class UR5eRecorderStudio(QMainWindow):
         self.btn_cancel.setEnabled(True)
         self.cam_widget_1.set_recording(True)
         self.cam_widget_2.set_recording(True)
+
+        # Launch Hybrid Control Worker if a reference path is loaded
+        if is_hybrid:
+            # Auto-arm Gamepad Teleoperation if controller is plugged in so manual override is instantly ready
+            if (
+                hasattr(self, "btn_toggle_gamepad")
+                and not self.btn_toggle_gamepad.isChecked()
+                and self.gamepad_teleop
+                and self.gamepad_teleop.is_controller_connected()
+            ):
+                self.btn_toggle_gamepad.setChecked(True)
+
+            self.hybrid_worker = HybridPathWorker(
+                waypoints=self.loaded_ref_waypoints,
+                robot_ip=self.robot_ip,
+                gamepad_teleop=self.gamepad_teleop,
+                robot_worker=self.robot_worker,
+                gripper=self.gripper,
+                override_delay_s=self.override_delay_s,
+                mock=self.mock_mode,
+                parent=self,
+            )
+            self.hybrid_worker.state_changed.connect(self.on_hybrid_state_changed)
+            self.hybrid_worker.progress_updated.connect(self.on_hybrid_progress_updated)
+            self.hybrid_worker.snapback_started.connect(self.on_hybrid_snapback_started)
+            self.hybrid_worker.log_message.connect(lambda lvl, msg: print(f"[{lvl}] {msg}"))
+            self.hybrid_worker.finished.connect(self.on_hybrid_playback_finished)
+            self.hybrid_worker.start()
 
         # Start Timers
         self.recording_timer.start()
@@ -3560,6 +3955,11 @@ class UR5eRecorderStudio(QMainWindow):
             return
 
         try:
+            # Stop Hybrid Assist worker if active
+            if hasattr(self, "hybrid_worker") and self.hybrid_worker and self.hybrid_worker.isRunning():
+                self.hybrid_worker.request_abort()
+                self.hybrid_worker.wait(1500)
+
             # Stop recording timers
             self.dataset_frame_timer.stop()
             self.recording_timer.stop()
@@ -3637,6 +4037,10 @@ class UR5eRecorderStudio(QMainWindow):
     def cancel_recording(self):
         if not self.is_recording:
             return
+
+        if hasattr(self, "hybrid_worker") and self.hybrid_worker and self.hybrid_worker.isRunning():
+            self.hybrid_worker.request_abort()
+            self.hybrid_worker.wait(1500)
 
         self.dataset_frame_timer.stop()
         self.recording_timer.stop()
@@ -4246,6 +4650,13 @@ class UR5eRecorderStudio(QMainWindow):
     # -------------------------------------------------------------------------
     def closeEvent(self, event):
         print("\n[SYSTEM] Closing Teleoperation Studio window...")
+        if hasattr(self, "hybrid_worker") and self.hybrid_worker and self.hybrid_worker.isRunning():
+            try:
+                self.hybrid_worker.request_abort()
+                self.hybrid_worker.wait(1500)
+            except Exception:
+                pass
+
         if self.is_recording:
             self.cancel_recording()
 

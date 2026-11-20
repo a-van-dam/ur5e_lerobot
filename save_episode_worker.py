@@ -63,6 +63,17 @@ def save_episode_payload(payload_path: str | Path) -> None:
 
     import torch
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.configs.video import RGBEncoderConfig
+
+    # High-performance H.264 encoder configuration:
+    # Bypasses slow SVT-AV1 CPU encoding and prevents redundant intermediate PNG writes to disk
+    rgb_encoder = RGBEncoderConfig(
+        vcodec="h264",
+        pix_fmt="yuv420p",
+        crf=22,
+        preset="ultrafast",
+        g=2,
+    )
 
     meta_info_file = dataset_root / "meta" / "info.json"
 
@@ -102,7 +113,16 @@ def save_episode_payload(payload_path: str | Path) -> None:
 
     if is_valid_lerobot:
         print(f"[WORKER] Resuming existing LeRobot dataset at: {dataset_root}")
-        dataset = LeRobotDataset.resume(repo_id=repo_id, root=dataset_root)
+        try:
+            dataset = LeRobotDataset.resume(
+                repo_id=repo_id,
+                root=dataset_root,
+                rgb_encoder=rgb_encoder,
+                streaming_encoding=True,
+            )
+        except Exception as resume_err:
+            print(f"[WORKER] [NOTE] Resume with streaming H.264 failed ({resume_err}); fallback to standard resume.")
+            dataset = LeRobotDataset.resume(repo_id=repo_id, root=dataset_root)
     else:
         if dataset_root.exists():
             print(f"[WORKER] Cleaning non-LeRobot directory for fresh initialization: {dataset_root}")
@@ -115,21 +135,23 @@ def save_episode_payload(payload_path: str | Path) -> None:
             root=dataset_root,
             robot_type="ur5e",
             use_videos=True,
+            rgb_encoder=rgb_encoder,
+            streaming_encoding=True,
         )
 
     # Ingest frames into dataset buffer
     for idx, frame in enumerate(frames):
         t_frame = {
-            "observation.state": torch.from_numpy(np.ascontiguousarray(frame["observation.state"], dtype=np.float32)),
-            "action": torch.from_numpy(np.ascontiguousarray(frame["action"], dtype=np.float32)),
-            "observation.images.workspace": torch.from_numpy(
-                np.ascontiguousarray(frame["observation.images.workspace"], dtype=np.uint8)
+            "observation.state": np.ascontiguousarray(frame["observation.state"], dtype=np.float32),
+            "action": np.ascontiguousarray(frame["action"], dtype=np.float32),
+            "observation.images.workspace": np.ascontiguousarray(
+                frame["observation.images.workspace"], dtype=np.uint8
             ),
             "task": str(frame.get("task", task_str)),
         }
         if enable_dual_cameras and "observation.images.wrist" in frame:
-            t_frame["observation.images.wrist"] = torch.from_numpy(
-                np.ascontiguousarray(frame["observation.images.wrist"], dtype=np.uint8)
+            t_frame["observation.images.wrist"] = np.ascontiguousarray(
+                frame["observation.images.wrist"], dtype=np.uint8
             )
         dataset.add_frame(t_frame)
 

@@ -21,12 +21,14 @@ Features:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import datetime
 import json
 import math
 import os
 from pathlib import Path
 import pickle
+import queue
 import shutil
 import subprocess
 import sys
@@ -884,6 +886,156 @@ class HardwareTestWorker(QThread):
 
 
 # =============================================================================
+# 4b. Asynchronous LeRobot Dataset Episode Save Worker Thread
+# =============================================================================
+
+@dataclass
+class EpisodeSaveTask:
+    payload_file: Path
+    payload_data: Optional[Dict[str, Any]]
+    ep_idx: int
+    num_frames: int
+    duration_s: float
+    task_str: str
+
+
+class EpisodeSaveWorkerThread(QThread):
+    """
+    Dedicated background worker thread that serializes demonstration payloads
+    and coordinates isolated subprocess video encoding via save_episode_worker.py.
+
+    Key Benefits:
+    1. Zero GUI freezing: encoding, PyAV video compression, and disk I/O run completely off the Qt main thread.
+    2. Crash isolation: C-extension segmentation faults never terminate the main studio window.
+    3. Sequential FIFO dataset writing: prevents concurrent file write collisions on Parquet / meta info.
+    """
+    save_progress = pyqtSignal(str)
+    episode_saved = pyqtSignal(int, int, float, int, bool, str, str)  # ep_idx, num_frames, duration_s, total_eps, success, err_msg, payload_path
+
+    def __init__(self, worker_script: Path, parent=None):
+        super().__init__(parent)
+        self.worker_script = Path(worker_script).resolve()
+        self._queue: queue.Queue[Optional[EpisodeSaveTask]] = queue.Queue()
+        self._stop_requested = False
+        self._is_busy = False
+        self._active_proc: Optional[subprocess.Popen] = None
+
+    def enqueue_task(self, task: EpisodeSaveTask):
+        self._queue.put(task)
+
+    def is_busy(self) -> bool:
+        return self._is_busy or not self._queue.empty()
+
+    def wait_until_empty(self, timeout_s: float = 15.0):
+        """Waits until all pending save tasks in the queue are completed."""
+        t_start = time.time()
+        while self.is_busy() and (time.time() - t_start < timeout_s):
+            time.sleep(0.1)
+
+    def stop(self):
+        self._stop_requested = True
+        self._queue.put(None)  # Sentinel to unblock queue.get
+        if self._active_proc and self._active_proc.poll() is None:
+            try:
+                self._active_proc.terminate()
+            except Exception:
+                pass
+        self.wait(3000)
+
+    def run(self):
+        while not self._stop_requested:
+            try:
+                task = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if task is None or self._stop_requested:
+                break
+
+            self._is_busy = True
+            ep_idx = task.ep_idx
+            num_frames = task.num_frames
+            duration_s = task.duration_s
+            payload_file = task.payload_file
+
+            try:
+                self.save_progress.emit(f"Serializing Episode #{ep_idx:04d} payload...")
+                if task.payload_data is not None:
+                    payload_file.parent.mkdir(parents=True, exist_ok=True)
+                    with open(payload_file, "wb") as f:
+                        pickle.dump(task.payload_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    task.payload_data = None  # Free RAM immediately
+
+                if not self.worker_script.exists():
+                    raise FileNotFoundError(f"Worker script not found: {self.worker_script}")
+
+                env = os.environ.copy()
+                conda_bin = str(Path(sys.executable).parent)
+                env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
+
+                self.save_progress.emit(f"Encoding Episode #{ep_idx:04d} ({num_frames} frames)...")
+                cmd = [sys.executable, "-u", str(self.worker_script), "--payload", str(payload_file)]
+
+                self._active_proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                )
+
+                stdout, stderr = self._active_proc.communicate(timeout=300)
+                retcode = self._active_proc.returncode
+
+                total_episodes = -1
+                success = (retcode == 0)
+                err_msg = ""
+
+                if stdout:
+                    for line in stdout.splitlines():
+                        if "__WORKER_RESULT_JSON_START__" in line and "__WORKER_RESULT_JSON_END__" in line:
+                            try:
+                                json_str = line.split("__WORKER_RESULT_JSON_START__")[1].split("__WORKER_RESULT_JSON_END__")[0]
+                                res_data = json.loads(json_str)
+                                total_episodes = int(res_data.get("total_episodes", -1))
+                            except Exception:
+                                pass
+                        else:
+                            print(line)
+
+                if not success:
+                    err_msg = stderr or stdout or f"Worker exited with code {retcode}"
+                    print(f"[WORKER ERROR] Exit code {retcode}:\n{err_msg}", file=sys.__stderr__)
+
+                self.episode_saved.emit(
+                    ep_idx,
+                    num_frames,
+                    duration_s,
+                    total_episodes,
+                    success,
+                    err_msg,
+                    str(payload_file),
+                )
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[SAVE WORKER THREAD ERROR] {e}\n{tb}", file=sys.__stderr__)
+                self.episode_saved.emit(
+                    ep_idx,
+                    num_frames,
+                    duration_s,
+                    -1,
+                    False,
+                    str(e),
+                    str(payload_file),
+                )
+            finally:
+                self._active_proc = None
+                self._is_busy = False
+                self._queue.task_done()
+
+
+# =============================================================================
 # 5. Modular Camera Feed UI Widget
 # =============================================================================
 
@@ -1217,6 +1369,13 @@ class UR5eRecorderStudio(QMainWindow):
 
         # Diagnostic Worker reference
         self.diagnostic_worker: Optional[HardwareTestWorker] = None
+
+        # Asynchronous LeRobot Dataset Save Worker Thread
+        worker_script = Path(__file__).parent / "save_episode_worker.py"
+        self.episode_save_thread = EpisodeSaveWorkerThread(worker_script=worker_script, parent=self)
+        self.episode_save_thread.save_progress.connect(self._on_save_progress)
+        self.episode_save_thread.episode_saved.connect(self._on_episode_saved)
+        self.episode_save_thread.start()
 
         # Scan initial dataset directory
         self.rescan_dataset_directory()
@@ -3969,35 +4128,16 @@ class UR5eRecorderStudio(QMainWindow):
             self.cam_widget_1.set_recording(False)
             self.cam_widget_2.set_recording(False)
 
-            # Prevent accidental double-clicks: disable button and display saving state
-            self.btn_record.setEnabled(False)
-            self.btn_record.setText("⏳  SAVING EPISODE (Encoding Video & Parquet)...")
-            self.btn_record.setStyleSheet("""
-                QPushButton {
-                    background-color: #92400e;
-                    color: #fef08a;
-                    font-size: 13px;
-                    font-weight: bold;
-                    border-radius: 6px;
-                    border: 2px solid #f59e0b;
-                }
-            """)
-            self.btn_cancel.setEnabled(False)
-            self.btn_stop_session.setEnabled(False)
-            QApplication.processEvents()
-
             num_frames = len(self.current_episode_buffer)
             ep_idx = self.list_episodes.count()
 
-            print(f"[RECORD] Saving Episode #{ep_idx} ({num_frames} frames, {duration_s:.1f}s)...")
-            self.status_bar.showMessage(f"Writing Episode #{ep_idx} to disk...")
+            print(f"[RECORD] Queueing Episode #{ep_idx} ({num_frames} frames, {duration_s:.1f}s) for background save...")
 
-            # Write episode to disk / dataset
+            # Commit episode asynchronously via background save thread
             self.commit_episode_to_dataset(ep_idx, num_frames, duration_s)
 
             # Maintain arm in freedrive mode as requested
-            print("[INFO] Episode saved! Robot remains in Freedrive mode for the next demo.")
-            self.status_bar.showMessage(f"Episode #{ep_idx} saved ({num_frames} frames). Ready for next episode.", 6000)
+            print("[INFO] Episode recorded! Robot remains in Freedrive mode for the next demo.")
         except Exception as e:
             print(f"[CRITICAL ERROR] Failed in end_episode_and_save: {e}", file=sys.__stderr__)
             import traceback
@@ -4400,12 +4540,60 @@ class UR5eRecorderStudio(QMainWindow):
             traceback.print_exc(file=sys.__stderr__)
             return None
 
+    def _on_save_progress(self, msg: str):
+        if hasattr(self, "status_bar"):
+            self.status_bar.showMessage(msg, 3000)
+        print(f"[DATASET] {msg}")
+
+    def _on_episode_saved(
+        self,
+        ep_idx: int,
+        num_frames: int,
+        duration_s: float,
+        total_episodes: int,
+        success: bool,
+        err_msg: str,
+        payload_path: str,
+    ):
+        # Locate corresponding item in list_episodes
+        target_item = None
+        for i in range(self.list_episodes.count()):
+            it = self.list_episodes.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) == ep_idx:
+                target_item = it
+                break
+
+        if success:
+            saved_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s)"
+            if target_item is not None:
+                target_item.setText(saved_text)
+            print(f"[DATASET] ✔ Episode #{ep_idx:04d} saved successfully ({num_frames} frames). Total dataset episodes: {total_episodes}.")
+            self.status_bar.showMessage(f"✔ Episode #{ep_idx:04d} saved! Total dataset episodes: {total_episodes}.", 6000)
+        else:
+            self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
+            failed_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s) [UNENCODED]"
+            if target_item is not None:
+                target_item.setText(failed_text)
+            print(f"[ERROR] Save worker failed for Episode #{ep_idx}!", file=sys.__stderr__)
+            err_box_msg = (
+                f"Failed to encode Episode #{ep_idx} into the dataset.\n\n"
+                f"IMPORTANT: Your demonstration data was NOT lost!\n"
+                f"Raw demonstration buffer is preserved at:\n{payload_path}\n\n"
+                f"The studio has protected your session from crashing.\n"
+                f"Details:\n{err_msg[:400]}"
+            )
+            QMessageBox.warning(self, "Episode Save Notice", err_box_msg)
+
+        self.update_visualizer_command()
+
     def commit_episode_to_dataset(self, ep_idx: int, num_frames: int, duration_s: float):
         """
         Commits recorded demonstration frames to the LeRobot dataset.
-        Executes saving via an isolated background subprocess worker (save_episode_worker.py)
-        to guarantee that video encoding (PyAV / SVT-AV1) or C-extension faults cannot crash
-        the main GUI application.
+        Executes saving via an asynchronous background subprocess worker (save_episode_worker.py)
+        to guarantee:
+        1. Fast, non-blocking UI responsiveness (no freeze/stutter).
+        2. Safe crash isolation: video encoding faults never harm the main application.
+        3. Raw demonstration buffer safety on disk.
         """
         if not self.current_episode_buffer:
             print("[WARNING] Episode buffer empty; nothing to save.")
@@ -4433,88 +4621,40 @@ class UR5eRecorderStudio(QMainWindow):
             "frames": list(self.current_episode_buffer),
         }
 
-        try:
-            with open(payload_file, "wb") as f:
-                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception as dump_err:
-            print(f"[ERROR] Failed to write temporary episode payload: {dump_err}", file=sys.__stderr__)
-            self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
-            item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s) [MANIFEST]"
-            self.list_episodes.addItem(QListWidgetItem(item_text))
-            self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
-            self.current_episode_buffer.clear()
-            self.update_visualizer_command()
-            return
-
-        worker_script = Path(__file__).parent / "save_episode_worker.py"
-        save_success = False
-
-        if worker_script.exists():
-            env = os.environ.copy()
-            conda_bin = str(Path(sys.executable).parent)
-            env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
-
-            try:
-                print(f"[DATASET] Spawning isolated save worker for Episode #{ep_idx:04d}...")
-                proc = subprocess.run(
-                    [sys.executable, str(worker_script), "--payload", str(payload_file)],
-                    capture_output=True,
-                    text=True,
-                    env=env,
-                    timeout=300,  # 5 minutes safety timeout
-                )
-
-                if proc.stdout:
-                    for line in proc.stdout.strip().splitlines():
-                        if not line.startswith("__WORKER_RESULT_JSON"):
-                            print(line)
-
-                if proc.returncode == 0:
-                    save_success = True
-                    print(f"[DATASET] ✔ Episode #{ep_idx:04d} saved successfully via worker ({num_frames} frames).")
-                else:
-                    print(f"[ERROR] Save worker failed with exit code {proc.returncode}!", file=sys.__stderr__)
-                    if proc.stderr:
-                        print(f"[WORKER STDERR]\n{proc.stderr}", file=sys.__stderr__)
-
-                    err_msg = (
-                        f"Failed to encode Episode #{ep_idx} into the dataset.\n"
-                        f"Worker Process Exit Code: {proc.returncode}\n\n"
-                        f"IMPORTANT: Your demonstration data was NOT lost!\n"
-                        f"Raw demonstration buffer is preserved at:\n{payload_file}\n\n"
-                        f"The studio has protected your session from crashing.\n"
-                        f"You can continue recording demonstrations."
-                    )
-                    QMessageBox.warning(self, "Episode Save Notice", err_msg)
-            except subprocess.TimeoutExpired:
-                print(f"[ERROR] Save worker timed out after 300s for Episode #{ep_idx}!", file=sys.__stderr__)
-                QMessageBox.warning(
-                    self,
-                    "Save Timeout",
-                    f"Episode #{ep_idx} encoding timed out. The studio remains active.\n"
-                    f"Raw data preserved at:\n{payload_file}",
-                )
-            except Exception as sub_err:
-                print(f"[ERROR] Failed to run isolated save worker: {sub_err}", file=sys.__stderr__)
-                QMessageBox.warning(
-                    self,
-                    "Save Error",
-                    f"Save worker could not be launched ({sub_err}).\n"
-                    f"Raw data preserved at:\n{payload_file}",
-                )
-        else:
-            print("[WARNING] save_episode_worker.py not found. Using fallback manifest.", file=sys.__stderr__)
-
-        if not save_success:
-            self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
-            item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s) [UNENCODED]"
-        else:
-            item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s)"
-
-        self.list_episodes.addItem(QListWidgetItem(item_text))
-        self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
+        # Clear buffer immediately to free memory in main application
         self.current_episode_buffer.clear()
-        self.update_visualizer_command()
+
+        # Add pending item in the episode list with user-role metadata
+        item_text = f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s) ⏳ [Encoding...]"
+        item = QListWidgetItem(item_text)
+        item.setData(Qt.ItemDataRole.UserRole, ep_idx)
+        self.list_episodes.addItem(item)
+        self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
+
+        task = EpisodeSaveTask(
+            payload_file=payload_file,
+            payload_data=payload,
+            ep_idx=ep_idx,
+            num_frames=num_frames,
+            duration_s=duration_s,
+            task_str=task_str,
+        )
+
+        if hasattr(self, "episode_save_thread") and self.episode_save_thread is not None and self.episode_save_thread.isRunning():
+            self.episode_save_thread.enqueue_task(task)
+            print(f"[DATASET] Enqueued Episode #{ep_idx:04d} for background H.264 streaming save...")
+            self.status_bar.showMessage(f"Episode #{ep_idx:04d} recorded! Encoding video and parquet in background...", 4000)
+        else:
+            # Synchronous fallback if thread is not active
+            print("[WARNING] Background save thread not active; falling back to direct write.", file=sys.__stderr__)
+            try:
+                with open(payload_file, "wb") as f:
+                    pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as dump_err:
+                print(f"[ERROR] Failed to write temporary payload: {dump_err}", file=sys.__stderr__)
+            self._write_local_manifest_episode(ep_idx, num_frames, duration_s)
+            item.setText(f"Episode #{ep_idx:04d} — {num_frames} frames ({duration_s:.1f}s) [UNENCODED]")
+            self.update_visualizer_command()
 
     def _write_local_manifest_episode(self, ep_idx: int, num_frames: int, duration_s: float):
         """Standard backup manifest recording episode records."""
@@ -4562,6 +4702,15 @@ class UR5eRecorderStudio(QMainWindow):
             target_row = current_row
 
         item = self.list_episodes.item(target_row)
+        if "[Encoding...]" in item.text():
+            QMessageBox.warning(
+                self,
+                "Save in Progress",
+                "This episode is currently being encoded and saved to disk in the background.\n\n"
+                "Please wait a moment for saving to complete before deleting."
+            )
+            return
+
         confirm = QMessageBox.question(
             self,
             "Confirm Delete Episode",
@@ -4667,6 +4816,7 @@ class UR5eRecorderStudio(QMainWindow):
         if hasattr(self, "gamepad_teleop") and self.gamepad_teleop is not None:
             try:
                 self.gamepad_teleop.stop()
+                self.gamepad_teleop.wait(1000)
             except Exception:
                 pass
         if self.camera_worker_1 is not None:
@@ -4674,6 +4824,15 @@ class UR5eRecorderStudio(QMainWindow):
         if self.camera_worker_2 is not None:
             self.camera_worker_2.stop()
         self.robot_worker.stop()
+
+        # Stop background dataset save thread
+        if hasattr(self, "episode_save_thread") and self.episode_save_thread is not None:
+            if self.episode_save_thread.is_busy():
+                print("[SYSTEM] Waiting for background episode encoding to finish before closing...")
+                if hasattr(self, "status_bar"):
+                    self.status_bar.showMessage("Finalizing dataset encoding before exit...", 5000)
+                self.episode_save_thread.wait_until_empty(timeout_s=15)
+            self.episode_save_thread.stop()
 
         if self.active_dataset is not None:
             try:

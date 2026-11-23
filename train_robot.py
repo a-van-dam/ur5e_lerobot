@@ -72,15 +72,16 @@ AVAILABLE_OPTIMIZERS = [
 ]
 SELECTED_OPTIMIZER_INDEX = 0  # <--- Select optimizer by index (0: AdamW, 1: Adam, 2: SGD)
 
-# Training Hyperparameters
-TRAINING_STEPS = 15000      # Total optimization steps (increased for robust task mastery)
-BATCH_SIZE = 32               # Samples per training batch (RTX 3080 16GB handles 16-64 easily)
+# Training Hyperparameters (tuned for 320x240 dual-cam 7-DoF cube pick-and-place)
+TRAINING_STEPS = 20000        # Total optimization steps (~5 epochs on 130k frames; avoids overfitting)
+BATCH_SIZE = 32               # Samples per training batch (RTX 3080 16GB sweet spot)
 LEARNING_RATE = 1e-4          # Initial optimizer learning rate for transformer heads
 LR_BACKBONE = 1e-5            # Differential learning rate for pretrained ResNet vision backbone
 LR_MIN = 1e-6                 # Minimum learning rate at end of Cosine Annealing schedule
 WARMUP_STEPS = 1000           # Linear warmup steps to stabilize transformer attention layers
 WEIGHT_DECAY = 1e-4           # L2 regularization weight decay
 GRAD_CLIP_NORM = 10.0         # Gradient clipping max norm to prevent exploding gradients
+DEFAULT_CHUNK_SIZE = 60       # 2.0s action chunk horizon @ 30 FPS (crisp pickup/close/drop transitions)
 USE_AUGMENTATION = True       # Master switch for GPU visual data augmentation
 AUG_ROTATION = True           # Slight random rotation (±10 deg)
 AUG_TRANSLATION = True        # Slight random translation (±8% X/Y)
@@ -89,9 +90,9 @@ AUG_CUTOUT = False            # Random cutout / occlusion patches (5-15% area)
 AUG_NOISE = False             # Mild Gaussian sensor noise
 TEMPORAL_ENSEMBLE_COEFF = 0.01  # ACT Algorithm 2: Exponential moving average across overlapping chunks (0.01 standard)
 
-# Checkpoint & Disk Space Management
-# Overwrites the same folder every save to prevent gigabytes of redundant copies
-SAVE_CHECKPOINT_FREQ = 2500   # Save policy weights every N steps
+# Checkpoint Management
+# Keeps latest checkpoint/, lowest-val-loss best_checkpoint/, and periodic checkpoints/step_XXXXXX/
+SAVE_CHECKPOINT_FREQ = 2500   # Save periodic policy snapshot every N steps
 OUTPUT_DIR = "outputs/train/" + PROJECT_NAME  # Directory for model checkpoint, logs, and plots
 
 # Validation & Evaluation
@@ -99,7 +100,7 @@ VAL_SPLIT_RATIO = 0.1         # Reserve 10% of frames/episodes for validation
 EVAL_FREQ = 1000              # Compute validation loss every N steps
 
 # Logging & Hardware
-LOG_FREQ = 20                 # Console progress print interval (in steps)
+LOG_FREQ = 50                 # Console progress print interval (in steps)
 NUM_WORKERS = 4               # DataLoader background subprocess workers (0 for single-thread)
 SEED = 42                     # Random seed for reproducibility
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -863,11 +864,14 @@ class RobotTrainer:
         # Internal state
         self.is_aborted = False
         self.checkpoint_dir = self.output_dir / "checkpoint"
+        self.best_checkpoint_dir = self.output_dir / "best_checkpoint"
+        self.periodic_checkpoints_dir = self.output_dir / "checkpoints"
+        self.best_val_loss: float = float("inf")
         self.log_csv_file = self.output_dir / "train_log.csv"
         self.loss_plot_file = self.output_dir / "loss_curve.png"
         self.dashboard_html_file = self.output_dir / "training_dashboard.html"
         self.resume_checkpoint = Path(resume_checkpoint).resolve() if resume_checkpoint else None
-        self.chunk_size = int(chunk_size) if chunk_size is not None else None
+        self.chunk_size = int(chunk_size) if chunk_size is not None else DEFAULT_CHUNK_SIZE
         self.temporal_ensemble_coeff = float(temporal_ensemble_coeff) if temporal_ensemble_coeff is not None else None
         if self.policy_name == "act" and self.temporal_ensemble_coeff is not None:
             self.n_action_steps = 1
@@ -1031,21 +1035,22 @@ class RobotTrainer:
             print(f"[WARNING] Unknown optimizer '{self.optimizer_name}'. Defaulting to AdamW.")
             return torch.optim.AdamW(param_groups)
 
-    def _save_checkpoint(self, policy: Any, preprocessor: Any, postprocessor: Any, step: int):
-        """
-        Saves the model weights and processors to disk.
-        Overwrites the same directory every time to minimize disk consumption.
-        """
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[CHECKPOINT] Saving latest policy weights to: {self.checkpoint_dir} (Step {step})")
+    def _write_checkpoint_to_dir(
+        self,
+        target_dir: Path,
+        policy: Any,
+        preprocessor: Any,
+        postprocessor: Any,
+        step: int,
+        val_loss: Optional[float] = None,
+    ):
+        """Writes model weights, processors, and training_info.json into target_dir."""
+        target_dir.mkdir(parents=True, exist_ok=True)
+        policy.save_pretrained(target_dir)
+        preprocessor.save_pretrained(target_dir)
+        postprocessor.save_pretrained(target_dir)
 
-        # Save model and normalization processors
-        policy.save_pretrained(self.checkpoint_dir)
-        preprocessor.save_pretrained(self.checkpoint_dir)
-        postprocessor.save_pretrained(self.checkpoint_dir)
-
-        # Save metadata info file
-        eff_chunk = getattr(policy.config, "chunk_size", self.chunk_size or 100)
+        eff_chunk = getattr(policy.config, "chunk_size", self.chunk_size or DEFAULT_CHUNK_SIZE)
         eff_n_actions = getattr(policy.config, "n_action_steps", self.n_action_steps or (50 if self.policy_name == 'act' else 10))
         dec_interval = float(eff_n_actions / max(1, self.dataset_fps))
 
@@ -1059,6 +1064,8 @@ class RobotTrainer:
             "n_action_steps": eff_n_actions,
             "decision_interval_s": dec_interval,
             "temporal_ensemble_coeff": self.temporal_ensemble_coeff,
+            "val_loss": val_loss,
+            "best_val_loss": None if not math.isfinite(self.best_val_loss) else self.best_val_loss,
             "grayscale": self.is_grayscale,
             "image_mode": "gs" if self.is_grayscale else "col",
             "image_channels": 1 if self.is_grayscale else 3,
@@ -1072,8 +1079,22 @@ class RobotTrainer:
             },
             "updated_at": datetime.datetime.now().isoformat(),
         }
-        with open(self.checkpoint_dir / "training_info.json", "w") as f:
+        with open(target_dir / "training_info.json", "w") as f:
             json.dump(info_dict, f, indent=2)
+
+    def _save_checkpoint(self, policy: Any, preprocessor: Any, postprocessor: Any, step: int, save_periodic: bool = True):
+        """
+        Saves the latest model weights to checkpoint/ and also keeps a periodic snapshot
+        in checkpoints/step_XXXXXX/ so the best generalization checkpoint can be chosen later.
+        """
+        latest_v_loss = self.history_val_loss[-1][1] if self.history_val_loss else None
+        print(f"\n[CHECKPOINT] Saving policy weights to: {self.checkpoint_dir} (Step {step})")
+        self._write_checkpoint_to_dir(self.checkpoint_dir, policy, preprocessor, postprocessor, step, val_loss=latest_v_loss)
+
+        if save_periodic:
+            step_dir = self.periodic_checkpoints_dir / f"step_{step:06d}"
+            self._write_checkpoint_to_dir(step_dir, policy, preprocessor, postprocessor, step, val_loss=latest_v_loss)
+            print(f"[CHECKPOINT] Saved periodic snapshot: {step_dir}")
 
         # Update visual loss curve plot
         plot_loss_curve(
@@ -1087,7 +1108,6 @@ class RobotTrainer:
 
         # Generate live HTML browser dashboard
         latest_t_loss = self.history_train_loss[-1] if self.history_train_loss else 0.0
-        latest_v_loss = self.history_val_loss[-1][1] if self.history_val_loss else None
         generate_html_dashboard(
             output_html=self.dashboard_html_file,
             model_name=self.output_dir.name,
@@ -1338,6 +1358,17 @@ class RobotTrainer:
                 if val_losses:
                     val_loss_scalar = float(np.mean(val_losses))
                     self.history_val_loss.append((step, val_loss_scalar))
+                    if val_loss_scalar < self.best_val_loss:
+                        self.best_val_loss = val_loss_scalar
+                        self._write_checkpoint_to_dir(
+                            self.best_checkpoint_dir,
+                            policy,
+                            preprocessor,
+                            postprocessor,
+                            step,
+                            val_loss=val_loss_scalar,
+                        )
+                        print(f"[CHECKPOINT] ★ New Best Val Loss ({val_loss_scalar:.5f} at Step {step}) -> Saved {self.best_checkpoint_dir}")
                 policy.train()
 
             # Logging & Progress Display
@@ -1398,15 +1429,19 @@ class RobotTrainer:
         status = "ABORTED" if self.is_aborted else "COMPLETED"
         print("\n" + "=" * 70)
         print(f"  Training {status} in {datetime.timedelta(seconds=int(total_time))}")
-        print(f"  • Final Model Saved: {self.checkpoint_dir}")
-        print(f"  • Loss Curve:        {self.loss_plot_file}")
-        print(f"  • CSV Metrics Log:   {self.log_csv_file}")
+        print(f"  • Final Model Saved:     {self.checkpoint_dir}")
+        if self.best_checkpoint_dir.exists():
+            print(f"  • Best Val Model Saved:  {self.best_checkpoint_dir} (val_loss={self.best_val_loss:.5f})")
+        print(f"  • Periodic Snapshots:    {self.periodic_checkpoints_dir}")
+        print(f"  • Loss Curve:            {self.loss_plot_file}")
+        print(f"  • CSV Metrics Log:       {self.log_csv_file}")
         print("=" * 70 + "\n")
 
         return {
             "status": status,
             "steps_completed": step,
             "final_checkpoint": str(self.checkpoint_dir),
+            "best_checkpoint": str(self.best_checkpoint_dir) if self.best_checkpoint_dir.exists() else None,
             "loss_plot": str(self.loss_plot_file),
             "csv_log": str(self.log_csv_file),
             "total_time_s": total_time,
@@ -1449,14 +1484,14 @@ def parse_args():
     parser.add_argument("--aug-cutout", action=argparse.BooleanOptionalAction, default=AUG_CUTOUT, help="Random cutout / occlusion patches")
     parser.add_argument("--aug-noise", action=argparse.BooleanOptionalAction, default=AUG_NOISE, help="Random Gaussian sensor noise")
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="L2 weight decay")
-    parser.add_argument("--save-freq", type=int, default=SAVE_CHECKPOINT_FREQ, help="Checkpoint save step frequency (in-place overwrite)")
+    parser.add_argument("--save-freq", type=int, default=SAVE_CHECKPOINT_FREQ, help="Checkpoint save step frequency (latest + periodic snapshots)")
     parser.add_argument("--log-freq", type=int, default=LOG_FREQ, help="Console logging interval")
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR, help="Output directory for model weights and loss curves")
     parser.add_argument("--device", type=str, default=DEVICE, help="Execution device (cuda or cpu)")
     parser.add_argument("--workers", type=int, default=NUM_WORKERS, help="DataLoader subprocess workers")
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed for reproducibility")
     parser.add_argument("--grayscale", action="store_true", default=None, help="Train policy on single-channel Grayscale imagery")
-    parser.add_argument("--chunk-size", type=int, default=None, help="Action prediction horizon steps")
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Action prediction horizon steps")
     parser.add_argument("--n-action-steps", type=int, default=None, help="Action execution steps before re-querying visual observation")
     parser.add_argument("--temporal-ensemble-coeff", type=float, default=TEMPORAL_ENSEMBLE_COEFF, help="ACT Temporal Ensembling coefficient (0.01 standard)")
     parser.add_argument("--no-temporal-ensemble", action="store_true", help="Disable ACT temporal ensembling")

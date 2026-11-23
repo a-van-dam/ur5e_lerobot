@@ -142,7 +142,7 @@ DEFAULT_ROBOT_IP = "192.168.1.102"
 DEFAULT_CAMERA_INDEX = 4         # HD Webcam C525 (Workspace)
 DEFAULT_CAMERA_2_INDEX = 6       # eFace 1325R (Wrist Flange)
 DEFAULT_FPS = 30
-DEFAULT_DATASET_NAME = "ur5e_assembly"
+DEFAULT_DATASET_NAME = "ur5e_cube_pick_place"
 DEFAULT_DATASETS_DIR = Path(__file__).resolve().parent / "datasets"
 
 UR5E_JOINTS = [
@@ -153,6 +153,8 @@ UR5E_JOINTS = [
     "wrist_2",
     "wrist_3",
 ]
+
+UR5E_STATE_ACTION_NAMES = [f"{j}_pos" for j in UR5E_JOINTS] + ["gripper_width"]
 
 # Canonical UR5e Ready/Home Pose: [0°, -90°, 90°, -90°, -90°, 0°]
 HOME_JOINTS = [0.0, -90.0, 90.0, -90.0, -90.0, 0.0]
@@ -1303,12 +1305,17 @@ class UR5eRecorderStudio(QMainWindow):
 
         # Initialize OnRobot 2FG Gripper
         self._user_dragging_gripper: bool = False
+        self._gripper_commanded_width_mm: float = float(DEFAULT_START_GRIPPER_MM)
         self.gripper: Optional[OnRobot2FGModbus] = None
         if ONROBOT_GRIPPER_AVAILABLE and get_shared_gripper is not None:
             try:
                 self.gripper = get_shared_gripper(auto_connect=not self.mock_mode)
                 if self.gripper and self.gripper.is_connected:
                     init_w = self.gripper.get_width()
+                    # Snap initial commanded width to crisp OPEN / CLOSE state
+                    min_w = getattr(self.gripper, "min_width_mm", 55.0)
+                    max_w = getattr(self.gripper, "max_width_mm", 105.0)
+                    self._gripper_commanded_width_mm = float(min_w if init_w < (max_w - 12.0) else max_w)
                     if hasattr(self, "gripper_slider"):
                         self.gripper_slider.blockSignals(True)
                         self.gripper_slider.setValue(int(round(init_w)))
@@ -1764,7 +1771,7 @@ class UR5eRecorderStudio(QMainWindow):
         gamepad_row1.addWidget(self.lbl_gamepad_vel)
 
         # Gripper Gamepad Shortcut Badge
-        self.lbl_gamepad_gripper_hint = QLabel("🤏 Gripper: [A] Close | [B] Open")
+        self.lbl_gamepad_gripper_hint = QLabel("🤏 Gripper: [A] Close (55mm) | [B] Open (105mm)")
         self.lbl_gamepad_gripper_hint.setStyleSheet("""
             color: #10b981;
             font-family: monospace;
@@ -1775,7 +1782,7 @@ class UR5eRecorderStudio(QMainWindow):
             border: 1px solid #059669;
             border-radius: 4px;
         """)
-        self.lbl_gamepad_gripper_hint.setToolTip("Xbox Controller: Hold [A] to slowly CLOSE gripper | Hold [B] to slowly OPEN gripper")
+        self.lbl_gamepad_gripper_hint.setToolTip("Xbox Controller: Press [A] to snap CLOSE (55mm, 30N) | Press [B] to snap OPEN (105mm)")
         gamepad_row1.addWidget(self.lbl_gamepad_gripper_hint)
 
         # Invert Left Stick Horizontal (Lateral Translation) Checkbox
@@ -3565,9 +3572,10 @@ class UR5eRecorderStudio(QMainWindow):
         self._user_targets.clear()
         action = {f"{j}.pos": math.radians(self.start_position.get(j, 0.0)) for j in UR5E_JOINTS}
         pose_str = ", ".join(f"{self.start_position.get(j, 0.0):+.1f}°" for j in UR5E_JOINTS)
-        print(f"[MOTION] Commanding UR5e arm to Start Position [{pose_str}]...")
-        self.status_bar.showMessage("Moving arm to Start Position...", 4000)
+        print(f"[MOTION] Commanding UR5e arm to Start Position [{pose_str}] and opening gripper ({self.start_gripper_mm:.1f} mm)...")
+        self.status_bar.showMessage("Moving arm to Start Position & opening gripper...", 4000)
         self.robot_worker.request_move_pose(action)
+        self.command_gripper_width(self.start_gripper_mm)
 
     def move_to_home_pose(self):
         # Inhibit gamepad teleoperation during discrete motion
@@ -3745,6 +3753,7 @@ class UR5eRecorderStudio(QMainWindow):
         min_w = getattr(self.gripper, "min_width_mm", 55.0) if self.gripper else 55.0
         max_w = getattr(self.gripper, "max_width_mm", 105.0) if self.gripper else 105.0
         clamped = max(min_w, min(max_w, float(width_mm)))
+        self._gripper_commanded_width_mm = clamped
 
         if hasattr(self, "gripper_slider"):
             self.gripper_slider.blockSignals(True)
@@ -3759,19 +3768,25 @@ class UR5eRecorderStudio(QMainWindow):
 
         if self.gripper is not None and self.gripper.is_connected:
             try:
-                self.gripper.grip(clamped, force_n=30.0, speed_percent=50, wait=False)
+                self.gripper.grip(clamped, force_n=30.0, speed_percent=80, wait=False)
                 print(f"[GRIPPER] Commanded width to {clamped:.1f} mm (30N force).")
                 self.status_bar.showMessage(f"Gripper moving to {clamped:.1f} mm...", 3000)
             except Exception as e:
                 print(f"[GRIPPER ERROR] Failed to command gripper: {e}")
                 self.status_bar.showMessage(f"Gripper command failed: {e}", 3000)
         else:
+            if self.gripper is not None and hasattr(self.gripper, "grip"):
+                try:
+                    self.gripper.grip(clamped, force_n=30.0, speed_percent=80, wait=False)
+                except Exception:
+                    pass
             print(f"[GRIPPER SIM] Commanded width: {clamped:.1f} mm.")
             self.status_bar.showMessage(f"Gripper set to {clamped:.1f} mm (Simulation).", 3000)
 
     @pyqtSlot(float)
     def on_gamepad_gripper_width_updated(self, width_mm: float):
-        """Called live when the user holds Xbox [A] (close) or [B] (open)."""
+        """Called live when the user presses Xbox [A] (close 55mm) or [B] (open 105mm)."""
+        self._gripper_commanded_width_mm = float(width_mm)
         if not getattr(self, "_user_dragging_gripper", False):
             if hasattr(self, "gripper_slider"):
                 self.gripper_slider.blockSignals(True)
@@ -3779,6 +3794,35 @@ class UR5eRecorderStudio(QMainWindow):
                 self.gripper_slider.blockSignals(False)
             if hasattr(self, "gripper_input"):
                 self.gripper_input.setText(f"{width_mm:.1f}")
+
+    @pyqtSlot(float)
+    def on_hybrid_gripper_commanded(self, width_mm: float):
+        """Called when Hybrid Path Assist issues a discrete CLOSE/OPEN gripper command."""
+        self._gripper_commanded_width_mm = float(width_mm)
+        if not getattr(self, "_user_dragging_gripper", False):
+            if hasattr(self, "gripper_slider"):
+                self.gripper_slider.blockSignals(True)
+                self.gripper_slider.setValue(int(round(width_mm)))
+                self.gripper_slider.blockSignals(False)
+            if hasattr(self, "gripper_input"):
+                self.gripper_input.setText(f"{width_mm:.1f}")
+
+    def _get_gripper_state_and_action_mm(self) -> Tuple[float, float]:
+        """
+        Returns (obs_gripper_mm, act_gripper_mm) for 7-DoF dataset recording:
+          - obs_gripper_mm: Live non-blocking measured physical width in mm (e.g. 105mm open, ~80mm on cube).
+          - act_gripper_mm: Sharp commanded target width in mm (55mm CLOSE / 105mm OPEN) from gamepad,
+                            GUI buttons/slider, or hybrid path playback.
+        """
+        act_mm = float(self._gripper_commanded_width_mm)
+        if self.gripper is not None and (self.gripper.is_connected or getattr(self.gripper, "mock", False)):
+            if hasattr(self.gripper, "get_cached_width"):
+                obs_mm = float(self.gripper.get_cached_width())
+            else:
+                obs_mm = float(self.gripper.get_width())
+        else:
+            obs_mm = act_mm
+        return obs_mm, act_mm
 
     # -------------------------------------------------------------------------
     # Hybrid Control, Reference Path Management & Min-Jerk Snapback
@@ -4033,6 +4077,7 @@ class UR5eRecorderStudio(QMainWindow):
             self.hybrid_worker.state_changed.connect(self.on_hybrid_state_changed)
             self.hybrid_worker.progress_updated.connect(self.on_hybrid_progress_updated)
             self.hybrid_worker.snapback_started.connect(self.on_hybrid_snapback_started)
+            self.hybrid_worker.gripper_commanded.connect(self.on_hybrid_gripper_commanded)
             self.hybrid_worker.log_message.connect(lambda lvl, msg: print(f"[{lvl}] {msg}"))
             self.hybrid_worker.finished.connect(self.on_hybrid_playback_finished)
             self.hybrid_worker.start()
@@ -4057,9 +4102,14 @@ class UR5eRecorderStudio(QMainWindow):
         if not self.is_recording:
             return
 
-        # Acquire synced telemetry and camera frame
+        # Acquire synced 7-DoF telemetry: 6 UR5e joint angles (rad) + OnRobot 2FG gripper width (mm)
         joints = self.robot_worker.get_latest_joints()
-        q_vals = np.array([joints[j] for j in UR5E_JOINTS], dtype=np.float32)
+        obs_gripper_mm, act_gripper_mm = self._get_gripper_state_and_action_mm()
+        q_list = [joints[j] for j in UR5E_JOINTS]
+        obs_state = np.array(q_list + [obs_gripper_mm], dtype=np.float32)
+        # Joint actions [:6] are shifted 1 step ahead (q[t+1]) on episode commit;
+        # action[6] stores the immediate commanded gripper width (55mm CLOSE / 105mm OPEN).
+        action_vec = np.array(q_list + [act_gripper_mm], dtype=np.float32)
 
         # Primary Camera (Workspace)
         cam1_frame = self.latest_camera_frame_1 if self.latest_camera_frame_1 is not None else self.latest_camera_frame
@@ -4081,8 +4131,8 @@ class UR5eRecorderStudio(QMainWindow):
         task_text = self.txt_task_desc.text().strip() or "Pick and place demonstration"
 
         frame_data = {
-            "observation.state": q_vals,
-            "action": q_vals,
+            "observation.state": obs_state,
+            "action": action_vec,
             "observation.images.workspace": img_workspace,
             "task": task_text,
             "timestamp": time.perf_counter() - (self.record_start_time or time.perf_counter()),
@@ -4473,13 +4523,13 @@ class UR5eRecorderStudio(QMainWindow):
         features = {
             "observation.state": {
                 "dtype": "float32",
-                "shape": (6,),
-                "names": [f"{j}_pos" for j in UR5E_JOINTS],
+                "shape": (7,),
+                "names": UR5E_STATE_ACTION_NAMES,
             },
             "action": {
                 "dtype": "float32",
-                "shape": (6,),
-                "names": [f"{j}_pos" for j in UR5E_JOINTS],
+                "shape": (7,),
+                "names": UR5E_STATE_ACTION_NAMES,
             },
             "observation.images.workspace": {
                 "dtype": "video",
@@ -4606,6 +4656,19 @@ class UR5eRecorderStudio(QMainWindow):
         temp_dir.mkdir(parents=True, exist_ok=True)
         payload_file = temp_dir / f"episode_{ep_idx:04d}_{int(time.time())}.pkl"
 
+        # Shift joint actions 1 step forward: action[t][:6] = observation.state[t+1][:6]
+        # so the policy predicts the next joint target rather than copying current measured joints,
+        # while keeping action[t][6] as the sharp commanded gripper width (55mm CLOSE / 105mm OPEN).
+        frames_to_commit = list(self.current_episode_buffer)
+        n_frames = len(frames_to_commit)
+        for i in range(n_frames):
+            act = np.array(frames_to_commit[i]["action"], dtype=np.float32, copy=True)
+            if i + 1 < n_frames:
+                act[:6] = frames_to_commit[i + 1]["observation.state"][:6]
+            else:
+                act[:6] = frames_to_commit[i]["observation.state"][:6]
+            frames_to_commit[i]["action"] = act
+
         payload = {
             "dataset_root": str(self.dataset_root.resolve()),
             "repo_id": f"local/{self.dataset_root.name}",
@@ -4618,7 +4681,7 @@ class UR5eRecorderStudio(QMainWindow):
             "num_frames": num_frames,
             "duration_s": duration_s,
             "task_str": task_str,
-            "frames": list(self.current_episode_buffer),
+            "frames": frames_to_commit,
         }
 
         # Clear buffer immediately to free memory in main application

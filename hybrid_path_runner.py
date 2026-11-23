@@ -217,6 +217,7 @@ class HybridPathWorker(QThread):
     state_changed = pyqtSignal(str, str, str) # (state_name, badge_color_hex, description)
     progress_updated = pyqtSignal(int, int, float, float) # (curr_idx, total_pts, pct, dist_to_path_cm)
     snapback_started = pyqtSignal(int, float, float) # (target_idx, snapback_duration_s, max_dq_deg)
+    gripper_commanded = pyqtSignal(float) # Commanded discrete gripper width in mm (55.0 close / 105.0 open)
     log_message = pyqtSignal(str, str) # (level, message)
     finished = pyqtSignal(bool, str) # (success, message)
 
@@ -409,14 +410,32 @@ class HybridPathWorker(QThread):
             self._send_stop()
             time.sleep(0.1)
 
-        # Apply initial gripper width from reference path if connected
+        # Discrete open/close helper for reference path waypoints:
+        # Handles both crisp binary paths (105->55mm) and measured-width paths (e.g. 105->80mm on a cube)
+        min_w = getattr(self.gripper, "min_width_mm", 55.0) if self.gripper else 55.0
+        max_w = getattr(self.gripper, "max_width_mm", 105.0) if self.gripper else 105.0
+        ref_close_thresh = max_w - 12.0  # e.g., < 93.0 mm -> CLOSED (commands min_w = 55.0 mm)
+        ref_open_thresh = max_w - 6.0    # e.g., >= 99.0 mm -> OPEN (commands max_w = 105.0 mm)
+
+        def _classify_wp_closed(w_mm: float, cur_closed: bool) -> bool:
+            if not cur_closed and w_mm < ref_close_thresh:
+                return True
+            if cur_closed and w_mm >= ref_open_thresh:
+                return False
+            return cur_closed
+
+        # Apply initial discrete gripper state from reference path
+        w_start_raw = float(self.waypoints[0].gripper_width)
+        prev_wp_closed = _classify_wp_closed(w_start_raw, False)
+        cmd_init_w = float(min_w if prev_wp_closed else max_w)
         if self.gripper and hasattr(self.gripper, "grip"):
             try:
-                w_start = float(self.waypoints[0].gripper_width)
-                if w_start > 50.0:
-                    self.gripper.grip(w_start, force_n=30.0, speed_percent=50, wait=False)
+                self.gripper.grip(cmd_init_w, force_n=30.0, speed_percent=80, wait=False)
             except Exception:
                 pass
+        if self.gamepad_teleop and hasattr(self.gamepad_teleop, "set_gripper_target_width"):
+            self.gamepad_teleop.set_gripper_target_width(cmd_init_w)
+        self.gripper_commanded.emit(cmd_init_w)
 
         # ---------------------------------------------------------------------
         # State 1: Reference Path Playback Loop (50 Hz)
@@ -433,7 +452,6 @@ class HybridPathWorker(QThread):
         current_idx = 0
         interrupt_idx = 0
         last_gripper_cmd_time = 0.0
-        prev_gripper_width = float(self.waypoints[0].gripper_width)
 
         self.log_message.emit("INFO", "[HYBRID] >>> Commencing State 1: Path Playback. Touch gamepad sticks/buttons to override! <<<")
 
@@ -564,6 +582,10 @@ class HybridPathWorker(QThread):
                 interrupt_idx = target_idx
                 self._set_state(HybridState.PLAYBACK)
                 self.gamepad_teleop.set_inhibited(True, "Path playback in progress")
+                # Sync reference gripper edge tracker to resumed waypoint so we never undo
+                # a manual grasp/release performed by the operator during State 2 override.
+                if current_idx < N:
+                    prev_wp_closed = _classify_wp_closed(float(self.waypoints[current_idx].gripper_width), prev_wp_closed)
                 self.log_message.emit("INFO", f"[HYBRID] >>> Resuming STATE 1 (Path Playback) from Waypoint #{current_idx}/{N} <<<")
 
             # =================================================================
@@ -589,17 +611,23 @@ class HybridPathWorker(QThread):
 
             self._send_speedj(qd_cmd, a=1.4, t=0.06)
 
-            # Gripper control streaming if changed
+            # Discrete edge-triggered gripper control on reference path state transitions
             now = time.perf_counter()
-            if self.gripper and hasattr(self.gripper, "grip") and now - last_gripper_cmd_time >= 0.10:
-                target_w = float(wp_curr.gripper_width)
-                if abs(target_w - prev_gripper_width) > 1.0 and target_w > 50.0:
+            wp_closed = _classify_wp_closed(float(wp_curr.gripper_width), prev_wp_closed)
+            if wp_closed != prev_wp_closed and (now - last_gripper_cmd_time >= 0.15):
+                prev_wp_closed = wp_closed
+                cmd_w = float(min_w if wp_closed else max_w)
+                last_gripper_cmd_time = now
+                if self.gripper and hasattr(self.gripper, "grip"):
                     try:
-                        self.gripper.grip(target_w, force_n=30.0, speed_percent=50, wait=False)
-                        prev_gripper_width = target_w
-                        last_gripper_cmd_time = now
+                        self.gripper.grip(cmd_w, force_n=30.0, speed_percent=80, wait=False)
                     except Exception:
                         pass
+                if self.gamepad_teleop and hasattr(self.gamepad_teleop, "set_gripper_target_width"):
+                    self.gamepad_teleop.set_gripper_target_width(cmd_w)
+                self.gripper_commanded.emit(cmd_w)
+                state_lbl = "CLOSE" if wp_closed else "OPEN"
+                self.log_message.emit("INFO", f"[HYBRID GRIPPER] Reference path transition -> {state_lbl} ({cmd_w:.1f} mm)")
 
             # Progress update
             pct = (current_idx / max(1, N - 1)) * 100.0

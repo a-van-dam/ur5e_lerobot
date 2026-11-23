@@ -67,13 +67,50 @@ class OnRobot2FGModbus:
         self.min_width_mm: float = 55.0
         self.max_width_mm: float = 105.0
         self.default_force_n: float = 30.0
-        self.default_speed_pct: int = 50
+        self.default_speed_pct: int = 80
 
-        # Latest cache
-        self._cached_width_mm: float = 72.0
+        # Latest cache (initialized to wide-open default 105.0 mm)
+        self._cached_width_mm: float = 105.0
         self._cached_status: int = 0
         self._last_cmd_time: float = 0.0
-        self._last_cmd_target: float = 72.0
+        self._last_cmd_target: float = 105.0
+
+        # Background telemetry poller so 30 Hz recording / policy rollouts never block on Modbus I/O
+        self._poll_stop_event = threading.Event()
+        self._poll_thread: Optional[threading.Thread] = None
+
+    def _start_poller(self, hz: float = 25.0) -> None:
+        """Starts a lightweight daemon thread refreshing cached gripper width & status."""
+        if self.mock or not self._is_connected:
+            return
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            return
+        self._poll_stop_event.clear()
+        period = 1.0 / max(1.0, float(hz))
+
+        def _poll_loop():
+            while not self._poll_stop_event.is_set() and self._is_connected:
+                # Yield immediately after a write command so grip() gets priority on Modbus TCP
+                if time.time() - self._last_cmd_time >= 0.08:
+                    with self._lock:
+                        try:
+                            if self._is_connected and self.client is not None:
+                                res = self._read_holding(address=256, count=2)
+                                if not res.isError() and len(res.registers) >= 2:
+                                    self._cached_status = res.registers[0]
+                                    self._cached_width_mm = res.registers[1] / 10.0
+                        except Exception:
+                            pass
+                self._poll_stop_event.wait(period)
+
+        self._poll_thread = threading.Thread(target=_poll_loop, name="OnRobot2FGPoller", daemon=True)
+        self._poll_thread.start()
+
+    def _stop_poller(self) -> None:
+        self._poll_stop_event.set()
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            self._poll_thread.join(timeout=0.5)
+        self._poll_thread = None
 
     def connect(self) -> bool:
         """Establishes connection to the OnRobot Compute Box and reads stroke limits."""
@@ -103,17 +140,21 @@ class OnRobot2FGModbus:
         if info is not None:
             self.min_width_mm = info.get("min_external_mm", 55.0)
             self.max_width_mm = info.get("max_external_mm", 105.0)
-            self._cached_width_mm = info.get("external_width_mm", 72.0)
+            self._cached_width_mm = info.get("external_width_mm", 105.0)
             self._last_cmd_target = self._cached_width_mm
             logger.info(
                 f"OnRobot 2FG connected: Width={self._cached_width_mm:.1f}mm "
                 f"Limits=[{self.min_width_mm:.1f}, {self.max_width_mm:.1f}]mm"
             )
 
+        if self._is_connected:
+            self._start_poller(hz=25.0)
+
         return self._is_connected
 
     def disconnect(self) -> None:
         """Closes Modbus socket cleanly."""
+        self._stop_poller()
         with self._lock:
             if self.client is not None:
                 try:
@@ -193,7 +234,7 @@ class OnRobot2FGModbus:
 
     def get_width(self) -> float:
         """Reads current external aperture width in mm."""
-        if self.mock:
+        if self.mock or not self._is_connected:
             return self._cached_width_mm
 
         with self._lock:
@@ -205,9 +246,22 @@ class OnRobot2FGModbus:
                 pass
         return self._cached_width_mm
 
+    def get_cached_width(self) -> float:
+        """Returns latest measured gripper aperture width in mm without blocking on Modbus I/O."""
+        return float(self._cached_width_mm)
+
+    def get_target_width(self) -> float:
+        """Returns latest commanded target gripper width in mm."""
+        return float(self._last_cmd_target)
+
+    def is_closed(self, threshold_mm: Optional[float] = None) -> bool:
+        """Returns True if the gripper's commanded target width is below the open/close threshold."""
+        thresh = (0.5 * (self.min_width_mm + self.max_width_mm)) if threshold_mm is None else float(threshold_mm)
+        return float(self._last_cmd_target) < thresh
+
     def get_status(self) -> int:
         """Reads status bitmask."""
-        if self.mock:
+        if self.mock or not self._is_connected:
             return self._cached_status
 
         with self._lock:
@@ -249,7 +303,7 @@ class OnRobot2FGModbus:
         self._last_cmd_target = target_clamped
         self._last_cmd_time = time.time()
 
-        if self.mock:
+        if self.mock or not self._is_connected:
             self._cached_width_mm = target_clamped
             return self._cached_width_mm
 

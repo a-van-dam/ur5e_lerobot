@@ -201,16 +201,24 @@ def detect_available_cameras() -> List[Tuple[int, str]]:
 
 
 def scan_available_checkpoints() -> List[Tuple[str, Path]]:
-    """Scans outputs/train/ for available model checkpoints."""
+    """Scans outputs/train/ for available model checkpoints (best, latest, and periodic step snapshots)."""
     checkpoints = []
     if DEFAULT_TRAIN_DIR.exists():
         for proj in sorted(DEFAULT_TRAIN_DIR.iterdir()):
             if proj.is_dir():
+                best_ckpt = proj / "best_checkpoint"
+                if best_ckpt.exists() and (best_ckpt / "config.json").exists():
+                    checkpoints.append((f"{proj.name} [BEST VAL]", best_ckpt))
                 ckpt = proj / "checkpoint"
                 if ckpt.exists() and (ckpt / "config.json").exists():
                     checkpoints.append((proj.name, ckpt))
                 elif (proj / "config.json").exists():
                     checkpoints.append((proj.name, proj))
+                steps_dir = proj / "checkpoints"
+                if steps_dir.exists() and steps_dir.is_dir():
+                    for step_sub in sorted(steps_dir.iterdir()):
+                        if step_sub.is_dir() and (step_sub / "config.json").exists():
+                            checkpoints.append((f"{proj.name}/{step_sub.name}", step_sub))
     return checkpoints
 
 
@@ -757,6 +765,7 @@ class PolicyRolloutWorker(QThread):
     """
     plan_preview_ready = pyqtSignal(dict)
     step_progress = pyqtSignal(int, int, float, list)
+    gripper_state_changed = pyqtSignal(float)
     rollout_finished = pyqtSignal(bool, str)
 
     def __init__(
@@ -765,6 +774,8 @@ class PolicyRolloutWorker(QThread):
         robot_worker: RobotRTDEWorker,
         camera_worker_1: CameraWorker,
         camera_worker_2: Optional[CameraWorker],
+        gripper: Optional[Any] = None,
+        start_gripper_mm: float = DEFAULT_START_GRIPPER_MM,
         duration_s: float = 10.0,
         control_fps: int = 30,
         max_jump_deg: float = 45.0,
@@ -783,6 +794,8 @@ class PolicyRolloutWorker(QThread):
         self.robot_worker = robot_worker
         self.camera_worker_1 = camera_worker_1
         self.camera_worker_2 = camera_worker_2
+        self.gripper = gripper
+        self.start_gripper_mm = float(start_gripper_mm)
         self.duration_s = duration_s
         self.control_fps = control_fps
         self.max_jump_deg = max_jump_deg
@@ -864,6 +877,41 @@ class PolicyRolloutWorker(QThread):
                 except Exception:
                     pass
 
+        # Inspect state/action dimensionality (7-DoF with gripper vs legacy 6-DoF joints-only)
+        in_feats = getattr(policy.config, "input_features", {}) or {}
+        out_feats = getattr(policy.config, "output_features", {}) or {}
+        state_dim = 6
+        action_dim = 6
+        if "observation.state" in in_feats:
+            s_shape = getattr(in_feats["observation.state"], "shape", None)
+            if s_shape:
+                state_dim = int(s_shape[0])
+        if "action" in out_feats:
+            a_shape = getattr(out_feats["action"], "shape", None)
+            if a_shape:
+                action_dim = int(a_shape[0])
+        has_gripper_state = state_dim >= 7
+        has_gripper_action = action_dim >= 7
+
+        min_grip_w = getattr(self.gripper, "min_width_mm", 55.0) if self.gripper else 55.0
+        max_grip_w = getattr(self.gripper, "max_width_mm", 105.0) if self.gripper else 105.0
+        grip_close_thresh = 0.5 * (min_grip_w + max_grip_w)      # 80.0 mm -> trigger CLOSE (55.0 mm)
+        grip_open_thresh = grip_close_thresh + 5.0               # 85.0 mm -> trigger OPEN (105.0 mm)
+        tracked_gripper_mm = float(self.start_gripper_mm)
+        if self.gripper is not None and (self.gripper.is_connected or getattr(self.gripper, "mock", False)):
+            tracked_gripper_mm = float(
+                self.gripper.get_cached_width() if hasattr(self.gripper, "get_cached_width") else self.gripper.get_width()
+            )
+        gripper_is_closed = tracked_gripper_mm < (max_grip_w - 12.0)
+
+        if has_gripper_action:
+            print(
+                f"  • Action Space:       {action_dim}-DoF (6 UR5e Joints + OnRobot 2FG Gripper | "
+                f"Close<{grip_close_thresh:.1f}mm -> {min_grip_w:.0f}mm, Open>{grip_open_thresh:.1f}mm -> {max_grip_w:.0f}mm)"
+            )
+        else:
+            print(f"  • Action Space:       {action_dim}-DoF (Legacy Joints-Only Model — No Gripper Control)")
+
         # Inspect camera requirements
         img_features = getattr(policy.config, "image_features", {}) or getattr(policy.config, "input_features", {})
         has_wrist_cam = "observation.images.wrist" in img_features
@@ -886,11 +934,12 @@ class PolicyRolloutWorker(QThread):
         current_joints = self.robot_worker.get_latest_joints()
         start_q_rad = [current_joints.get(j, 0.0) for j in UR5E_JOINTS]
         start_q_deg = [math.degrees(r) for r in start_q_rad]
+        start_state_vec = list(start_q_rad) + ([tracked_gripper_mm] if has_gripper_state else [])
 
         # Single inference step for trajectory preview
         img_rgb = cv2.cvtColor(cam1_frame, cv2.COLOR_BGR2RGB)
         img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
-        state_tensor = torch.from_numpy(np.array(start_q_rad, dtype=np.float32)).unsqueeze(0).to(device)
+        state_tensor = torch.from_numpy(np.array(start_state_vec, dtype=np.float32)).unsqueeze(0).to(device)
 
         batch = {
             "observation.state": state_tensor,
@@ -912,11 +961,14 @@ class PolicyRolloutWorker(QThread):
             pred_raw = policy.select_action(pre_batch)
             pred_post = postprocessor(pred_raw)
 
-        first_target_rad = pred_post.squeeze().detach().cpu().numpy()
-        if first_target_rad.ndim > 1:
-            first_target_rad = first_target_rad[0].tolist()
+        first_action_full = pred_post.squeeze().detach().cpu().numpy()
+        if first_action_full.ndim > 1:
+            first_action_full = first_action_full[0].tolist()
         else:
-            first_target_rad = first_target_rad.tolist()
+            first_action_full = first_action_full.tolist()
+
+        first_target_rad = first_action_full[:6]
+        first_target_gripper = float(first_action_full[6]) if has_gripper_action and len(first_action_full) >= 7 else None
 
         first_target_deg = [math.degrees(r) for r in first_target_rad]
         deltas_deg = [t - c for t, c in zip(first_target_deg, start_q_deg)]
@@ -933,6 +985,9 @@ class PolicyRolloutWorker(QThread):
         ):
             status = "WARN" if abs(d_deg) > self.max_jump_deg else "OK"
             print(f" {j_name:<16} | {c_deg:+7.2f}° ({c_rad:+.3f}) | {t_deg:+7.2f}° ({t_rad:+.3f}) | {d_deg:+6.2f}° [{status}]")
+        if first_target_gripper is not None:
+            g_cmd_str = "CLOSE" if first_target_gripper < grip_close_thresh else "OPEN"
+            print(f" {'gripper_width':<16} | {tracked_gripper_mm:7.1f} mm       | {first_target_gripper:7.1f} mm       | [{g_cmd_str}]")
         print("-" * 75)
         print(f" Max Initial Shift:           {max_delta_deg:.2f}°")
         print(f" Rollout Duration:            {self.duration_s:.1f}s ({int(self.duration_s * self.control_fps)} steps)")
@@ -943,6 +998,7 @@ class PolicyRolloutWorker(QThread):
             "target_deg": first_target_deg,
             "deltas_deg": deltas_deg,
             "max_delta_deg": max_delta_deg,
+            "gripper_mm": first_target_gripper,
         })
 
         if max_delta_deg > self.max_jump_deg:
@@ -977,16 +1033,26 @@ class PolicyRolloutWorker(QThread):
                 if frame.shape[1] != req_w or frame.shape[0] != req_h:
                     frame = cv2.resize(frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
 
-                # 2. Grab current joint angles
+                # 2. Grab current joint angles (+ live cached gripper width if 7-DoF policy)
                 obs = self.robot_worker.get_latest_joints()
                 cur_q = [obs.get(j, 0.0) for j in UR5E_JOINTS]
+                if has_gripper_state:
+                    if self.gripper is not None and (self.gripper.is_connected or getattr(self.gripper, "mock", False)):
+                        cur_grip_mm = float(
+                            self.gripper.get_cached_width() if hasattr(self.gripper, "get_cached_width") else self.gripper.get_width()
+                        )
+                    else:
+                        cur_grip_mm = float(min_grip_w if gripper_is_closed else max_grip_w)
+                    cur_state = cur_q + [cur_grip_mm]
+                else:
+                    cur_state = cur_q
 
                 # 3. Model inference
                 if is_model_grayscale and len(frame.shape) == 3:
                     frame = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
                 img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img_t = torch.from_numpy(img_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
-                state_t = torch.from_numpy(np.array(cur_q, dtype=np.float32)).unsqueeze(0).to(device)
+                state_t = torch.from_numpy(np.array(cur_state, dtype=np.float32)).unsqueeze(0).to(device)
 
                 step_batch = {
                     "observation.state": state_t,
@@ -1009,13 +1075,15 @@ class PolicyRolloutWorker(QThread):
                     a_raw = policy.select_action(p_batch)
                     a_post = postprocessor(a_raw)
 
-                step_target = a_post.squeeze().detach().cpu().numpy()
-                if step_target.ndim > 1:
-                    step_target = step_target[0].tolist()
+                step_action_full = a_post.squeeze().detach().cpu().numpy()
+                if step_action_full.ndim > 1:
+                    step_action_full = step_action_full[0].tolist()
                 else:
-                    step_target = step_target.tolist()
+                    step_action_full = step_action_full.tolist()
 
-                # 4. Clamp single-step delta against safety limits
+                step_target = step_action_full[:6]
+
+                # 4. Clamp single-step joint delta against safety limits
                 clamped_target = []
                 for tgt, last in zip(step_target, last_target_q):
                     d = tgt - last
@@ -1023,8 +1091,30 @@ class PolicyRolloutWorker(QThread):
                     clamped_target.append(last + d)
                 last_target_q = list(clamped_target)
 
-                # 5. Stream action to robot
+                # 5. Stream joint action to robot
                 self.robot_worker.stream_servoj(clamped_target, dt=loop_period)
+
+                # 6. Execute discrete thresholded gripper command (with hysteresis to avoid chatter)
+                if has_gripper_action and len(step_action_full) >= 7:
+                    pred_grip_mm = float(step_action_full[6])
+                    if not gripper_is_closed and pred_grip_mm < grip_close_thresh:
+                        gripper_is_closed = True
+                        print(f"[GRIPPER POLICY] Step {step_count}: CLOSE triggered (pred={pred_grip_mm:.1f}mm < {grip_close_thresh:.1f}mm) -> Commanding {min_grip_w:.1f} mm (30N)")
+                        if self.gripper is not None and hasattr(self.gripper, "grip"):
+                            try:
+                                self.gripper.grip(min_grip_w, force_n=30.0, speed_percent=80, wait=False)
+                            except Exception as g_err:
+                                print(f"[GRIPPER ERROR] Policy close failed: {g_err}")
+                        self.gripper_state_changed.emit(float(min_grip_w))
+                    elif gripper_is_closed and pred_grip_mm > grip_open_thresh:
+                        gripper_is_closed = False
+                        print(f"[GRIPPER POLICY] Step {step_count}: OPEN triggered (pred={pred_grip_mm:.1f}mm > {grip_open_thresh:.1f}mm) -> Commanding {max_grip_w:.1f} mm")
+                        if self.gripper is not None and hasattr(self.gripper, "grip"):
+                            try:
+                                self.gripper.grip(max_grip_w, force_n=30.0, speed_percent=80, wait=False)
+                            except Exception as g_err:
+                                print(f"[GRIPPER ERROR] Policy open failed: {g_err}")
+                        self.gripper_state_changed.emit(float(max_grip_w))
 
                 elapsed_s = time.perf_counter() - t_rollout_start
                 self.step_progress.emit(step_count, total_steps, elapsed_s, clamped_target)
@@ -1056,9 +1146,15 @@ class PolicyRolloutWorker(QThread):
 
         # 5. Post-Test Behavior
         if self.return_start_after:
-            print("\n[POST-TEST] Returning arm to stored Start Position...")
+            print(f"\n[POST-TEST] Returning arm to stored Start Position and opening gripper ({self.start_gripper_mm:.1f} mm)...")
             start_action = {f"{j}.pos": math.radians(self.start_pose_deg.get(j, 0.0)) for j in UR5E_JOINTS}
             self.robot_worker.request_move_pose(start_action)
+            if self.gripper is not None and hasattr(self.gripper, "grip"):
+                try:
+                    self.gripper.grip(self.start_gripper_mm, force_n=30.0, speed_percent=80, wait=False)
+                    self.gripper_state_changed.emit(float(self.start_gripper_mm))
+                except Exception:
+                    pass
             time.sleep(1.0)
         elif self.auto_freedrive_after:
             print("\n[POST-TEST] Automatically restoring Freedrive mode for manual arm guidance...")
@@ -1781,7 +1877,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
         gamepad_row2.addWidget(self.lbl_gamepad_vel)
 
         # Gripper Gamepad Shortcut Badge
-        self.lbl_gamepad_gripper_hint = QLabel("🤏 Gripper: [A] Close | [B] Open")
+        self.lbl_gamepad_gripper_hint = QLabel("🤏 Gripper: [A] Close (55mm) | [B] Open (105mm)")
         self.lbl_gamepad_gripper_hint.setStyleSheet("""
             color: #10b981;
             font-family: monospace;
@@ -1792,7 +1888,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
             border: 1px solid #059669;
             border-radius: 4px;
         """)
-        self.lbl_gamepad_gripper_hint.setToolTip("Xbox Controller: Hold [A] to slowly CLOSE gripper | Hold [B] to slowly OPEN gripper")
+        self.lbl_gamepad_gripper_hint.setToolTip("Xbox Controller: Press [A] to snap CLOSE (55mm, 30N) | Press [B] to snap OPEN (105mm)")
         gamepad_row2.addWidget(self.lbl_gamepad_gripper_hint)
         gamepad_layout.addLayout(gamepad_row2)
 
@@ -3051,9 +3147,11 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self._user_targets.clear()
         action = {f"{j}.pos": math.radians(self.start_position.get(j, 0.0)) for j in UR5E_JOINTS}
         pose_str = ", ".join(f"{self.start_position.get(j, 0.0):+.1f}°" for j in UR5E_JOINTS)
-        print(f"[MOTION] Commanding UR5e arm to Start Position [{pose_str}]...")
-        self.status_bar.showMessage("Moving arm to Start Position...", 4000)
+        print(f"[MOTION] Commanding UR5e arm to Start Position [{pose_str}] and opening gripper ({self.start_gripper_mm:.1f} mm)...")
+        self.status_bar.showMessage("Moving arm to Start Position & opening gripper...", 4000)
         self.robot_worker.request_move_pose(action)
+        if hasattr(self, "command_gripper_width"):
+            self.command_gripper_width(self.start_gripper_mm)
 
     def move_to_home_pose(self):
         if hasattr(self, "gamepad_teleop") and self.gamepad_teleop and self.gamepad_teleop.is_enabled():
@@ -3360,6 +3458,8 @@ class UR5ePolicyTesterStudio(QMainWindow):
             robot_worker=self.robot_worker,
             camera_worker_1=self.camera_worker_1,
             camera_worker_2=self.camera_worker_2,
+            gripper=self.gripper,
+            start_gripper_mm=self.start_gripper_mm,
             duration_s=duration,
             control_fps=getattr(self, "model_fps", 30),
             max_jump_deg=max_jump,
@@ -3373,6 +3473,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
             mock=self.mock_mode,
         )
         self.rollout_worker.step_progress.connect(self.on_rollout_step_progress)
+        self.rollout_worker.gripper_state_changed.connect(self.on_gamepad_gripper_width_updated)
         self.rollout_worker.rollout_finished.connect(self.on_rollout_finished)
         self.rollout_worker.start()
 

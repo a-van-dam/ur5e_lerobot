@@ -44,6 +44,15 @@ except ImportError as err:
     LEROBOT_AVAILABLE = False
     LEROBOT_IMPORT_ERR = str(err)
 
+# Optional OnRobot 2FG Gripper Modbus TCP driver
+try:
+    from onrobot_gripper import get_shared_gripper, OnRobot2FGModbus
+    ONROBOT_GRIPPER_AVAILABLE = True
+except ImportError:
+    get_shared_gripper = None
+    OnRobot2FGModbus = None
+    ONROBOT_GRIPPER_AVAILABLE = False
+
 
 # =============================================================================
 # 1. User Configuration & Safety Parameters (Adjust freely here)
@@ -376,14 +385,41 @@ def run_policy_rollout(
     # ─────────────────────────────────────────────────────────────────
     print("\n[3/5] Sampling initial model prediction for trajectory safety review...")
 
+    # Inspect 7-DoF (joints + gripper) vs legacy 6-DoF model dimensionality
+    in_feats = getattr(policy.config, "input_features", {}) or {}
+    out_feats = getattr(policy.config, "output_features", {}) or {}
+    state_dim = int(getattr(in_feats.get("observation.state"), "shape", [6])[0]) if "observation.state" in in_feats else 6
+    action_dim = int(getattr(out_feats.get("action"), "shape", [6])[0]) if "action" in out_feats else 6
+    has_gripper_state = state_dim >= 7
+    has_gripper_action = action_dim >= 7
+
+    gripper = None
+    if (has_gripper_state or has_gripper_action) and ONROBOT_GRIPPER_AVAILABLE and get_shared_gripper is not None:
+        try:
+            gripper = get_shared_gripper(auto_connect=not mock)
+            if mock and gripper is not None:
+                gripper.mock = True
+        except Exception as g_err:
+            print(f"[GRIPPER] Init notice: {g_err}")
+
+    min_grip_w = getattr(gripper, "min_width_mm", 55.0) if gripper else 55.0
+    max_grip_w = getattr(gripper, "max_width_mm", 105.0) if gripper else 105.0
+    grip_close_thresh = 0.5 * (min_grip_w + max_grip_w)  # 80.0 mm
+    grip_open_thresh = grip_close_thresh + 5.0           # 85.0 mm
+    start_grip_w = float(
+        gripper.get_cached_width() if (gripper and (gripper.is_connected or getattr(gripper, "mock", False))) else max_grip_w
+    )
+    gripper_is_closed = start_grip_w < (max_grip_w - 12.0)
+
     obs_start = robot.get_observation()
     start_q_rad = [obs_start[f"{j}.pos"] for j in UR5E_JOINTS]
     start_q_deg = [math.degrees(rad) for rad in start_q_rad]
+    start_state_vec = list(start_q_rad) + ([start_grip_w] if has_gripper_state else [])
 
     # Run 1 inference step to inspect the starting waypoint
     img_rgb = cv2.cvtColor(initial_cam_frame, cv2.COLOR_BGR2RGB)
     img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
-    state_tensor = torch.from_numpy(np.array(start_q_rad, dtype=np.float32)).unsqueeze(0).to(device)
+    state_tensor = torch.from_numpy(np.array(start_state_vec, dtype=np.float32)).unsqueeze(0).to(device)
 
     batch = {
         "observation.state": state_tensor,
@@ -398,11 +434,14 @@ def run_policy_rollout(
         pred_raw = policy.select_action(pre_batch)
         pred_post = postprocessor(pred_raw)
 
-    first_target_rad = pred_post.squeeze().detach().cpu().numpy()
-    if first_target_rad.ndim > 1:
-        first_target_rad = first_target_rad[0].tolist()
+    first_action_full = pred_post.squeeze().detach().cpu().numpy()
+    if first_action_full.ndim > 1:
+        first_action_full = first_action_full[0].tolist()
     else:
-        first_target_rad = first_target_rad.tolist()
+        first_action_full = first_action_full.tolist()
+
+    first_target_rad = first_action_full[:6]
+    first_target_gripper = float(first_action_full[6]) if has_gripper_action and len(first_action_full) >= 7 else None
 
     first_target_deg = [math.degrees(r) for r in first_target_rad]
     deltas_deg = [t - c for t, c in zip(first_target_deg, start_q_deg)]
@@ -421,6 +460,9 @@ def run_policy_rollout(
     ):
         status = "WARN" if abs(d_deg) > max_jump_deg else "OK"
         print(f" {j_name:<16} | {c_deg:+7.2f}° ({c_rad:+.3f}) | {t_deg:+7.2f}° ({t_rad:+.3f}) | {d_deg:+6.2f}° [{status}]")
+    if first_target_gripper is not None:
+        g_cmd_str = "CLOSE" if first_target_gripper < grip_close_thresh else "OPEN"
+        print(f" {'gripper_width':<16} | {start_grip_w:7.1f} mm       | {first_target_gripper:7.1f} mm       | [{g_cmd_str}]")
     print("-" * 75)
     print(f" Initial Angular Shift:       {max_delta_deg:.2f}°")
     print(f" Rollout Duration:            {rollout_duration_s:.1f} seconds ({total_steps} sequential action steps)")
@@ -481,14 +523,22 @@ def run_policy_rollout(
             if is_grayscale:
                 cam_frame = cv2.cvtColor(cv2.cvtColor(cam_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
 
-            # 2. Acquire latest robot telemetry
+            # 2. Acquire latest robot telemetry (+ gripper width if 7-DoF policy)
             obs = robot.get_observation()
             current_q = [obs[f"{j}.pos"] for j in UR5E_JOINTS]
+            if has_gripper_state:
+                if gripper is not None and (gripper.is_connected or getattr(gripper, "mock", False)):
+                    cur_grip_mm = float(gripper.get_cached_width())
+                else:
+                    cur_grip_mm = float(min_grip_w if gripper_is_closed else max_grip_w)
+                current_state = current_q + [cur_grip_mm]
+            else:
+                current_state = current_q
 
             # 3. Construct model input tensors
             img_rgb = cv2.cvtColor(cam_frame, cv2.COLOR_BGR2RGB)
             img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
-            state_tensor = torch.from_numpy(np.array(current_q, dtype=np.float32)).unsqueeze(0).to(device)
+            state_tensor = torch.from_numpy(np.array(current_state, dtype=np.float32)).unsqueeze(0).to(device)
 
             step_batch = {
                 "observation.state": state_tensor,
@@ -507,13 +557,15 @@ def run_policy_rollout(
                 act_raw = policy.select_action(pre_batch)
                 act_post = postprocessor(act_raw)
 
-            step_target_rad = act_post.squeeze().detach().cpu().numpy()
-            if step_target_rad.ndim > 1:
-                step_target_rad = step_target_rad[0].tolist()
+            step_action_full = act_post.squeeze().detach().cpu().numpy()
+            if step_action_full.ndim > 1:
+                step_action_full = step_action_full[0].tolist()
             else:
-                step_target_rad = step_target_rad.tolist()
+                step_action_full = step_action_full.tolist()
 
-            # 5. Safety step delta clamp
+            step_target_rad = step_action_full[:6]
+
+            # 5. Safety step delta clamp (joints only)
             clamped_target = []
             max_jump_rad = math.radians(max_jump_deg)
             for tgt, last in zip(step_target_rad, last_target_q):
@@ -522,7 +574,7 @@ def run_policy_rollout(
                 clamped_target.append(last + d)
             last_target_q = list(clamped_target)
 
-            # 6. Command robot motion smoothly
+            # 6. Command robot motion smoothly (+ thresholded gripper command if 7-DoF)
             if mock:
                 robot.stream_servoj(clamped_target, dt=loop_period)
             else:
@@ -533,6 +585,19 @@ def run_policy_rollout(
                 else:
                     action_dict = {f"{j}.pos": float(val) for j, val in zip(UR5E_JOINTS, clamped_target)}
                     robot.send_action(action_dict)
+
+            if has_gripper_action and len(step_action_full) >= 7:
+                pred_grip_mm = float(step_action_full[6])
+                if not gripper_is_closed and pred_grip_mm < grip_close_thresh:
+                    gripper_is_closed = True
+                    print(f"\n[GRIPPER POLICY] Step {step_count}: CLOSE ({pred_grip_mm:.1f}mm < {grip_close_thresh:.1f}mm) -> {min_grip_w:.1f}mm")
+                    if gripper is not None and hasattr(gripper, "grip"):
+                        gripper.grip(min_grip_w, force_n=30.0, speed_percent=80, wait=False)
+                elif gripper_is_closed and pred_grip_mm > grip_open_thresh:
+                    gripper_is_closed = False
+                    print(f"\n[GRIPPER POLICY] Step {step_count}: OPEN ({pred_grip_mm:.1f}mm > {grip_open_thresh:.1f}mm) -> {max_grip_w:.1f}mm")
+                    if gripper is not None and hasattr(gripper, "grip"):
+                        gripper.grip(max_grip_w, force_n=30.0, speed_percent=80, wait=False)
 
             # 7. Live terminal progress bar
             elapsed = time.perf_counter() - start_rollout_time

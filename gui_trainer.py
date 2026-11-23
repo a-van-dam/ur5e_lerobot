@@ -109,6 +109,7 @@ try:
         AVAILABLE_POLICIES,
         BATCH_SIZE,
         DATASET_PATH,
+        DEFAULT_CHUNK_SIZE,
         DEVICE,
         EVAL_FREQ,
         GRAD_CLIP_NORM,
@@ -135,7 +136,7 @@ except Exception as err:
     LEROBOT_IMPORT_ERROR = str(err)
     AVAILABLE_POLICIES = ["act", "diffusion", "vqbet"]
     AVAILABLE_OPTIMIZERS = ["AdamW", "Adam", "SGD"]
-    TRAINING_STEPS = 15000
+    TRAINING_STEPS = 20000
     BATCH_SIZE = 32
     LEARNING_RATE = 1e-4
     LR_BACKBONE = 1e-5
@@ -143,6 +144,7 @@ except Exception as err:
     WARMUP_STEPS = 1000
     WEIGHT_DECAY = 1e-4
     GRAD_CLIP_NORM = 10.0
+    DEFAULT_CHUNK_SIZE = 60
     USE_AUGMENTATION = True
     TEMPORAL_ENSEMBLE_COEFF = 0.01
     AUG_ROTATION = True
@@ -151,7 +153,7 @@ except Exception as err:
     AUG_CUTOUT = False
     AUG_NOISE = False
     SAVE_CHECKPOINT_FREQ = 2500
-    LOG_FREQ = 20
+    LOG_FREQ = 50
     EVAL_FREQ = 1000
     VAL_SPLIT_RATIO = 0.1
     OUTPUT_DIR = "outputs/train/model"
@@ -944,7 +946,7 @@ class UR5eTrainerStudio(QMainWindow):
         grid_act.addWidget(QLabel("Chunk Size (Horizon Steps):"), 0, 0)
         self.spin_chunk_size = QSpinBox()
         self.spin_chunk_size.setRange(10, 300)
-        self.spin_chunk_size.setValue(100)
+        self.spin_chunk_size.setValue(DEFAULT_CHUNK_SIZE)
         self.spin_chunk_size.setToolTip("Total future action steps predicted at each neural network snapshot")
         self.spin_chunk_size.valueChanged.connect(self.update_decision_interval)
         grid_act.addWidget(self.spin_chunk_size, 0, 1)
@@ -1185,9 +1187,17 @@ class UR5eTrainerStudio(QMainWindow):
         found = []
         if self.outputs_dir.exists():
             for model_dir in sorted(self.outputs_dir.iterdir()):
+                best_dir = model_dir / "best_checkpoint"
+                if best_dir.exists() and (best_dir / "config.json").exists():
+                    found.append((f"{model_dir.name} [BEST VAL]", best_dir))
                 ckpt_dir = model_dir / "checkpoint"
                 if ckpt_dir.exists() and (ckpt_dir / "config.json").exists():
                     found.append((model_dir.name, ckpt_dir))
+                steps_dir = model_dir / "checkpoints"
+                if steps_dir.exists() and steps_dir.is_dir():
+                    for step_sub in sorted(steps_dir.iterdir()):
+                        if step_sub.is_dir() and (step_sub / "config.json").exists():
+                            found.append((f"{model_dir.name}/{step_sub.name}", step_sub))
 
         for name, ckpt in found:
             self.combo_resume_ckpt.addItem(f"💾 {name}", str(ckpt))

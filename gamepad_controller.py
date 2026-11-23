@@ -187,7 +187,8 @@ class GamepadConfig:
     # Gripper Button Indices (Xbox: A=0 close, B=1 open; PlayStation: Cross=0 close, Circle=1 open)
     button_gripper_close: int = 0
     button_gripper_open: int = 1
-    gripper_speed_mms: float = 25.0  # Aperture change rate in mm/s when button is held down
+    gripper_discrete_mode: bool = True  # Crisp binary snap: [A]=Full Close (55mm), [B]=Full Open (105mm)
+    gripper_speed_mms: float = 25.0     # Fallback aperture rate in mm/s if gripper_discrete_mode=False
 
     # Direction inversions (+1.0 normal, -1.0 inverted)
     invert_x: float = -1.0
@@ -463,6 +464,8 @@ class UR5eGamepadTeleop(QThread):
         self._gripper_target_width: float = DEFAULT_START_GRIPPER_MM  # Default wide open (105.0 mm)
         self._last_gripper_cmd_time: float = 0.0
         self._gripper_button_active: bool = False
+        self._prev_btn_gripper_close: bool = False
+        self._prev_btn_gripper_open: bool = False
 
     # -------------------------------------------------------------------------
     # Public Control & Configuration API
@@ -1047,7 +1050,9 @@ class UR5eGamepadTeleop(QThread):
                 has_joint = any(abs(w) > 1e-4 for w in (joint_vel[0], joint_vel[4], joint_vel[5]))
 
                 # ---------------------------------------------------------------------
-                # Gripper Teleoperation: Button A (Close Slowly) & Button B (Open Slowly)
+                # Gripper Teleoperation: Button A (Close) & Button B (Open)
+                # Discrete mode (default) snaps cleanly between min_w (55mm) and max_w (105mm)
+                # so imitation learning datasets receive a sharp, unmistakable open/close signal.
                 # ---------------------------------------------------------------------
                 num_buttons = self._joystick.get_numbuttons()
                 btn_close = (
@@ -1059,41 +1064,75 @@ class UR5eGamepadTeleop(QThread):
                     and bool(self._joystick.get_button(self.config.button_gripper_open))
                 )
 
-                if (btn_close or btn_open) and not self._inhibited:
-                    self._gripper_button_active = True
-                    min_w = getattr(self.gripper, "min_width_mm", 55.0) if self.gripper else 55.0
-                    max_w = getattr(self.gripper, "max_width_mm", 105.0) if self.gripper else 105.0
+                if self.config.gripper_discrete_mode:
+                    if not self._inhibited:
+                        min_w = getattr(self.gripper, "min_width_mm", 55.0) if self.gripper else 55.0
+                        max_w = getattr(self.gripper, "max_width_mm", 105.0) if self.gripper else 105.0
 
-                    delta = 0.0
-                    if btn_close and not btn_open:
-                        delta = -self.config.gripper_speed_mms * poll_period
-                    elif btn_open and not btn_close:
-                        delta = +self.config.gripper_speed_mms * poll_period
-
-                    if abs(delta) > 1e-4:
-                        with QMutexLocker(self._lock):
-                            self._gripper_target_width = max(min_w, min(max_w, self._gripper_target_width + delta))
-                            target_to_send = self._gripper_target_width
-
-                        now = time.perf_counter()
-                        if now - self._last_gripper_cmd_time >= 0.065:
-                            self._last_gripper_cmd_time = now
+                        # Rising-edge discrete CLOSE on Button [A]
+                        if btn_close and not self._prev_btn_gripper_close and not btn_open:
+                            with QMutexLocker(self._lock):
+                                self._gripper_target_width = float(min_w)
+                                target_to_send = self._gripper_target_width
+                            self._last_gripper_cmd_time = time.perf_counter()
                             if self.gripper is not None and hasattr(self.gripper, "grip"):
                                 try:
-                                    self.gripper.grip(target_to_send, force_n=30.0, speed_percent=50, wait=False)
+                                    self.gripper.grip(target_to_send, force_n=30.0, speed_percent=80, wait=False)
                                 except Exception:
                                     pass
                             self.gripper_width_updated.emit(target_to_send)
-                elif self._gripper_button_active:
-                    self._gripper_button_active = False
-                    with QMutexLocker(self._lock):
-                        final_w = self._gripper_target_width
-                    if self.gripper is not None and hasattr(self.gripper, "grip"):
-                        try:
-                            self.gripper.grip(final_w, force_n=30.0, speed_percent=50, wait=False)
-                        except Exception:
-                            pass
-                    self.gripper_width_updated.emit(final_w)
+
+                        # Rising-edge discrete OPEN on Button [B]
+                        elif btn_open and not self._prev_btn_gripper_open and not btn_close:
+                            with QMutexLocker(self._lock):
+                                self._gripper_target_width = float(max_w)
+                                target_to_send = self._gripper_target_width
+                            self._last_gripper_cmd_time = time.perf_counter()
+                            if self.gripper is not None and hasattr(self.gripper, "grip"):
+                                try:
+                                    self.gripper.grip(target_to_send, force_n=30.0, speed_percent=80, wait=False)
+                                except Exception:
+                                    pass
+                            self.gripper_width_updated.emit(target_to_send)
+
+                    self._prev_btn_gripper_close = btn_close
+                    self._prev_btn_gripper_open = btn_open
+                else:
+                    if (btn_close or btn_open) and not self._inhibited:
+                        self._gripper_button_active = True
+                        min_w = getattr(self.gripper, "min_width_mm", 55.0) if self.gripper else 55.0
+                        max_w = getattr(self.gripper, "max_width_mm", 105.0) if self.gripper else 105.0
+
+                        delta = 0.0
+                        if btn_close and not btn_open:
+                            delta = -self.config.gripper_speed_mms * poll_period
+                        elif btn_open and not btn_close:
+                            delta = +self.config.gripper_speed_mms * poll_period
+
+                        if abs(delta) > 1e-4:
+                            with QMutexLocker(self._lock):
+                                self._gripper_target_width = max(min_w, min(max_w, self._gripper_target_width + delta))
+                                target_to_send = self._gripper_target_width
+
+                            now = time.perf_counter()
+                            if now - self._last_gripper_cmd_time >= 0.065:
+                                self._last_gripper_cmd_time = now
+                                if self.gripper is not None and hasattr(self.gripper, "grip"):
+                                    try:
+                                        self.gripper.grip(target_to_send, force_n=30.0, speed_percent=50, wait=False)
+                                    except Exception:
+                                        pass
+                                self.gripper_width_updated.emit(target_to_send)
+                    elif self._gripper_button_active:
+                        self._gripper_button_active = False
+                        with QMutexLocker(self._lock):
+                            final_w = self._gripper_target_width
+                        if self.gripper is not None and hasattr(self.gripper, "grip"):
+                            try:
+                                self.gripper.grip(final_w, force_n=30.0, speed_percent=50, wait=False)
+                            except Exception:
+                                pass
+                        self.gripper_width_updated.emit(final_w)
 
                 with QMutexLocker(self._lock):
                     can_stream = self._enabled and not self._inhibited

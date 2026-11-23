@@ -35,6 +35,9 @@ UR5E_JOINTS = [
     "wrist_3",
 ]
 
+UR5E_STATE_ACTION_NAMES_7D = [f"{j}_pos" for j in UR5E_JOINTS] + ["gripper_width"]
+UR5E_STATE_ACTION_NAMES_6D = [f"{j}_pos" for j in UR5E_JOINTS]
+
 
 def save_episode_payload(payload_path: str | Path) -> None:
     payload_file = Path(payload_path).resolve()
@@ -77,16 +80,28 @@ def save_episode_payload(payload_path: str | Path) -> None:
 
     meta_info_file = dataset_root / "meta" / "info.json"
 
+    # Infer state/action dimensionality from incoming frames (default: 7-D = 6 UR5e joints + gripper_width)
+    state_dim = 7
+    if frames and "observation.state" in frames[0]:
+        try:
+            state_dim = int(np.asarray(frames[0]["observation.state"]).reshape(-1).shape[0])
+        except Exception:
+            state_dim = 7
+    state_names = UR5E_STATE_ACTION_NAMES_7D if state_dim == 7 else (
+        UR5E_STATE_ACTION_NAMES_6D if state_dim == 6 else [f"dim_{i}" for i in range(state_dim)]
+    )
+    print(f"         State/Action Dim: {state_dim}-DoF ({', '.join(state_names)})")
+
     features = {
         "observation.state": {
             "dtype": "float32",
-            "shape": (6,),
-            "names": [f"{j}_pos" for j in UR5E_JOINTS],
+            "shape": (state_dim,),
+            "names": state_names,
         },
         "action": {
             "dtype": "float32",
-            "shape": (6,),
-            "names": [f"{j}_pos" for j in UR5E_JOINTS],
+            "shape": (state_dim,),
+            "names": state_names,
         },
         "observation.images.workspace": {
             "dtype": "video",
@@ -102,14 +117,26 @@ def save_episode_payload(payload_path: str | Path) -> None:
         }
 
     is_valid_lerobot = False
+    existing_state_dim = None
     if meta_info_file.exists():
         try:
             with open(meta_info_file, "r") as f:
                 meta = json.load(f)
             if "features" in meta and "codebase_version" in meta:
                 is_valid_lerobot = True
+                ex_shape = meta.get("features", {}).get("observation.state", {}).get("shape", [])
+                if ex_shape:
+                    existing_state_dim = int(ex_shape[0])
         except Exception:
             is_valid_lerobot = False
+
+    if is_valid_lerobot and existing_state_dim is not None and existing_state_dim != state_dim:
+        raise ValueError(
+            f"Dataset schema mismatch at '{dataset_root.name}': existing dataset has "
+            f"{existing_state_dim}-D state/action (legacy without gripper), whereas the new episode has "
+            f"{state_dim}-D state/action (6 joints + gripper_width). "
+            f"Please enter a NEW Dataset Name in the recorder for 7-DoF gripper datasets!"
+        )
 
     if is_valid_lerobot:
         print(f"[WORKER] Resuming existing LeRobot dataset at: {dataset_root}")
@@ -173,6 +200,8 @@ def save_episode_payload(payload_path: str | Path) -> None:
         "height": camera_height,
         "fps": fps,
         "dual_cam": enable_dual_cameras,
+        "state_dim": state_dim,
+        "has_gripper": state_dim >= 7,
         "updated_at": datetime.datetime.now().isoformat(),
     }
     with open(meta_dir / "recording_config.json", "w") as f_cfg:

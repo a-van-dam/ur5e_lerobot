@@ -33,12 +33,15 @@ import socket
 import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import warnings
 
 # Enable background events in SDL before initializing Pygame so gamepads work without a focused window
 os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
 
 try:
-    import pygame
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*", category=UserWarning)
+        import pygame
     PYGAME_AVAILABLE = True
 except ImportError:
     PYGAME_AVAILABLE = False

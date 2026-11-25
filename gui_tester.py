@@ -31,6 +31,9 @@ from pathlib import Path
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import warnings
+
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*", category=UserWarning)
 
 import cv2
 import numpy as np
@@ -511,10 +514,11 @@ class RobotRTDEWorker(QThread):
             self._cmd_disconnect = True
 
     def stream_servoj(self, target_q: List[float], dt: float = 0.033):
-        """Streams a servoj position command smoothly to the arm."""
+        """Streams a damped servoj position command smoothly to the arm."""
         if not self.mock and self._robot and hasattr(self._robot, "sock") and self._robot.sock:
             q_str = ", ".join(f"{val:.5f}" for val in target_q)
-            cmd = f"servoj([{q_str}], t={dt:.3f}, lookahead_time=0.1, gain=300)\n"
+            t_param = max(0.08, float(dt) * 2.5)
+            cmd = f"servoj([{q_str}], t={t_param:.4f}, lookahead_time=0.20, gain=100)\n"
             try:
                 self._robot.sock.sendall(cmd.encode("utf-8"))
             except Exception as e:
@@ -524,11 +528,29 @@ class RobotRTDEWorker(QThread):
                 for idx, j_name in enumerate(UR5E_JOINTS):
                     self._latest_q[j_name] = float(target_q[idx])
 
+    def stream_speedj(self, qd_cmd: List[float], a: float = 1.2, t: float = 0.12, dt: float = 0.033):
+        """
+        Streams a continuous closed-loop speedj velocity command to the UR5e arm.
+        Provides smooth acceleration-limited tracking without servoj interrupt chatter
+        or hardware protective stops.
+        """
+        if not self.mock and self._robot and hasattr(self._robot, "sock") and self._robot.sock:
+            qd_str = ", ".join(f"{float(v):.5f}" for v in qd_cmd)
+            cmd = f"speedj([{qd_str}], a={float(a):.3f}, t={float(t):.3f})\n"
+            try:
+                self._robot.sock.sendall(cmd.encode("utf-8"))
+            except Exception as e:
+                print(f"[ERROR] speedj transmission failed: {e}")
+        elif self.mock:
+            with QMutexLocker(self._cmd_lock):
+                for idx, j_name in enumerate(UR5E_JOINTS):
+                    self._latest_q[j_name] = float(self._latest_q.get(j_name, 0.0)) + float(qd_cmd[idx]) * float(dt)
+
     def stop_motion(self):
-        """Halts motion immediately on the robot."""
+        """Halts motion smoothly and immediately on the robot (position hold, no Freedrive)."""
         if not self.mock and self._robot and hasattr(self._robot, "sock") and self._robot.sock:
             try:
-                self._robot.sock.sendall(b"stopj(2.0)\n")
+                self._robot.sock.sendall(b"stopj(1.5)\n")
             except Exception:
                 pass
 
@@ -782,6 +804,9 @@ class PolicyRolloutWorker(QThread):
         n_action_steps: Optional[int] = None,
         temporal_ensemble: bool = True,
         temporal_ensemble_coeff: float = 0.01,
+        smoothing_alpha: float = 0.35,
+        max_joint_vel_rads: float = 1.0,
+        max_joint_acc_rads2: float = 1.2,
         auto_freedrive_after: bool = True,
         return_start_after: bool = False,
         start_pose_deg: Optional[Dict[str, float]] = None,
@@ -802,6 +827,9 @@ class PolicyRolloutWorker(QThread):
         self.n_action_steps = n_action_steps
         self.temporal_ensemble = temporal_ensemble
         self.temporal_ensemble_coeff = temporal_ensemble_coeff
+        self.smoothing_alpha = max(0.05, min(1.0, float(smoothing_alpha)))
+        self.max_joint_vel_rads = max(0.1, min(2.5, float(max_joint_vel_rads)))
+        self.max_joint_acc_rads2 = max(0.2, min(3.0, float(max_joint_acc_rads2)))
         self.auto_freedrive_after = auto_freedrive_after
         self.return_start_after = return_start_after
         self.start_pose_deg = start_pose_deg or DEFAULT_START_JOINTS_DICT
@@ -811,6 +839,10 @@ class PolicyRolloutWorker(QThread):
 
     def request_abort(self):
         self._abort_requested = True
+        try:
+            self.robot_worker.stop_motion()
+        except Exception:
+            pass
 
     def run(self):
         print("\n" + "=" * 75)
@@ -850,13 +882,21 @@ class PolicyRolloutWorker(QThread):
                 if hasattr(policy.config, "temporal_ensemble_coeff"):
                     policy.config.temporal_ensemble_coeff = None
                 if self.n_action_steps is not None and hasattr(policy.config, "n_action_steps"):
-                    policy.config.n_action_steps = int(self.n_action_steps)
+                    model_chunk = int(getattr(policy.config, "chunk_size", 100) or 100)
+                    clamped_n_steps = max(1, min(model_chunk, int(self.n_action_steps)))
+                    policy.config.n_action_steps = clamped_n_steps
+                    if clamped_n_steps != int(self.n_action_steps):
+                        print(f"  • Note: Clamped Re-plan Interval from {self.n_action_steps} to model chunk_size={model_chunk}.")
                 if hasattr(policy, "drop_queued_actions"):
                     policy.drop_queued_actions()
                 policy.reset()
                 curr_steps = getattr(policy.config, "n_action_steps", 10)
                 dt_dec = curr_steps / max(1, self.control_fps)
                 print(f"  • Replanning Mode:    Open-Loop Chunks ({curr_steps} steps, {dt_dec:.2f}s @ {self.control_fps} FPS)")
+            print(
+                f"  • Smooth Motion:      speedj Closed-Loop | EMA α={self.smoothing_alpha:.2f} | "
+                f"V_max={self.max_joint_vel_rads:.2f} rad/s | A_max={self.max_joint_acc_rads2:.2f} rad/s²"
+            )
         except Exception as err:
             msg = f"Failed to load policy checkpoint: {err}"
             print(f"[ERROR] {msg}")
@@ -1010,20 +1050,27 @@ class PolicyRolloutWorker(QThread):
             self.robot_worker.request_toggle_freedrive()
             time.sleep(0.3)
 
-        # 4. Continuous Closed-Loop Rollout Loop
+        # 4. Continuous Closed-Loop Rollout Loop (Smooth speedj + EMA + Accel/Vel Limiting)
         total_steps = max(1, int(self.duration_s * self.control_fps))
         loop_period = 1.0 / self.control_fps
         policy.reset()
-        last_target_q = list(start_q_rad)
+        filtered_target_q = list(start_q_rad)
+        prev_filtered_q = list(start_q_rad)
+        prev_qd = [0.0] * 6
         max_jump_rad = math.radians(self.max_jump_deg)
+        kp_track = 2.2  # Closed-loop proportional tracking gain (s^-1)
+        ramp_steps = max(1.0, 0.6 * self.control_fps)  # 0.6s soft initial start ramp
 
-        print(f"[4/4] Executing autonomous rollout ({total_steps} steps)...")
+        print(f"[4/4] Executing smooth autonomous rollout ({total_steps} steps)...")
         step_count = 0
         t_rollout_start = time.perf_counter()
+        prev_tick_time = t_rollout_start
 
         try:
             while step_count < total_steps and not self._abort_requested:
                 t_tick_start = time.perf_counter()
+                dt_actual = max(0.015, min(0.10, t_tick_start - prev_tick_time)) if step_count > 0 else loop_period
+                prev_tick_time = t_tick_start
                 step_count += 1
 
                 # 1. Grab camera frame
@@ -1075,6 +1122,9 @@ class PolicyRolloutWorker(QThread):
                     a_raw = policy.select_action(p_batch)
                     a_post = postprocessor(a_raw)
 
+                if self._abort_requested:
+                    break
+
                 step_action_full = a_post.squeeze().detach().cpu().numpy()
                 if step_action_full.ndim > 1:
                     step_action_full = step_action_full[0].tolist()
@@ -1083,16 +1133,41 @@ class PolicyRolloutWorker(QThread):
 
                 step_target = step_action_full[:6]
 
-                # 4. Clamp single-step joint delta against safety limits
-                clamped_target = []
-                for tgt, last in zip(step_target, last_target_q):
-                    d = tgt - last
-                    d = max(-max_jump_rad, min(max_jump_rad, d))
-                    clamped_target.append(last + d)
-                last_target_q = list(clamped_target)
+                # 4. Safety delta clamp + EMA low-pass target smoothing
+                clamped_raw = []
+                for tgt, last in zip(step_target, filtered_target_q):
+                    d = max(-max_jump_rad, min(max_jump_rad, tgt - last))
+                    clamped_raw.append(last + d)
 
-                # 5. Stream joint action to robot
-                self.robot_worker.stream_servoj(clamped_target, dt=loop_period)
+                alpha = self.smoothing_alpha
+                filtered_target_q = [
+                    alpha * tgt + (1.0 - alpha) * prev
+                    for tgt, prev in zip(clamped_raw, filtered_target_q)
+                ]
+
+                # 5. Smooth closed-loop speedj velocity tracking with soft ramp-in,
+                #    velocity ceiling, and acceleration slew-rate limiting (prevents UR5e protective stops)
+                ramp = min(1.0, step_count / ramp_steps)
+                max_dv = self.max_joint_acc_rads2 * dt_actual
+                qd_cmd = [0.0] * 6
+                for j in range(6):
+                    qd_ff = (filtered_target_q[j] - prev_filtered_q[j]) / dt_actual
+                    pos_err = filtered_target_q[j] - cur_q[j]
+                    v_des = (qd_ff + kp_track * pos_err) * ramp
+                    v_des = max(-self.max_joint_vel_rads, min(self.max_joint_vel_rads, v_des))
+                    dv = max(-max_dv, min(max_dv, v_des - prev_qd[j]))
+                    qd_cmd[j] = prev_qd[j] + dv
+
+                prev_filtered_q = list(filtered_target_q)
+                prev_qd = list(qd_cmd)
+
+                watchdog_t = max(0.12, loop_period * 3.5)
+                self.robot_worker.stream_speedj(
+                    qd_cmd,
+                    a=self.max_joint_acc_rads2,
+                    t=watchdog_t,
+                    dt=dt_actual,
+                )
 
                 # 6. Execute discrete thresholded gripper command (with hysteresis to avoid chatter)
                 if has_gripper_action and len(step_action_full) >= 7:
@@ -1117,7 +1192,7 @@ class PolicyRolloutWorker(QThread):
                         self.gripper_state_changed.emit(float(max_grip_w))
 
                 elapsed_s = time.perf_counter() - t_rollout_start
-                self.step_progress.emit(step_count, total_steps, elapsed_s, clamped_target)
+                self.step_progress.emit(step_count, total_steps, elapsed_s, filtered_target_q)
 
                 # Sleep to maintain control loop frequency
                 t_elapsed = time.perf_counter() - t_tick_start
@@ -1144,8 +1219,12 @@ class PolicyRolloutWorker(QThread):
             print(f"[ERROR] {msg}")
             success = False
 
-        # 5. Post-Test Behavior
-        if self.return_start_after:
+        # 5. Post-Test Behavior (ONLY on clean completion — NEVER enter Freedrive on user Stop/Abort!)
+        if self._abort_requested:
+            print("\n[ABORT] Rollout interrupted by user. Robot holding position safely (Freedrive NOT enabled).")
+        elif not success:
+            print("\n[POST-TEST] Rollout stopped due to error. Robot holding position safely (Freedrive NOT enabled).")
+        elif self.return_start_after:
             print(f"\n[POST-TEST] Returning arm to stored Start Position and opening gripper ({self.start_gripper_mm:.1f} mm)...")
             start_action = {f"{j}.pos": math.radians(self.start_pose_deg.get(j, 0.0)) for j in UR5E_JOINTS}
             self.robot_worker.request_move_pose(start_action)
@@ -1588,16 +1667,57 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.chk_auto_freedrive = QCheckBox("Auto-enable Freedrive after test")
         self.chk_auto_freedrive.setChecked(True)
         self.chk_auto_freedrive.setStyleSheet("color: #cbd5e1; font-size: 11px;")
-        self.chk_auto_freedrive.setToolTip("Automatically unlock arm in Freedrive once rollout completes")
+        self.chk_auto_freedrive.setToolTip("Automatically unlock arm in Freedrive only when rollout completes normally (never on Stop/Abort)")
         opts_row.addWidget(self.chk_auto_freedrive)
 
         self.chk_return_start = QCheckBox("Return to Start Pose")
         self.chk_return_start.setChecked(False)
         self.chk_return_start.setStyleSheet("color: #cbd5e1; font-size: 11px;")
-        self.chk_return_start.setToolTip("Automatically command arm back to active Start Position when test finishes")
+        self.chk_return_start.setToolTip("Automatically command arm back to active Start Position when test finishes normally")
         opts_row.addWidget(self.chk_return_start)
 
         eval_layout.addLayout(opts_row)
+
+        # Motion Smoothing & Speed/Accel Limiting Row (prevents choppy motion & UR5e protective stops)
+        smooth_row = QHBoxLayout()
+        lbl_smooth = QLabel("Motion Filter (EMA α):")
+        lbl_smooth.setStyleSheet("color: #34d399; font-weight: bold; font-size: 11px;")
+        self.spin_smooth_alpha = QDoubleSpinBox()
+        self.spin_smooth_alpha.setRange(0.05, 1.00)
+        self.spin_smooth_alpha.setDecimals(2)
+        self.spin_smooth_alpha.setSingleStep(0.05)
+        self.spin_smooth_alpha.setValue(0.35)
+        self.spin_smooth_alpha.setToolTip(
+            "Low-pass EMA filter on policy joint targets (lower = smoother/more damped, 0.35 = recommended, 1.00 = raw unfiltered)"
+        )
+        smooth_row.addWidget(lbl_smooth)
+        smooth_row.addWidget(self.spin_smooth_alpha)
+
+        lbl_vmax = QLabel("Max Vel:")
+        lbl_vmax.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px; margin-left: 8px;")
+        self.spin_max_vel = QDoubleSpinBox()
+        self.spin_max_vel.setRange(0.20, 2.00)
+        self.spin_max_vel.setDecimals(2)
+        self.spin_max_vel.setSingleStep(0.10)
+        self.spin_max_vel.setValue(1.00)
+        self.spin_max_vel.setSuffix(" rad/s")
+        self.spin_max_vel.setToolTip("Maximum joint velocity ceiling during autonomous speedj tracking (1.0 rad/s ≈ 57°/s)")
+        smooth_row.addWidget(lbl_vmax)
+        smooth_row.addWidget(self.spin_max_vel)
+
+        lbl_amax = QLabel("Max Accel:")
+        lbl_amax.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px; margin-left: 8px;")
+        self.spin_max_acc = QDoubleSpinBox()
+        self.spin_max_acc.setRange(0.30, 2.50)
+        self.spin_max_acc.setDecimals(2)
+        self.spin_max_acc.setSingleStep(0.10)
+        self.spin_max_acc.setValue(1.20)
+        self.spin_max_acc.setSuffix(" rad/s²")
+        self.spin_max_acc.setToolTip("Maximum joint acceleration slew-rate limit (prevents sudden jerks and UR5e protective stops)")
+        smooth_row.addWidget(lbl_amax)
+        smooth_row.addWidget(self.spin_max_acc)
+        smooth_row.addStretch()
+        eval_layout.addLayout(smooth_row)
 
         # Temporal Ensembling & Decision Horizon Controls
         ensemble_row = QHBoxLayout()
@@ -1631,8 +1751,8 @@ class UR5ePolicyTesterStudio(QMainWindow):
         interval_row.addWidget(self.lbl_steps)
 
         self.slider_action_steps = QSlider(Qt.Orientation.Horizontal)
-        self.slider_action_steps.setRange(1, 50)
-        self.slider_action_steps.setValue(10)
+        self.slider_action_steps.setRange(1, 100)
+        self.slider_action_steps.setValue(15)
         self.slider_action_steps.setEnabled(False)
         self.slider_action_steps.setStyleSheet("""
             QSlider::groove:horizontal {
@@ -2601,9 +2721,10 @@ class UR5ePolicyTesterStudio(QMainWindow):
             self.set_grayscale_mode(is_model_grayscale)
             mode_badge = "Grayscale (1-Ch)" if is_model_grayscale else "RGB (3-Ch)"
 
-            # Check for trained FPS, decision horizon, and temporal ensemble settings
+            # Check for trained FPS, chunk size, decision horizon, and temporal ensemble settings
             model_fps = 30
-            trained_n_steps = 10
+            model_chunk_size = int(data.get("chunk_size", 100) or 100)
+            trained_n_steps = 15
             trained_ensemble_coeff = None
             for info_p in [p / "training_info.json", p.parent / "training_info.json"]:
                 if info_p.exists():
@@ -2611,7 +2732,9 @@ class UR5ePolicyTesterStudio(QMainWindow):
                         with open(info_p, "r") as f_info:
                             t_info = json.load(f_info)
                             model_fps = int(t_info.get("fps", 30))
-                            trained_n_steps = int(t_info.get("n_action_steps", 10))
+                            if "chunk_size" in t_info and t_info["chunk_size"]:
+                                model_chunk_size = int(t_info["chunk_size"])
+                            trained_n_steps = int(t_info.get("n_action_steps", 15))
                             if "temporal_ensemble_coeff" in t_info and t_info["temporal_ensemble_coeff"] is not None:
                                 trained_ensemble_coeff = float(t_info["temporal_ensemble_coeff"])
                             break
@@ -2627,6 +2750,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
                     pass
 
             self.model_fps = model_fps
+            self.model_chunk_size = model_chunk_size
             if trained_ensemble_coeff is not None and hasattr(self, "spin_ensemble_coeff"):
                 self.spin_ensemble_coeff.blockSignals(True)
                 self.spin_ensemble_coeff.setValue(trained_ensemble_coeff)
@@ -2634,7 +2758,8 @@ class UR5ePolicyTesterStudio(QMainWindow):
 
             if hasattr(self, "slider_action_steps"):
                 self.slider_action_steps.blockSignals(True)
-                self.slider_action_steps.setValue(trained_n_steps)
+                self.slider_action_steps.setRange(1, max(1, model_chunk_size))
+                self.slider_action_steps.setValue(max(1, min(model_chunk_size, trained_n_steps)))
                 self.slider_action_steps.blockSignals(False)
 
             if hasattr(self, "chk_temporal_ensemble"):
@@ -3450,9 +3575,12 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.status_bar.showMessage("Executing autonomous policy evaluation rollout...", 10000)
 
         # Launch background rollout thread
-        n_steps = self.slider_action_steps.value() if hasattr(self, "slider_action_steps") else 10
+        n_steps = self.slider_action_steps.value() if hasattr(self, "slider_action_steps") else 15
         use_ensemble = self.chk_temporal_ensemble.isChecked() if hasattr(self, "chk_temporal_ensemble") else True
         ens_coeff = self.spin_ensemble_coeff.value() if hasattr(self, "spin_ensemble_coeff") else 0.01
+        smooth_alpha = self.spin_smooth_alpha.value() if hasattr(self, "spin_smooth_alpha") else 0.35
+        max_vel = self.spin_max_vel.value() if hasattr(self, "spin_max_vel") else 1.00
+        max_acc = self.spin_max_acc.value() if hasattr(self, "spin_max_acc") else 1.20
         self.rollout_worker = PolicyRolloutWorker(
             model_path=self.active_model_path,
             robot_worker=self.robot_worker,
@@ -3466,6 +3594,9 @@ class UR5ePolicyTesterStudio(QMainWindow):
             n_action_steps=n_steps,
             temporal_ensemble=use_ensemble,
             temporal_ensemble_coeff=ens_coeff,
+            smoothing_alpha=smooth_alpha,
+            max_joint_vel_rads=max_vel,
+            max_joint_acc_rads2=max_acc,
             auto_freedrive_after=auto_fd,
             return_start_after=return_start,
             start_pose_deg=self.start_position,

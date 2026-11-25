@@ -34,6 +34,9 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import warnings
+
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*", category=UserWarning)
 
 import cv2
 import numpy as np

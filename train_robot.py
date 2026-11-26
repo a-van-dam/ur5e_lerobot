@@ -46,6 +46,12 @@ except ImportError as e:
     LEROBOT_AVAILABLE = False
     LEROBOT_IMPORT_ERROR = str(e)
 
+try:
+    from camera_roi import load_camera_roi_from_dir
+except ImportError:
+    def load_camera_roi_from_dir(_):
+        return {"workspace": None, "wrist": None}
+
 
 # =============================================================================
 # 1. User Configuration & Hyperparameters (Adjust freely here)
@@ -72,20 +78,21 @@ AVAILABLE_OPTIMIZERS = [
 ]
 SELECTED_OPTIMIZER_INDEX = 0  # <--- Select optimizer by index (0: AdamW, 1: Adam, 2: SGD)
 
-# Training Hyperparameters (tuned for 320x240 dual-cam 7-DoF cube pick-and-place)
+# Training Hyperparameters (tuned for 480x360 dual-cam 7-DoF cube pick-and-place)
 TRAINING_STEPS = 20000        # Total optimization steps (~5 epochs on 130k frames; avoids overfitting)
 BATCH_SIZE = 32               # Samples per training batch (RTX 3080 16GB sweet spot)
 LEARNING_RATE = 1e-4          # Initial optimizer learning rate for transformer heads
-LR_BACKBONE = 1e-5            # Differential learning rate for pretrained ResNet vision backbone
+LR_BACKBONE = 3e-5            # Differential learning rate for ResNet vision backbone (adapts cleanly to table & cube)
 LR_MIN = 1e-6                 # Minimum learning rate at end of Cosine Annealing schedule
 WARMUP_STEPS = 1000           # Linear warmup steps to stabilize transformer attention layers
 WEIGHT_DECAY = 1e-4           # L2 regularization weight decay
 GRAD_CLIP_NORM = 10.0         # Gradient clipping max norm to prevent exploding gradients
+STATE_NOISE_STD = 0.02        # Gaussian proprioception noise (rad, ~1.1 deg) on arm joints during training to prevent vision-ignoring shortcuts
 DEFAULT_CHUNK_SIZE = 60       # 2.0s action chunk horizon @ 30 FPS (crisp pickup/close/drop transitions)
 USE_AUGMENTATION = True       # Master switch for GPU visual data augmentation
-AUG_ROTATION = True           # Slight random rotation (±10 deg)
-AUG_TRANSLATION = True        # Slight random translation (±8% X/Y)
-AUG_COLOR = True              # Mild brightness & contrast jitter (±20%)
+AUG_ROTATION = False          # Off by default: avoids distorting exact object location on fixed cameras
+AUG_TRANSLATION = False       # Off by default: avoids teaching policy to ignore shifted object positions
+AUG_COLOR = True              # Mild brightness & contrast jitter (±20%, spatially invariant)
 AUG_CUTOUT = False            # Random cutout / occlusion patches (5-15% area)
 AUG_NOISE = False             # Mild Gaussian sensor noise
 TEMPORAL_ENSEMBLE_COEFF = 0.01  # ACT Algorithm 2: Exponential moving average across overlapping chunks (0.01 standard)
@@ -808,6 +815,7 @@ class RobotTrainer:
         warmup_steps: int = WARMUP_STEPS,
         weight_decay: float = WEIGHT_DECAY,
         grad_clip_norm: float = GRAD_CLIP_NORM,
+        state_noise_std: float = STATE_NOISE_STD,
         use_augmentation: bool = USE_AUGMENTATION,
         aug_rotation: bool = AUG_ROTATION,
         aug_translation: bool = AUG_TRANSLATION,
@@ -845,6 +853,7 @@ class RobotTrainer:
         self.warmup_steps = int(warmup_steps)
         self.weight_decay = float(weight_decay)
         self.grad_clip_norm = float(grad_clip_norm)
+        self.state_noise_std = max(0.0, float(state_noise_std))
         self.use_augmentation = bool(use_augmentation)
         self.aug_rotation = bool(aug_rotation)
         self.aug_translation = bool(aug_translation)
@@ -884,8 +893,9 @@ class RobotTrainer:
         else:
             self.is_grayscale = False  # Default: Train in RGB Color
 
-        # Extract native dataset FPS
+        # Extract native dataset FPS and any camera ROI masks saved during recording
         self.dataset_fps = 30
+        self.camera_roi = load_camera_roi_from_dir(self.dataset_path)
         for info_c in [self.dataset_path / "meta" / "info.json", self.dataset_path / "meta" / "recording_config.json"]:
             if info_c.exists():
                 try:
@@ -1064,6 +1074,8 @@ class RobotTrainer:
             "n_action_steps": eff_n_actions,
             "decision_interval_s": dec_interval,
             "temporal_ensemble_coeff": self.temporal_ensemble_coeff,
+            "state_noise_std": self.state_noise_std,
+            "camera_roi": self.camera_roi,
             "val_loss": val_loss,
             "best_val_loss": None if not math.isfinite(self.best_val_loss) else self.best_val_loss,
             "grayscale": self.is_grayscale,
@@ -1292,6 +1304,14 @@ class RobotTrainer:
                 train_iter = iter(train_loader)
                 batch = next(train_iter)
 
+            # Proprioception Noise Injection (training only, arm joints [:6] only — preserves gripper dim [6]):
+            # Prevents ACT from memorizing a state-only trajectory and forces genuine visual attention.
+            if self.state_noise_std > 0.0 and "observation.state" in batch and isinstance(batch["observation.state"], torch.Tensor):
+                st = batch["observation.state"].clone()
+                joint_dims = min(6, st.shape[-1])
+                st[..., :joint_dims] = st[..., :joint_dims] + torch.randn_like(st[..., :joint_dims]) * self.state_noise_std
+                batch["observation.state"] = st
+
             # Preprocess (normalization & tensor device transfer)
             batch = preprocessor(batch)
             batch = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -1484,6 +1504,7 @@ def parse_args():
     parser.add_argument("--aug-cutout", action=argparse.BooleanOptionalAction, default=AUG_CUTOUT, help="Random cutout / occlusion patches")
     parser.add_argument("--aug-noise", action=argparse.BooleanOptionalAction, default=AUG_NOISE, help="Random Gaussian sensor noise")
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="L2 weight decay")
+    parser.add_argument("--state-noise-std", type=float, default=STATE_NOISE_STD, help="Gaussian joint proprioception noise std (rad) during training")
     parser.add_argument("--save-freq", type=int, default=SAVE_CHECKPOINT_FREQ, help="Checkpoint save step frequency (latest + periodic snapshots)")
     parser.add_argument("--log-freq", type=int, default=LOG_FREQ, help="Console logging interval")
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR, help="Output directory for model weights and loss curves")
@@ -1518,6 +1539,7 @@ def main():
         aug_cutout=args.aug_cutout,
         aug_noise=args.aug_noise,
         weight_decay=args.weight_decay,
+        state_noise_std=args.state_noise_std,
         save_checkpoint_freq=args.save_freq,
         log_freq=args.log_freq,
         output_dir=args.output_dir,

@@ -53,6 +53,14 @@ except ImportError:
     OnRobot2FGModbus = None
     ONROBOT_GRIPPER_AVAILABLE = False
 
+try:
+    from camera_roi import apply_roi_mask, load_camera_roi_from_dir
+except ImportError:
+    def apply_roi_mask(frame, _roi):
+        return frame
+    def load_camera_roi_from_dir(_):
+        return {"workspace": None, "wrist": None}
+
 
 # =============================================================================
 # 1. User Configuration & Safety Parameters (Adjust freely here)
@@ -416,8 +424,13 @@ def run_policy_rollout(
     start_q_deg = [math.degrees(rad) for rad in start_q_rad]
     start_state_vec = list(start_q_rad) + ([start_grip_w] if has_gripper_state else [])
 
+    camera_roi = load_camera_roi_from_dir(model_dir)
+    roi_ws = camera_roi.get("workspace")
+    roi_wr = camera_roi.get("wrist")
+
     # Run 1 inference step to inspect the starting waypoint
-    img_rgb = cv2.cvtColor(initial_cam_frame, cv2.COLOR_BGR2RGB)
+    ws_init = apply_roi_mask(initial_cam_frame, roi_ws)
+    img_rgb = cv2.cvtColor(ws_init, cv2.COLOR_BGR2RGB)
     img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
     state_tensor = torch.from_numpy(np.array(start_state_vec, dtype=np.float32)).unsqueeze(0).to(device)
 
@@ -426,7 +439,8 @@ def run_policy_rollout(
         "observation.images.workspace": img_tensor,
     }
     if has_wrist_cam and cam2_stream is not None:
-        wrist_rgb = cv2.cvtColor(cam2_stream.read_frame(), cv2.COLOR_BGR2RGB)
+        wrist_init = apply_roi_mask(cam2_stream.read_frame(), roi_wr)
+        wrist_rgb = cv2.cvtColor(wrist_init, cv2.COLOR_BGR2RGB)
         batch["observation.images.wrist"] = torch.from_numpy(wrist_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
 
     with torch.no_grad():
@@ -535,7 +549,8 @@ def run_policy_rollout(
             else:
                 current_state = current_q
 
-            # 3. Construct model input tensors
+            # 3. Construct model input tensors (with saved ROI masking if active)
+            cam_frame = apply_roi_mask(cam_frame, roi_ws)
             img_rgb = cv2.cvtColor(cam_frame, cv2.COLOR_BGR2RGB)
             img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
             state_tensor = torch.from_numpy(np.array(current_state, dtype=np.float32)).unsqueeze(0).to(device)
@@ -545,7 +560,7 @@ def run_policy_rollout(
                 "observation.images.workspace": img_tensor,
             }
             if has_wrist_cam and cam2_stream is not None:
-                wrist_raw = cam2_stream.read_frame()
+                wrist_raw = apply_roi_mask(cam2_stream.read_frame(), roi_wr)
                 if is_grayscale:
                     wrist_raw = cv2.cvtColor(cv2.cvtColor(wrist_raw, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
                 wrist_rgb = cv2.cvtColor(wrist_raw, cv2.COLOR_BGR2RGB)

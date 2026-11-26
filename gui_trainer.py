@@ -122,6 +122,7 @@ try:
         OUTPUT_DIR,
         SAVE_CHECKPOINT_FREQ,
         SEED,
+        STATE_NOISE_STD,
         TRAINING_STEPS,
         USE_AUGMENTATION,
         VAL_SPLIT_RATIO,
@@ -139,16 +140,17 @@ except Exception as err:
     TRAINING_STEPS = 20000
     BATCH_SIZE = 32
     LEARNING_RATE = 1e-4
-    LR_BACKBONE = 1e-5
+    LR_BACKBONE = 3e-5
     LR_MIN = 1e-6
     WARMUP_STEPS = 1000
     WEIGHT_DECAY = 1e-4
     GRAD_CLIP_NORM = 10.0
+    STATE_NOISE_STD = 0.02
     DEFAULT_CHUNK_SIZE = 60
     USE_AUGMENTATION = True
     TEMPORAL_ENSEMBLE_COEFF = 0.01
-    AUG_ROTATION = True
-    AUG_TRANSLATION = True
+    AUG_ROTATION = False
+    AUG_TRANSLATION = False
     AUG_COLOR = True
     AUG_CUTOUT = False
     AUG_NOISE = False
@@ -793,8 +795,8 @@ class UR5eTrainerStudio(QMainWindow):
         grid_lr.addWidget(self.edit_lr, 0, 1)
 
         grid_lr.addWidget(QLabel("Vision Backbone LR:"), 0, 2)
-        self.edit_lr_backbone = QLineEdit("1e-5")
-        self.edit_lr_backbone.setToolTip("Differential learning rate for pretrained ResNet visual backbone")
+        self.edit_lr_backbone = QLineEdit(f"{LR_BACKBONE:g}")
+        self.edit_lr_backbone.setToolTip("Differential learning rate for pretrained ResNet visual backbone (3e-5 recommended)")
         grid_lr.addWidget(self.edit_lr_backbone, 0, 3)
 
         grid_lr.addWidget(QLabel("Minimum LR (Cosine):"), 1, 0)
@@ -810,6 +812,18 @@ class UR5eTrainerStudio(QMainWindow):
         self.spin_grad_clip.setRange(0.0, 100.0)
         self.spin_grad_clip.setValue(GRAD_CLIP_NORM)
         grid_lr.addWidget(self.spin_grad_clip, 2, 1)
+
+        grid_lr.addWidget(QLabel("State Noise (rad):"), 2, 2)
+        self.spin_state_noise = QDoubleSpinBox()
+        self.spin_state_noise.setRange(0.0, 0.200)
+        self.spin_state_noise.setDecimals(3)
+        self.spin_state_noise.setSingleStep(0.005)
+        self.spin_state_noise.setValue(STATE_NOISE_STD)
+        self.spin_state_noise.setToolTip(
+            "Gaussian noise added to arm joint observations during training (0.02 rad ≈ ±1.1°).\n"
+            "Breaks proprioception memorization and forces the policy to attend to camera images!"
+        )
+        grid_lr.addWidget(self.spin_state_noise, 2, 3)
 
         layout.addWidget(grp_lr)
 
@@ -1070,6 +1084,27 @@ class UR5eTrainerStudio(QMainWindow):
         self.btn_test_policy.setToolTip("Launch gui_tester.py pre-loaded with this checkpoint")
         self.btn_test_policy.clicked.connect(self.launch_gui_tester)
         layout.addWidget(self.btn_test_policy)
+
+        # Offline Vision Sensitivity Check Button
+        self.btn_vision_check = QPushButton("👁 Vision Check")
+        self.btn_vision_check.setStyleSheet("""
+            QPushButton {
+                background-color: #7c3aed;
+                color: #ffffff;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 10px 14px;
+                border-radius: 6px;
+                border: 1px solid #a78bfa;
+            }
+            QPushButton:hover { background-color: #6d28d9; }
+        """)
+        self.btn_vision_check.setToolTip(
+            "Run offline Vision Sensitivity Diagnostic (no robot required): verifies that the trained model "
+            "actually changes its predicted grasp when left/right or near/far cube images are swapped."
+        )
+        self.btn_vision_check.clicked.connect(self.run_vision_sensitivity_check)
+        layout.addWidget(self.btn_vision_check)
 
         # Open Folder in File Manager
         self.btn_open_folder = QPushButton("📁 Folder")
@@ -1476,6 +1511,7 @@ class UR5eTrainerStudio(QMainWindow):
             "warmup_steps": self.spin_warmup.value(),
             "weight_decay": weight_decay,
             "grad_clip_norm": self.spin_grad_clip.value(),
+            "state_noise_std": self.spin_state_noise.value() if hasattr(self, "spin_state_noise") else STATE_NOISE_STD,
             "use_augmentation": self.chk_aug_master.isChecked(),
             "aug_rotation": self.chk_aug_rotation.isChecked(),
             "aug_translation": self.chk_aug_translation.isChecked(),
@@ -1659,6 +1695,53 @@ class UR5eTrainerStudio(QMainWindow):
         print(f"[LAUNCH] Launching GUI Tester with model: {ckpt_dir.parent.name}")
         subprocess.Popen([python_bin, str(tester_script)])
         self.status_bar.showMessage("Launched Policy Testing Studio.", 4000)
+
+    def run_vision_sensitivity_check(self):
+        """Runs check_vision_sensitivity.py offline on the active checkpoint and streams results to console."""
+        check_script = self.project_root / "check_vision_sensitivity.py"
+        if not check_script.exists():
+            QMessageBox.warning(self, "Missing Script", f"Could not find {check_script}")
+            return
+
+        out_dir = Path(self.edit_output_dir.text())
+        ckpt_dir = None
+        for cand in [out_dir / "best_checkpoint", out_dir / "checkpoint"]:
+            if cand.exists() and (cand / "config.json").exists():
+                ckpt_dir = cand
+                break
+        if ckpt_dir is None:
+            QMessageBox.warning(self, "No Checkpoint", f"No trained checkpoint found in:\n{out_dir}")
+            return
+
+        ds_path = self.combo_dataset.currentData()
+        cmd = [sys.executable, "-u", str(check_script), "--checkpoint", str(ckpt_dir)]
+        if ds_path and Path(ds_path).exists():
+            cmd += ["--dataset", str(ds_path)]
+
+        self.btn_vision_check.setEnabled(False)
+        self.btn_vision_check.setText("⏳ Checking Vision...")
+        self.status_bar.showMessage("Running offline Vision Sensitivity Diagnostic...", 5000)
+        print(f"\n[VISION CHECK] Running offline diagnostic on {ckpt_dir}...")
+
+        def _worker():
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                if proc.stdout:
+                    for line in proc.stdout:
+                        self.log_emitter.log_signal.emit(line.rstrip())
+                proc.wait()
+            except Exception as err:
+                self.log_emitter.log_signal.emit(f"[ERROR] Vision check failed: {err}")
+            finally:
+                QTimer.singleShot(0, self._on_vision_check_done)
+
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_vision_check_done(self):
+        self.btn_vision_check.setEnabled(True)
+        self.btn_vision_check.setText("👁 Vision Check")
+        self.status_bar.showMessage("Vision Sensitivity Diagnostic complete — inspect console output.", 5000)
 
     def open_output_folder(self):
         out_dir = Path(self.edit_output_dir.text())

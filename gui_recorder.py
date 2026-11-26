@@ -46,6 +46,8 @@ from PyQt6.QtCore import (
     QMutex,
     QMutexLocker,
     QObject,
+    QPoint,
+    QRect,
     QSize,
     QThread,
     QTimer,
@@ -139,6 +141,13 @@ except ImportError as err:
     print(f"[HYBRID WARNING] Could not import hybrid components: {err}")
 
 
+
+from camera_roi import (
+    apply_roi_mask,
+    format_roi_label,
+    load_camera_roi_from_dir,
+    normalize_roi,
+)
 
 # Default Configuration
 DEFAULT_ROBOT_IP = "192.168.1.102"
@@ -1044,18 +1053,153 @@ class EpisodeSaveWorkerThread(QThread):
 # 5. Modular Camera Feed UI Widget
 # =============================================================================
 
+class ROIVideoCanvas(QLabel):
+    """
+    Interactive video canvas supporting mouse click-and-drag ROI (Region of Interest) selection.
+    Accurately maps widget coordinates onto the aspect-ratio-scaled image pixmap so
+    drawn rectangles correspond 1:1 to normalized [x1, y1, x2, y2] image coordinates.
+    """
+    roi_drawn = pyqtSignal(object)  # Emits [x1, y1, x2, y2] in [0.0, 1.0] or None
+
+    def __init__(self, text: str = "Connecting Camera...", parent=None):
+        super().__init__(text, parent)
+        self._roi_edit_mode = False
+        self._dragging = False
+        self._drag_start_norm: Optional[Tuple[float, float]] = None
+        self._drag_curr_norm: Optional[Tuple[float, float]] = None
+        self._pixmap_rect = QRect()
+        self._active_roi: Optional[List[float]] = None
+
+    def set_roi_edit_mode(self, enabled: bool):
+        self._roi_edit_mode = bool(enabled)
+        if not self._roi_edit_mode:
+            self._dragging = False
+            self._drag_start_norm = None
+            self._drag_curr_norm = None
+        self.setCursor(Qt.CursorShape.CrossCursor if self._roi_edit_mode else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def set_active_roi(self, roi: Optional[List[float]]):
+        self._active_roi = normalize_roi(roi)
+        self.update()
+
+    def set_rendered_pixmap(self, pixmap: QPixmap):
+        w, h = pixmap.width(), pixmap.height()
+        x_off = max(0, (self.width() - w) // 2)
+        y_off = max(0, (self.height() - h) // 2)
+        self._pixmap_rect = QRect(x_off, y_off, w, h)
+        self.setPixmap(pixmap)
+
+    def _widget_pos_to_norm(self, pos: QPoint) -> Optional[Tuple[float, float]]:
+        r = self._pixmap_rect
+        if r.width() <= 1 or r.height() <= 1:
+            return None
+        nx = max(0.0, min(1.0, (pos.x() - r.x()) / float(r.width())))
+        ny = max(0.0, min(1.0, (pos.y() - r.y()) / float(r.height())))
+        return (nx, ny)
+
+    def mousePressEvent(self, event):
+        if self._roi_edit_mode and event.button() == Qt.MouseButton.LeftButton:
+            pt = self._widget_pos_to_norm(event.position().toPoint())
+            if pt is not None:
+                self._dragging = True
+                self._drag_start_norm = pt
+                self._drag_curr_norm = pt
+                self.update()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self._roi_edit_mode:
+            pt = self._widget_pos_to_norm(event.position().toPoint())
+            if pt is not None:
+                self._drag_curr_norm = pt
+                self.update()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging and event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            pt = self._widget_pos_to_norm(event.position().toPoint())
+            if pt is not None:
+                self._drag_curr_norm = pt
+            if self._drag_start_norm is not None and self._drag_curr_norm is not None:
+                raw_roi = [
+                    self._drag_start_norm[0],
+                    self._drag_start_norm[1],
+                    self._drag_curr_norm[0],
+                    self._drag_curr_norm[1],
+                ]
+                norm = normalize_roi(raw_roi)
+                if norm is not None:
+                    self._active_roi = norm
+                    self.roi_drawn.emit(norm)
+            self._drag_start_norm = None
+            self._drag_curr_norm = None
+            self.update()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        r = self._pixmap_rect
+        if r.width() <= 1 or r.height() <= 1:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if self._dragging and self._drag_start_norm and self._drag_curr_norm:
+            x1 = int(round(r.x() + min(self._drag_start_norm[0], self._drag_curr_norm[0]) * r.width()))
+            y1 = int(round(r.y() + min(self._drag_start_norm[1], self._drag_curr_norm[1]) * r.height()))
+            x2 = int(round(r.x() + max(self._drag_start_norm[0], self._drag_curr_norm[0]) * r.width()))
+            y2 = int(round(r.y() + max(self._drag_start_norm[1], self._drag_curr_norm[1]) * r.height()))
+            sel_rect = QRect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+            # Dim outside selection while dragging so the full table stays visible
+            shade = QColor(0, 0, 0, 150)
+            painter.fillRect(QRect(r.left(), r.top(), r.width(), max(0, y1 - r.top())), shade)
+            painter.fillRect(QRect(r.left(), y2, r.width(), max(0, r.bottom() - y2 + 1)), shade)
+            painter.fillRect(QRect(r.left(), y1, max(0, x1 - r.left()), max(0, y2 - y1)), shade)
+            painter.fillRect(QRect(x2, y1, max(0, r.right() - x2 + 1), max(0, y2 - y1)), shade)
+            pen = QPen(QColor("#facc15"), 2, Qt.PenStyle.SolidLine)
+            painter.setPen(pen)
+            painter.drawRect(sel_rect)
+        elif self._active_roi is not None:
+            x1 = int(round(r.x() + self._active_roi[0] * r.width()))
+            y1 = int(round(r.y() + self._active_roi[1] * r.height()))
+            x2 = int(round(r.x() + self._active_roi[2] * r.width()))
+            y2 = int(round(r.y() + self._active_roi[3] * r.height()))
+            pen = QPen(QColor("#34d399"), 2, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(QRect(x1, y1, max(1, x2 - x1), max(1, y2 - y1)))
+
+        if self._roi_edit_mode and not self._dragging:
+            banner_rect = QRect(r.x() + 6, r.y() + 6, min(r.width() - 12, 235), 22)
+            painter.fillRect(banner_rect, QColor(202, 138, 4, 220))
+            painter.setPen(QColor("#ffffff"))
+            painter.setFont(QFont("sans-serif", 9, QFont.Weight.Bold))
+            painter.drawText(banner_rect, Qt.AlignmentFlag.AlignCenter, "✂ DRAG TO MARK KEEP AREA")
+
+        painter.end()
+
+
 class CameraFeedWidget(QFrame):
     """
     Self-contained video feed widget with title bar, resolution/FPS badges,
-    blinking recording indicator overlay, and smooth proportional scaling.
-    Designed so secondary or wrist cameras can easily be added side-by-side.
+    interactive ROI mask drawing/preview, blinking recording indicator overlay,
+    and smooth proportional scaling.
     """
+    roi_changed = pyqtSignal(int, object)  # (camera_id, [x1, y1, x2, y2] or None)
+
     def __init__(self, title: str, camera_id: int, parent=None):
         super().__init__(parent)
         self.title = title
         self.camera_id = camera_id
         self.is_recording = False
         self._fps = 0.0
+        self._roi: Optional[List[float]] = None
+        self._roi_edit_mode = False
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet("""
@@ -1078,6 +1222,39 @@ class CameraFeedWidget(QFrame):
         header.addWidget(self.lbl_title)
 
         header.addStretch()
+
+        self.lbl_roi_badge = QLabel("✂ ROI")
+        self.lbl_roi_badge.setStyleSheet("""
+            color: #34d399;
+            font-size: 10px;
+            font-weight: bold;
+            padding: 1px 5px;
+            background-color: rgba(16, 185, 129, 0.18);
+            border: 1px solid rgba(52, 211, 153, 0.45);
+            border-radius: 3px;
+        """)
+        self.lbl_roi_badge.setVisible(False)
+        header.addWidget(self.lbl_roi_badge)
+
+        self.btn_clear_roi = QPushButton("✖")
+        self.btn_clear_roi.setFixedSize(18, 18)
+        self.btn_clear_roi.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_clear_roi.setToolTip("Clear ROI mask on this camera (record full frame)")
+        self.btn_clear_roi.setStyleSheet("""
+            QPushButton {
+                background-color: #7f1d1d;
+                color: #fecaca;
+                font-size: 9px;
+                font-weight: bold;
+                border-radius: 3px;
+                padding: 0px;
+                border: 1px solid #ef4444;
+            }
+            QPushButton:hover { background-color: #991b1b; }
+        """)
+        self.btn_clear_roi.setVisible(False)
+        self.btn_clear_roi.clicked.connect(self.clear_roi)
+        header.addWidget(self.btn_clear_roi)
 
         self.lbl_mode_badge = QLabel("RGB")
         self.lbl_mode_badge.setStyleSheet("""
@@ -1109,8 +1286,8 @@ class CameraFeedWidget(QFrame):
 
         layout.addLayout(header)
 
-        # Image display canvas
-        self.video_canvas = QLabel("Connecting Camera...")
+        # Interactive ROI Image Display Canvas
+        self.video_canvas = ROIVideoCanvas("Connecting Camera...")
         self.video_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_canvas.setStyleSheet("""
             background-color: #050811;
@@ -1121,6 +1298,7 @@ class CameraFeedWidget(QFrame):
         """)
         self.video_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.video_canvas.setMinimumSize(200, 200)
+        self.video_canvas.roi_drawn.connect(self._on_canvas_roi_drawn)
         layout.addWidget(self.video_canvas)
 
         # Blinking timer for REC badge
@@ -1128,8 +1306,32 @@ class CameraFeedWidget(QFrame):
         self._blink_timer.timeout.connect(self._toggle_rec_blink)
         self._blink_visible = True
 
+    def _on_canvas_roi_drawn(self, roi: Optional[List[float]]):
+        self.set_roi(roi, emit_signal=True)
+
+    def set_roi_edit_mode(self, enabled: bool):
+        self._roi_edit_mode = bool(enabled)
+        self.video_canvas.set_roi_edit_mode(self._roi_edit_mode)
+
+    def set_roi(self, roi: Optional[List[float]], emit_signal: bool = False):
+        self._roi = normalize_roi(roi)
+        self.video_canvas.set_active_roi(self._roi)
+        has_roi = self._roi is not None
+        self.lbl_roi_badge.setText(f"✂ {format_roi_label(self._roi)}" if has_roi else "✂ ROI")
+        self.lbl_roi_badge.setVisible(has_roi)
+        self.btn_clear_roi.setVisible(has_roi and not self.is_recording)
+        if emit_signal:
+            self.roi_changed.emit(self.camera_id, self._roi)
+
+    def clear_roi(self):
+        self.set_roi(None, emit_signal=True)
+
+    def get_roi(self) -> Optional[List[float]]:
+        return list(self._roi) if self._roi is not None else None
+
     def set_recording(self, recording: bool):
         self.is_recording = recording
+        self.btn_clear_roi.setVisible(self._roi is not None and not recording)
         if recording:
             self.lbl_rec.setVisible(True)
             self._blink_timer.start(500)
@@ -1176,14 +1378,19 @@ class CameraFeedWidget(QFrame):
         if cam_id != self.camera_id:
             return
 
-        if len(frame_bgr.shape) == 2:
-            h, w = frame_bgr.shape
+        # Show exact blacked-out ROI preview when not actively dragging a new box
+        display_frame = frame_bgr
+        if self._roi is not None and not self._roi_edit_mode:
+            display_frame = apply_roi_mask(frame_bgr, self._roi)
+
+        if len(display_frame.shape) == 2:
+            h, w = display_frame.shape
             bytes_per_line = w
-            qimg = QImage(frame_bgr.data, w, h, bytes_per_line, QImage.Format.Format_Grayscale8)
+            qimg = QImage(display_frame.data, w, h, bytes_per_line, QImage.Format.Format_Grayscale8)
         else:
-            h, w, ch = frame_bgr.shape
+            h, w, ch = display_frame.shape
             bytes_per_line = ch * w
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
             qimg = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
 
         # Scale to canvas dimensions preserving aspect ratio
@@ -1195,7 +1402,7 @@ class CameraFeedWidget(QFrame):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        self.video_canvas.setPixmap(scaled_pixmap)
+        self.video_canvas.set_rendered_pixmap(scaled_pixmap)
 
 
 # =============================================================================
@@ -1248,8 +1455,10 @@ class UR5eRecorderStudio(QMainWindow):
         self._user_modified_joints: set[str] = set()
         self._user_targets: Dict[str, float] = {}
 
-        self.camera_width = 320
-        self.camera_height = 240
+        self.camera_width = 480
+        self.camera_height = 360
+        # Normalized camera ROI masks [x1, y1, x2, y2] in [0.0, 1.0]; pixels outside become pure black
+        self.camera_roi: Dict[str, Optional[List[float]]] = {"workspace": None, "wrist": None}
 
         # Hybrid Control, Reference Path Playback & Min-Jerk Recovery
         self.path_manager: Optional[PathManager] = PathManager(robot_ip=self.robot_ip, mock=self.mock_mode) if PathManager else None
@@ -1500,10 +1709,12 @@ class UR5eRecorderStudio(QMainWindow):
 
         # Primary Camera Widget
         self.cam_widget_1 = CameraFeedWidget(f"Camera 1: Workspace (/dev/video{self.camera_index})", self.camera_index)
+        self.cam_widget_1.roi_changed.connect(self.on_camera_roi_changed)
         cam_layout.addWidget(self.cam_widget_1, stretch=2)
 
         # Secondary Camera Slot (Easily toggleable or plugged in)
         self.cam_widget_2 = CameraFeedWidget(f"Camera 2: Wrist Flange (/dev/video{self.camera_2_index})", self.camera_2_index)
+        self.cam_widget_2.roi_changed.connect(self.on_camera_roi_changed)
         self.cam_widget_2.setVisible(False)  # Hidden by default, toggled via button below
         cam_layout.addWidget(self.cam_widget_2, stretch=2)
 
@@ -1562,9 +1773,9 @@ class UR5eRecorderStudio(QMainWindow):
 
         self.RESOLUTION_PRESETS = [
             # Standard Landscape (Width x Height)
-            ("320 x 240 (Landscape 4:3 - Recommended Fast)", 320, 240),
-            ("640 x 480 (Landscape 4:3 - VGA Standard)", 640, 480),
-            ("480 x 360 (Landscape 4:3 - Medium)", 480, 360),
+            ("480 x 360 (Landscape 4:3 - Recommended for Vision)", 480, 360),
+            ("320 x 240 (Landscape 4:3 - Fast)", 320, 240),
+            ("640 x 480 (Landscape 4:3 - VGA High-Res)", 640, 480),
             ("160 x 120 (Landscape 4:3 - Ultra Fast)", 160, 120),
             ("640 x 360 (Landscape 16:9 - Widescreen nHD)", 640, 360),
             ("1280 x 720 (Landscape 16:9 - HD 720p)", 1280, 720),
@@ -1588,7 +1799,7 @@ class UR5eRecorderStudio(QMainWindow):
         self.combo_resolution = QComboBox()
         for label, _, _ in self.RESOLUTION_PRESETS:
             self.combo_resolution.addItem(label)
-        self.combo_resolution.setCurrentIndex(0)  # Default: 320x240
+        self.combo_resolution.setCurrentIndex(0)  # Default: 480x360
         self.combo_resolution.setStyleSheet("font-size: 11px; padding: 2px 6px;")
         self.combo_resolution.setMinimumWidth(260)
         self.combo_resolution.setToolTip("Select recording resolution for cameras (Landscape, Square, or Portrait). Smaller resolutions train faster and save disk space.")
@@ -1618,9 +1829,40 @@ class UR5eRecorderStudio(QMainWindow):
         self.lbl_dual_badge.setStyleSheet("color: #64748b; font-size: 10px; margin-left: 6px;")
         cam_ctrl_bar.addWidget(self.lbl_dual_badge)
 
-        self.lbl_cam_info = QLabel("Format: 320x240 RGB @ 30 FPS")
+        self.lbl_cam_info = QLabel("Format: 480x360 RGB @ 30 FPS")
         self.lbl_cam_info.setStyleSheet("color: #64748b; font-size: 10px; margin-left: 4px;")
         cam_ctrl_bar.addWidget(self.lbl_cam_info)
+
+        self.btn_draw_roi = QPushButton("✂ Draw ROI Mask")
+        self.btn_draw_roi.setCheckable(True)
+        self.btn_draw_roi.setStyleSheet("""
+            QPushButton {
+                font-size: 11px;
+                padding: 2px 8px;
+                font-weight: bold;
+                background-color: #1e293b;
+                color: #34d399;
+                border: 1px solid #059669;
+                border-radius: 4px;
+            }
+            QPushButton:checked {
+                background-color: #ca8a04;
+                color: #ffffff;
+                border: 1px solid #facc15;
+            }
+        """)
+        self.btn_draw_roi.setToolTip(
+            "Toggle ROI Mask Drawing: click and drag a rectangle on Camera 1 and/or Camera 2.\n"
+            "Pixels outside the rectangle become pure black during recording AND automatically during testing!"
+        )
+        self.btn_draw_roi.toggled.connect(self.on_draw_roi_toggled)
+        cam_ctrl_bar.addWidget(self.btn_draw_roi)
+
+        self.btn_clear_all_roi = QPushButton("✖ Clear ROI")
+        self.btn_clear_all_roi.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+        self.btn_clear_all_roi.setToolTip("Clear ROI black-out masks on both cameras (record full frame)")
+        self.btn_clear_all_roi.clicked.connect(self.clear_all_camera_rois)
+        cam_ctrl_bar.addWidget(self.btn_clear_all_roi)
 
         self.btn_refresh_cams = QPushButton("🔄 Refresh (F5)")
         self.btn_refresh_cams.setStyleSheet("font-size: 11px; padding: 2px 8px; font-weight: bold;")
@@ -3001,6 +3243,61 @@ class UR5eRecorderStudio(QMainWindow):
         # Invalidate active dataset handle so any new recording starts with the chosen resolution
         self.active_dataset = None
 
+    def on_draw_roi_toggled(self, checked: bool):
+        """Enables/disables interactive click-and-drag ROI mask drawing on both cameras."""
+        if hasattr(self, "cam_widget_1"):
+            self.cam_widget_1.set_roi_edit_mode(checked)
+        if hasattr(self, "cam_widget_2"):
+            self.cam_widget_2.set_roi_edit_mode(checked)
+        if checked:
+            self.status_bar.showMessage(
+                "ROI Draw Mode ACTIVE: click and drag a rectangle on Camera 1 and/or Camera 2 to mark pixels to KEEP (outside becomes black).",
+                8000,
+            )
+            print("[CAMERA ROI] Draw mode ON — drag a rectangle on Camera 1 and/or Camera 2 to define the keep-region.")
+        else:
+            self.status_bar.showMessage("ROI Draw Mode exited. Masked preview active.", 3000)
+
+    @pyqtSlot(int, object)
+    def on_camera_roi_changed(self, cam_id: int, roi: Optional[List[float]]):
+        """Stores updated normalized ROI mask [x1, y1, x2, y2] for workspace or wrist camera."""
+        norm = normalize_roi(roi)
+        if cam_id == self.cam_widget_1.camera_id:
+            self.camera_roi["workspace"] = norm
+            cam_label = "Workspace (Cam 1)"
+        elif hasattr(self, "cam_widget_2") and cam_id == self.cam_widget_2.camera_id:
+            self.camera_roi["wrist"] = norm
+            cam_label = "Wrist (Cam 2)"
+        else:
+            return
+
+        if norm is not None:
+            print(f"[CAMERA ROI] {cam_label} mask set to {norm} ({format_roi_label(norm)}) — outside pixels will be recorded as pure black.")
+            self.status_bar.showMessage(f"{cam_label} ROI set ({format_roi_label(norm)}). Outside pixels masked to black.", 4000)
+        else:
+            print(f"[CAMERA ROI] {cam_label} mask cleared (recording full frame).")
+            self.status_bar.showMessage(f"{cam_label} ROI cleared (full frame).", 3000)
+
+    def clear_all_camera_rois(self):
+        """Clears ROI masks on both cameras so full frames are recorded."""
+        self.camera_roi = {"workspace": None, "wrist": None}
+        if hasattr(self, "cam_widget_1"):
+            self.cam_widget_1.set_roi(None, emit_signal=False)
+        if hasattr(self, "cam_widget_2"):
+            self.cam_widget_2.set_roi(None, emit_signal=False)
+        print("[CAMERA ROI] Cleared ROI masks on both cameras (Full Frame mode).")
+        self.status_bar.showMessage("Cleared camera ROI masks (Full Frame).", 3000)
+
+    def apply_loaded_camera_rois(self, roi_dict: Dict[str, Optional[List[float]]]):
+        """Restores saved dataset ROI masks onto both camera widgets."""
+        ws_roi = normalize_roi(roi_dict.get("workspace")) if isinstance(roi_dict, dict) else None
+        wr_roi = normalize_roi(roi_dict.get("wrist")) if isinstance(roi_dict, dict) else None
+        self.camera_roi = {"workspace": ws_roi, "wrist": wr_roi}
+        if hasattr(self, "cam_widget_1"):
+            self.cam_widget_1.set_roi(ws_roi, emit_signal=False)
+        if hasattr(self, "cam_widget_2"):
+            self.cam_widget_2.set_roi(wr_roi, emit_signal=False)
+
     def _sync_resolution_ui(self, w: int, h: int):
         self.camera_width = w
         self.camera_height = h
@@ -4026,7 +4323,13 @@ class UR5eRecorderStudio(QMainWindow):
         self.recorded_frames_count = 0
         self.current_episode_buffer.clear()
 
-        # Disable resolution and camera controls during active demonstration
+        # Disable resolution, ROI drawing, and camera controls during active demonstration
+        if hasattr(self, "btn_draw_roi"):
+            if self.btn_draw_roi.isChecked():
+                self.btn_draw_roi.setChecked(False)
+            self.btn_draw_roi.setEnabled(False)
+        if hasattr(self, "btn_clear_all_roi"):
+            self.btn_clear_all_roi.setEnabled(False)
         if hasattr(self, "combo_resolution"):
             self.combo_resolution.setEnabled(False)
         if hasattr(self, "combo_cam1"):
@@ -4120,6 +4423,7 @@ class UR5eRecorderStudio(QMainWindow):
             raw_1 = cam1_frame
             if raw_1.shape[1] != self.camera_width or raw_1.shape[0] != self.camera_height:
                 raw_1 = cv2.resize(raw_1, (self.camera_width, self.camera_height), interpolation=cv2.INTER_AREA)
+            raw_1 = apply_roi_mask(raw_1, self.camera_roi.get("workspace"))
             if self.is_grayscale:
                 if len(raw_1.shape) == 3:
                     g1 = cv2.cvtColor(raw_1, cv2.COLOR_BGR2GRAY)
@@ -4147,6 +4451,7 @@ class UR5eRecorderStudio(QMainWindow):
                 raw_2 = self.latest_camera_frame_2
                 if raw_2.shape[1] != self.camera_width or raw_2.shape[0] != self.camera_height:
                     raw_2 = cv2.resize(raw_2, (self.camera_width, self.camera_height), interpolation=cv2.INTER_AREA)
+                raw_2 = apply_roi_mask(raw_2, self.camera_roi.get("wrist"))
                 if self.is_grayscale:
                     if len(raw_2.shape) == 3:
                         g2 = cv2.cvtColor(raw_2, cv2.COLOR_BGR2GRAY)
@@ -4204,6 +4509,10 @@ class UR5eRecorderStudio(QMainWindow):
             # Re-enable controls and restore green start state
             self.btn_record.setEnabled(True)
             self.btn_stop_session.setEnabled(True)
+            if hasattr(self, "btn_draw_roi"):
+                self.btn_draw_roi.setEnabled(True)
+            if hasattr(self, "btn_clear_all_roi"):
+                self.btn_clear_all_roi.setEnabled(True)
             if hasattr(self, "combo_resolution"):
                 self.combo_resolution.setEnabled(True)
             if hasattr(self, "combo_cam1"):
@@ -4241,6 +4550,10 @@ class UR5eRecorderStudio(QMainWindow):
 
         self.cam_widget_1.set_recording(False)
         self.cam_widget_2.set_recording(False)
+        if hasattr(self, "btn_draw_roi"):
+            self.btn_draw_roi.setEnabled(True)
+        if hasattr(self, "btn_clear_all_roi"):
+            self.btn_clear_all_roi.setEnabled(True)
         if hasattr(self, "combo_resolution"):
             self.combo_resolution.setEnabled(True)
         if hasattr(self, "combo_cam1"):
@@ -4438,6 +4751,16 @@ class UR5eRecorderStudio(QMainWindow):
                     if line.strip():
                         self.list_episodes.addItem(QListWidgetItem(line.strip()))
                 self.list_episodes.setCurrentRow(self.list_episodes.count() - 1)
+
+        # Restore saved camera ROI masks if this dataset already recorded with ROI masks
+        loaded_roi = load_camera_roi_from_dir(self.dataset_root)
+        if loaded_roi.get("workspace") is not None or loaded_roi.get("wrist") is not None:
+            self.apply_loaded_camera_rois(loaded_roi)
+            print(
+                f"[CAMERA ROI] Restored saved dataset ROI masks: "
+                f"Workspace={format_roi_label(loaded_roi.get('workspace'))} | "
+                f"Wrist={format_roi_label(loaded_roi.get('wrist'))}"
+            )
 
         # Inspect dataset recording configuration (grayscale detection & episode consistency lock)
         detected_grayscale = None
@@ -4680,6 +5003,10 @@ class UR5eRecorderStudio(QMainWindow):
             "camera_height": self.camera_height,
             "enable_dual_cameras": self.enable_dual_cameras,
             "is_grayscale": self.is_grayscale,
+            "camera_roi": {
+                "workspace": normalize_roi(self.camera_roi.get("workspace")),
+                "wrist": normalize_roi(self.camera_roi.get("wrist")),
+            },
             "ep_idx": ep_idx,
             "num_frames": num_frames,
             "duration_s": duration_s,

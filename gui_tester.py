@@ -125,6 +125,13 @@ except ImportError:
     OnRobot2FGModbus = None
     ONROBOT_GRIPPER_AVAILABLE = False
 
+from camera_roi import (
+    apply_roi_mask,
+    format_roi_label,
+    load_camera_roi_from_dir,
+    normalize_roi,
+)
+
 # =============================================================================
 # Defaults & Global Constants
 # =============================================================================
@@ -379,6 +386,7 @@ class VideoFeedWidget(QWidget):
         self._fps: float = 0.0
         self._is_evaluating: bool = False
         self._is_grayscale: bool = False
+        self._roi: Optional[List[float]] = None
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(320, 240)
 
@@ -390,13 +398,18 @@ class VideoFeedWidget(QWidget):
         self._is_grayscale = bool(enabled)
         self.update()
 
+    def set_roi(self, roi: Optional[List[float]]):
+        self._roi = normalize_roi(roi)
+        self.update()
+
     def update_frame(self, cam_id: int, frame: np.ndarray):
-        if len(frame.shape) == 2:
-            h, w = frame.shape
+        display_frame = apply_roi_mask(frame, self._roi) if self._roi is not None else frame
+        if len(display_frame.shape) == 2:
+            h, w = display_frame.shape
             bytes_per_line = w
-            q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_Grayscale8)
+            q_img = QImage(display_frame.data, w, h, bytes_per_line, QImage.Format.Format_Grayscale8)
         else:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_frame.shape
             bytes_per_line = ch * w
             q_img = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
@@ -423,19 +436,27 @@ class VideoFeedWidget(QWidget):
             x = (self.width() - scaled.width()) // 2
             y = (self.height() - scaled.height()) // 2
             painter.drawPixmap(x, y, scaled)
+            if self._roi is not None:
+                rx1 = int(round(x + self._roi[0] * scaled.width()))
+                ry1 = int(round(y + self._roi[1] * scaled.height()))
+                rx2 = int(round(x + self._roi[2] * scaled.width()))
+                ry2 = int(round(y + self._roi[3] * scaled.height()))
+                painter.setPen(QPen(QColor("#34d399"), 2, Qt.PenStyle.DashLine))
+                painter.drawRect(rx1, ry1, max(1, rx2 - rx1), max(1, ry2 - ry1))
         else:
             painter.setPen(QColor("#64748b"))
             painter.setFont(QFont("sans-serif", 12, QFont.Weight.Bold))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"{self.title}\nWaiting for video feed...")
 
         # HUD Overlay Banner
-        hud_rect_w = 210
+        roi_tag = f" | ✂ {format_roi_label(self._roi)}" if self._roi is not None else ""
+        hud_rect_w = 210 + (115 if roi_tag else 0)
         hud_rect_h = 24
         painter.fillRect(10, 10, hud_rect_w, hud_rect_h, QColor(15, 23, 42, 210))
         painter.setPen(QColor("#38bdf8"))
         painter.setFont(QFont("monospace", 10, QFont.Weight.Bold))
         mode_str = "GRAY" if self._is_grayscale else "RGB"
-        painter.drawText(18, 27, f"{self.title} | {self._fps:4.1f} FPS [{mode_str}]")
+        painter.drawText(18, 27, f"{self.title} | {self._fps:4.1f} FPS [{mode_str}]{roi_tag}")
 
         if self._is_evaluating:
             # Active Rollout Badge
@@ -952,6 +973,15 @@ class PolicyRolloutWorker(QThread):
         else:
             print(f"  • Action Space:       {action_dim}-DoF (Legacy Joints-Only Model — No Gripper Control)")
 
+        # Load any saved Camera ROI masks from checkpoint training_info.json so inference matches training 1:1
+        camera_roi = load_camera_roi_from_dir(model_dir)
+        roi_ws = camera_roi.get("workspace")
+        roi_wr = camera_roi.get("wrist")
+        if roi_ws is not None or roi_wr is not None:
+            print(
+                f"  • Camera ROI Masks:   Workspace={format_roi_label(roi_ws)} | Wrist={format_roi_label(roi_wr)}"
+            )
+
         # Inspect camera requirements
         img_features = getattr(policy.config, "image_features", {}) or getattr(policy.config, "input_features", {})
         has_wrist_cam = "observation.images.wrist" in img_features
@@ -968,6 +998,7 @@ class PolicyRolloutWorker(QThread):
             cam1_frame = np.zeros((req_h, req_w, 3), dtype=np.uint8)
         if cam1_frame.shape[1] != req_w or cam1_frame.shape[0] != req_h:
             cam1_frame = cv2.resize(cam1_frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
+        cam1_frame = apply_roi_mask(cam1_frame, roi_ws)
         if is_model_grayscale and len(cam1_frame.shape) == 3:
             cam1_frame = cv2.cvtColor(cv2.cvtColor(cam1_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
 
@@ -991,6 +1022,7 @@ class PolicyRolloutWorker(QThread):
                 cam2_frame = np.zeros((req_h, req_w, 3), dtype=np.uint8)
             if cam2_frame.shape[1] != req_w or cam2_frame.shape[0] != req_h:
                 cam2_frame = cv2.resize(cam2_frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
+            cam2_frame = apply_roi_mask(cam2_frame, roi_wr)
             if is_model_grayscale and len(cam2_frame.shape) == 3:
                 cam2_frame = cv2.cvtColor(cv2.cvtColor(cam2_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
             wrist_rgb = cv2.cvtColor(cam2_frame, cv2.COLOR_BGR2RGB)
@@ -1073,12 +1105,13 @@ class PolicyRolloutWorker(QThread):
                 prev_tick_time = t_tick_start
                 step_count += 1
 
-                # 1. Grab camera frame
+                # 1. Grab camera frame & apply saved ROI black-out mask
                 frame = self.camera_worker_1.get_latest_frame()
                 if frame is None:
                     frame = np.zeros((req_h, req_w, 3), dtype=np.uint8)
                 if frame.shape[1] != req_w or frame.shape[0] != req_h:
                     frame = cv2.resize(frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
+                frame = apply_roi_mask(frame, roi_ws)
 
                 # 2. Grab current joint angles (+ live cached gripper width if 7-DoF policy)
                 obs = self.robot_worker.get_latest_joints()
@@ -1111,6 +1144,7 @@ class PolicyRolloutWorker(QThread):
                         w_frame = np.zeros((req_h, req_w, 3), dtype=np.uint8)
                     if w_frame.shape[1] != req_w or w_frame.shape[0] != req_h:
                         w_frame = cv2.resize(w_frame, (req_w, req_h), interpolation=cv2.INTER_AREA)
+                    w_frame = apply_roi_mask(w_frame, roi_wr)
                     if is_model_grayscale and len(w_frame.shape) == 3:
                         w_frame = cv2.cvtColor(cv2.cvtColor(w_frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
                     step_batch["observation.images.wrist"] = torch.from_numpy(
@@ -2720,6 +2754,19 @@ class UR5ePolicyTesterStudio(QMainWindow):
 
             self.set_grayscale_mode(is_model_grayscale)
             mode_badge = "Grayscale (1-Ch)" if is_model_grayscale else "RGB (3-Ch)"
+
+            # Sync camera ROI masks saved with this checkpoint onto the live preview widgets
+            model_roi = load_camera_roi_from_dir(p)
+            if hasattr(self, "cam_widget_1"):
+                self.cam_widget_1.set_roi(model_roi.get("workspace"))
+            if hasattr(self, "cam_widget_2"):
+                self.cam_widget_2.set_roi(model_roi.get("wrist"))
+            if model_roi.get("workspace") is not None or model_roi.get("wrist") is not None:
+                print(
+                    f"[CAMERA ROI] Auto-applied checkpoint ROI masks: "
+                    f"Workspace={format_roi_label(model_roi.get('workspace'))} | "
+                    f"Wrist={format_roi_label(model_roi.get('wrist'))}"
+                )
 
             # Check for trained FPS, chunk size, decision horizon, and temporal ensemble settings
             model_fps = 30

@@ -54,6 +54,7 @@ def save_episode_payload(payload_path: str | Path) -> None:
     camera_height = int(payload.get("camera_height", 240))
     enable_dual_cameras = bool(payload.get("enable_dual_cameras", False))
     is_grayscale = bool(payload.get("is_grayscale", False))
+    camera_roi = payload.get("camera_roi", {"workspace": None, "wrist": None})
     ep_idx = int(payload.get("ep_idx", 0))
     num_frames = int(payload.get("num_frames", 0))
     duration_s = float(payload.get("duration_s", 0.0))
@@ -200,6 +201,7 @@ def save_episode_payload(payload_path: str | Path) -> None:
         "height": camera_height,
         "fps": fps,
         "dual_cam": enable_dual_cameras,
+        "camera_roi": camera_roi if isinstance(camera_roi, dict) else {"workspace": None, "wrist": None},
         "state_dim": state_dim,
         "has_gripper": state_dim >= 7,
         "updated_at": datetime.datetime.now().isoformat(),

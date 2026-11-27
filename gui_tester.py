@@ -98,8 +98,7 @@ try:
     from lerobot.cameras.opencv import OpenCVCameraConfig
     from lerobot.policies import make_pre_post_processors
     from lerobot.policies.act import ACTPolicy
-    from lerobot.robots import UR5eRobotConfig, make_robot_from_config
-    from ur5e.robot_ur5e import UR5eRobot
+    from ur5e import UR5eRobot, UR5eRobotConfig, make_robot_from_config
     LEROBOT_AVAILABLE = True
 except ImportError as err:
     LEROBOT_AVAILABLE = False

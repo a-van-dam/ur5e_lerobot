@@ -37,8 +37,7 @@ import torch
 try:
     from lerobot.policies import make_pre_post_processors
     from lerobot.policies.act import ACTPolicy
-    from lerobot.robots import UR5eRobotConfig, make_robot_from_config
-    from lerobot.robots.ur5e.robot_ur5e import UR5E_JOINTS, UR5eRobot
+    from ur5e import UR5E_JOINTS, UR5eRobot, UR5eRobotConfig, make_robot_from_config
     LEROBOT_AVAILABLE = True
 except ImportError as err:
     LEROBOT_AVAILABLE = False
@@ -112,11 +111,10 @@ class CameraStream:
         self.cap: Optional[cv2.VideoCapture] = None
 
     def open(self, warmup_frames: int = 10):
-        self.cap = cv2.VideoCapture(self.camera_index)
+        from camera_utils import open_video_capture
+        self.cap = open_video_capture(self.camera_index, width=640, height=480, fps=CONTROL_LOOP_FPS)
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open camera device /dev/video{self.camera_index}.")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
         # Warmup frames to let sensor gain/white-balance stabilize
         for _ in range(warmup_frames):

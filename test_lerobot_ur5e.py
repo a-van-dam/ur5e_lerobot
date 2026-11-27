@@ -2,7 +2,7 @@ import math
 import time
 from typing import Any
 
-from lerobot.robots import UR5eRobotConfig, make_robot_from_config
+from ur5e import UR5eRobotConfig, make_robot_from_config
 from onrobot_gripper import OnRobot2FGModbus
 
 

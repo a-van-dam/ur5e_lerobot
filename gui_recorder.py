@@ -103,10 +103,11 @@ except ImportError:
 try:
     from lerobot.cameras.opencv import OpenCVCameraConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.robots import UR5eRobotConfig, make_robot_from_config
+    from ur5e import UR5eRobot, UR5eRobotConfig, make_robot_from_config
     LEROBOT_AVAILABLE = True
-except ImportError:
+except ImportError as _lerobot_err:
     LEROBOT_AVAILABLE = False
+    print(f"[LEROBOT WARNING] Could not import LeRobot/UR5e modules: {_lerobot_err}")
 
 # Gamepad Cartesian Teleoperation Controller
 try:

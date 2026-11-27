@@ -9,10 +9,11 @@ import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.robots import UR5eRobotConfig, make_robot_from_config
+from ur5e import UR5eRobotConfig, make_robot_from_config
+from camera_utils import detect_available_cameras, resolve_camera_indices
 
 ROBOT_IP = "192.168.1.102"
-CAMERA_INDEX = 4       # USB Camera (KYE Systems Corp. eFace 1325R)
+CAMERA_INDEX = resolve_camera_indices(detect_available_cameras(), 4, None)[0]
 FPS = 30               # Target recording frequency
 DATASET_REPO = "local/ur5e_freedrive_demos"
 OUTPUT_DIR = Path(__file__).resolve().parent / "datasets" / "ur5e_freedrive_demos"

@@ -750,9 +750,9 @@ class RobotRTDEWorker(QThread):
                         mock_angles[i] += 0.001 * math.sin(sim_t * (1 + i * 0.4))
                 elif self._mock_cartesian_v and any(abs(x) > 1e-4 for x in self._mock_cartesian_v):
                     # Mock teleoperation velocity integration:
-                    # [vx, vy, vz, w_base, w_wrist2, w_wrist3]
+                    # [vx, vy, vz, w_base, w_wrist2, w_wrist1]
                     dt = target_period
-                    vx, vy, vz, w_base, w_wrist2, w_wrist3 = self._mock_cartesian_v
+                    vx, vy, vz, w_base, w_wrist2, w_wrist1 = self._mock_cartesian_v
                     theta_base = mock_angles[0]
                     # Deconstruct base-frame velocity into arm's reach and swing plane
                     vfwd = vx * math.cos(theta_base) + vy * math.sin(theta_base)
@@ -761,8 +761,8 @@ class RobotRTDEWorker(QThread):
                     mock_angles[1] += vfwd * dt * 1.2             # Shoulder extends in arm's forward direction
                     mock_angles[2] -= vfwd * dt * 1.2             # Elbow compensates for reach
                     mock_angles[1] -= vz * dt * 1.2               # Shoulder moves vertical vz
+                    mock_angles[3] += w_wrist1 * dt               # Wrist 1 rotates directly via triggers
                     mock_angles[4] += w_wrist2 * dt               # Wrist 2 rotates directly via shoulders
-                    mock_angles[5] += w_wrist3 * dt               # Wrist 3 rotates directly via triggers
                 for idx, j_name in enumerate(UR5E_JOINTS):
                     self._latest_q[j_name] = mock_angles[idx]
 
@@ -1967,7 +1967,7 @@ class UR5eRecorderStudio(QMainWindow):
             "• Right Stick (Y): TCP Vertical Up/Down (+Z/-Z)\n"
             "• Right Stick (X): Direct Base Motor Rotation (shoulder_pan)\n"
             "• Shoulders (LB/RB / L1/R1): Direct Wrist 2 Rotation\n"
-            "• Triggers (LT/RT): Direct Wrist 3 Rotation\n"
+            "• Triggers (LT/RT): Direct Wrist 1 Rotation\n"
             "• Select Button: Go to Start / Home Position\n"
             "• Start Button: Start / End Episode Recording (Space)\n"
             "• Note: Wrist 3 is strictly decoupled from analog stick movement\n"
@@ -3787,9 +3787,9 @@ class UR5eRecorderStudio(QMainWindow):
     def on_gamepad_velocity_updated(self, v: list):
         if not hasattr(self, "lbl_gamepad_vel"):
             return
-        vx, vy, vz, w_base, w_w2, w_w3 = v
+        vx, vy, vz, w_base, w_w2, w_w1 = v
         v_lin = math.sqrt(vx * vx + vy * vy + vz * vz)
-        has_joint = any(abs(x) > 1e-4 for x in (w_base, w_w2, w_w3))
+        has_joint = any(abs(x) > 1e-4 for x in (w_base, w_w2, w_w1))
         has_cart = v_lin > 1e-4
 
         if has_joint:
@@ -3797,10 +3797,10 @@ class UR5eRecorderStudio(QMainWindow):
             if abs(w_base) > 1e-4:
                 theta_deg = math.degrees(self.gamepad_teleop.get_base_angle()) if hasattr(self, "gamepad_teleop") and self.gamepad_teleop else 0.0
                 parts.append(f"Base:{w_base:+5.2f} [{theta_deg:+.0f}°]")
+            if abs(w_w1) > 1e-4:
+                parts.append(f"W1:{w_w1:+5.2f}")
             if abs(w_w2) > 1e-4:
                 parts.append(f"W2:{w_w2:+5.2f}")
-            if abs(w_w3) > 1e-4:
-                parts.append(f"W3:{w_w3:+5.2f}")
             self.lbl_gamepad_vel.setText(" | ".join(parts) + " rad/s")
             self.lbl_gamepad_vel.setStyleSheet("""
                 color: #a855f7;

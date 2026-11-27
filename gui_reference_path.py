@@ -612,8 +612,10 @@ class RobotRTDEWorker(QThread):
                             self._motion_in_progress = False
                             self.motion_finished.emit(True, "Mock target reached.")
                     else:
-                        # Apply mock velocity from gamepad if any
+                        # Apply mock velocity from gamepad if any: [vx, vy, vz, w_base, w_wrist2, w_wrist1]
                         self._latest_q["shoulder_pan"] += self._mock_velocity[3] * dt
+                        self._latest_q["wrist_2"] += self._mock_velocity[4] * dt
+                        self._latest_q["wrist_1"] += self._mock_velocity[5] * dt
                         self._latest_tcp[0] += self._mock_velocity[0] * dt
                         self._latest_tcp[1] += self._mock_velocity[1] * dt
                         self._latest_tcp[2] += self._mock_velocity[2] * dt
@@ -1813,7 +1815,7 @@ class ReferencePathStudio(QMainWindow):
             "• Right Stick (Y): TCP Vertical Up/Down (+Z/-Z)\n"
             "• Right Stick (X): Direct Base Motor Rotation (shoulder_pan)\n"
             "• Shoulders (LB/RB): Direct Wrist 2 Rotation\n"
-            "• Triggers (LT/RT): Direct Wrist 3 Rotation\n"
+            "• Triggers (LT/RT): Direct Wrist 1 Rotation\n"
             "• [A]/[B]: Close/Open Gripper"
         )
         self.btn_toggle_gamepad.setStyleSheet("""

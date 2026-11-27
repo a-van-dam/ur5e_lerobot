@@ -10,7 +10,7 @@ Movement Scheme:
 - Right Stick (Y)        : Tool Translation Vertical Up/Down (+Z/-Z) via `speedl`
 - Right Stick (X)        : DIRECT Base motor rotation (joint 0 / shoulder_pan) via `speedj`
 - Shoulder Buttons (LB/RB): DIRECT Wrist 2 rotation (joint 4 / wrist_2) via `speedj`
-- Triggers (LT/RT)       : DIRECT Wrist 3 rotation (joint 5 / wrist_3) via `speedj`
+- Triggers (LT/RT)       : DIRECT Wrist 1 rotation (joint 3 / wrist_1) via `speedj`
 - Select / Back Button   : Go to Start / Home Position
 - Start / Options Button : Toggle Episode Demonstration Recording (Space)
 - Neutral Sticks/Buttons : Smooth software deceleration ramp -> `stopl` / `stopj` (zero drift)
@@ -166,8 +166,8 @@ class GamepadConfig:
       - Left Stick Y (Axis 1)      : Forward / Backward translation (+X / -X)
       - Right Stick X (Axis 3)     : Direct Base motor rotation (-shoulder_pan / +shoulder_pan)
       - Right Stick Y (Axis 4)     : Vertical Up / Down translation (+Z / -Z)
-      - Left Trigger (Axis 2)      : Rotate Wrist 3 in negative direction (-wrist_3)
-      - Right Trigger (Axis 5)     : Rotate Wrist 3 in positive direction (+wrist_3)
+      - Left Trigger (Axis 2)      : Rotate Wrist 1 in negative direction (-wrist_1)
+      - Right Trigger (Axis 5)     : Rotate Wrist 1 in positive direction (+wrist_1)
       - Left Shoulder (Button 4)   : Rotate Wrist 2 in negative direction (-wrist_2)
       - Right Shoulder (Button 5)  : Rotate Wrist 2 in positive direction (+wrist_2)
       - Select / Back (Button 6)   : Go to Start / Home Position
@@ -198,8 +198,8 @@ class GamepadConfig:
     invert_y: float = 1.0
     invert_z: float = -1.0
     invert_base: float = 1.0
+    invert_wrist1: float = 1.0
     invert_wrist2: float = 1.0
-    invert_wrist3: float = 1.0
 
     # User togglable direction inversions
     invert_left_horizontal: bool = False
@@ -224,8 +224,8 @@ class GamepadConfig:
     # Baseline Velocities at 100% scale
     base_linear_velocity: float = 0.15         # m/s -> at 50% scale, 0.075 m/s (~6.4 cm/s with left mult)
     base_base_velocity: float = 0.50           # rad/s -> 0.25 rad/s at 50% (Right stick X: unchanged)
-    base_wrist2_velocity: float = 0.50         # rad/s -> 0.25 rad/s at 50%
-    base_wrist3_velocity: float = 0.75         # rad/s -> 0.375 rad/s at 50%
+    base_wrist1_velocity: float = 0.50         # rad/s -> 0.25 rad/s at 50% (Triggers LT/RT)
+    base_wrist2_velocity: float = 0.50         # rad/s -> 0.25 rad/s at 50% (Shoulders LB/RB)
 
     # Baseline Accelerations at 100% scale (gentle defaults eliminate protective stops)
     base_linear_acceleration: float = 0.40     # m/s^2 -> responsive linear acceleration ramp
@@ -253,20 +253,20 @@ class GamepadConfig:
         self.base_base_velocity = val / max(1e-3, self.speed_scale)
 
     @property
+    def max_wrist1_velocity(self) -> float:
+        return self.base_wrist1_velocity * self.speed_scale
+
+    @max_wrist1_velocity.setter
+    def max_wrist1_velocity(self, val: float):
+        self.base_wrist1_velocity = val / max(1e-3, self.speed_scale)
+
+    @property
     def max_wrist2_velocity(self) -> float:
         return self.base_wrist2_velocity * self.speed_scale
 
     @max_wrist2_velocity.setter
     def max_wrist2_velocity(self, val: float):
         self.base_wrist2_velocity = val / max(1e-3, self.speed_scale)
-
-    @property
-    def max_wrist3_velocity(self) -> float:
-        return self.base_wrist3_velocity * self.speed_scale
-
-    @max_wrist3_velocity.setter
-    def max_wrist3_velocity(self, val: float):
-        self.base_wrist3_velocity = val / max(1e-3, self.speed_scale)
 
     @property
     def linear_acceleration(self) -> float:
@@ -294,7 +294,7 @@ XBOX_CONFIG = GamepadConfig(
     button_select=6, button_start=7,
     button_gripper_close=0, button_gripper_open=1,
     invert_x=-1.0, invert_y=1.0, invert_z=-1.0,
-    invert_base=1.0, invert_wrist2=1.0, invert_wrist3=1.0,
+    invert_base=1.0, invert_wrist1=1.0, invert_wrist2=1.0,
 )
 
 PLAYSTATION_CONFIG = GamepadConfig(
@@ -305,7 +305,7 @@ PLAYSTATION_CONFIG = GamepadConfig(
     button_select=8, button_start=9,
     button_gripper_close=0, button_gripper_open=1,
     invert_x=-1.0, invert_y=1.0, invert_z=-1.0,
-    invert_base=1.0, invert_wrist2=1.0, invert_wrist3=1.0,
+    invert_base=1.0, invert_wrist1=1.0, invert_wrist2=1.0,
 )
 
 
@@ -388,7 +388,7 @@ class UR5eGamepadTeleop(QThread):
       - Tool 3D position translation in space (`speedl`) with Wrist 3 strictly decoupled
       - Direct Base pan via Right Stick X (`speedj`) with inversion toggle
       - Direct Wrist 2 rotation via Shoulder buttons (`speedj`)
-      - Direct Wrist 3 rotation via Triggers (`speedj`)
+      - Direct Wrist 1 rotation via Triggers (`speedj`)
       - Select button: Go to Start / Home Position signal
       - Start button: Start / End Episode Recording (Space) signal
       - Acceleration slew-rate limiting preventing Wrist 1 protective stops
@@ -396,7 +396,7 @@ class UR5eGamepadTeleop(QThread):
     """
     # Qt Signals for GUI integration
     status_updated = pyqtSignal(bool, str)        # (is_connected, controller_name)
-    velocity_updated = pyqtSignal(list)           # [vx, vy, vz, w_base, w_wrist2, w_wrist3]
+    velocity_updated = pyqtSignal(list)           # [vx, vy, vz, w_base, w_wrist2, w_wrist1]
     teleop_state_changed = pyqtSignal(bool, str)  # (is_active, status_message)
     command_sent = pyqtSignal(str)                # URScript command string
     speed_scale_changed = pyqtSignal(float)       # speed_scale (0.10 to 1.00)
@@ -666,7 +666,7 @@ class UR5eGamepadTeleop(QThread):
                 return any(abs(x) > 1e-4 for x in self._latest_state)
             if not self._is_controller_connected or self._joystick is None:
                 return False
-            # Check non-zero analog velocity axes: [vx, vy, vz, w_base, w_wrist2, w_wrist3]
+            # Check non-zero analog velocity axes: [vx, vy, vz, w_base, w_wrist2, w_wrist1]
             if any(abs(x) > 1e-4 for x in self._latest_state):
                 return True
             # Check gripper buttons (A / B) or shoulder buttons
@@ -873,8 +873,8 @@ class UR5eGamepadTeleop(QThread):
         Polls all sticks, bumpers, triggers, and special buttons (Select / Start).
         Returns:
           - cart_vel:  [vx, vy, vz, 0, 0, 0] (Tool 3D linear positioning velocity in space)
-          - joint_vel: [w_base, 0, 0, 0, w_wrist2, w_wrist3] (Direct joint commands)
-          - combined:  [vx, vy, vz, w_base, w_wrist2, w_wrist3]
+          - joint_vel: [w_base, 0, 0, w_wrist1, w_wrist2, 0] (Direct joint commands)
+          - combined:  [vx, vy, vz, w_base, w_wrist2, w_wrist1]
         """
         if self._joystick is None:
             return [0.0] * 6, [0.0] * 6, [0.0] * 6
@@ -985,16 +985,16 @@ class UR5eGamepadTeleop(QThread):
             w_wrist2 = -self.config.max_wrist2_velocity * self.config.invert_wrist2
 
         # ---------------------------------------------------------------------
-        # 4. Direct Wrist 3 Rotation: Triggers (LT / RT)
+        # 4. Direct Wrist 1 Rotation: Triggers (LT / RT)
         # ---------------------------------------------------------------------
         lt_val = self._read_trigger(self.config.axis_trigger_left, is_left=True)
         rt_val = self._read_trigger(self.config.axis_trigger_right, is_left=False)
 
         trigger_diff = rt_val - lt_val
-        w_wrist3 = trigger_diff * self.config.invert_wrist3 * self.config.max_wrist3_velocity
+        w_wrist1 = trigger_diff * self.config.invert_wrist1 * self.config.max_wrist1_velocity
 
-        joint_vel = [w_base, 0.0, 0.0, 0.0, w_wrist2, w_wrist3]
-        combined = [vx, vy, vz, w_base, w_wrist2, w_wrist3]
+        joint_vel = [w_base, 0.0, 0.0, w_wrist1, w_wrist2, 0.0]
+        combined = [vx, vy, vz, w_base, w_wrist2, w_wrist1]
 
         return cart_vel, joint_vel, combined
 
@@ -1007,7 +1007,7 @@ class UR5eGamepadTeleop(QThread):
         Background loop streaming commands at 20-50 Hz (default 35 Hz).
         Features:
           - Tool 3D Cartesian translation in space via `speedl` with Wrist 3 decoupled
-          - Direct Joint Rotations (Base, Wrist 2, Wrist 3) via `speedj`
+          - Direct Joint Rotations (Base, Wrist 1, Wrist 2) via `speedj`
           - Software acceleration slew-rate limiting protecting Wrist 1
         """
         self._running = True
@@ -1050,7 +1050,7 @@ class UR5eGamepadTeleop(QThread):
                         self._current_base_angle += joint_vel[0] * poll_period
 
                 has_cart = any(abs(v) > 1e-4 for v in cart_vel[:3])
-                has_joint = any(abs(w) > 1e-4 for w in (joint_vel[0], joint_vel[4], joint_vel[5]))
+                has_joint = any(abs(w) > 1e-4 for w in (joint_vel[0], joint_vel[3], joint_vel[4]))
 
                 # ---------------------------------------------------------------------
                 # Gripper Teleoperation: Button A (Close) & Button B (Open)
@@ -1144,8 +1144,8 @@ class UR5eGamepadTeleop(QThread):
                     if has_joint or has_cart:
                         norm_joint = max(
                             abs(joint_vel[0]) / max(1e-4, self.config.max_base_velocity),
+                            abs(joint_vel[3]) / max(1e-4, self.config.max_wrist1_velocity),
                             abs(joint_vel[4]) / max(1e-4, self.config.max_wrist2_velocity),
-                            abs(joint_vel[5]) / max(1e-4, self.config.max_wrist3_velocity),
                         )
                         norm_cart = max(
                             abs(cart_vel[0]) / max(1e-4, self.config.max_linear_velocity),
@@ -1258,7 +1258,7 @@ def run_standalone():
     print("  • Right Stick (Y)     : Tool Position Vertical Up/Down (+Z/-Z)")
     print("  • Right Stick (X)     : DIRECT Base Motor Rotation (shoulder_pan)")
     print("  • Shoulders (LB/RB)   : DIRECT Wrist 2 Rotation")
-    print("  • Triggers (LT/RT)    : DIRECT Wrist 3 Rotation")
+    print("  • Triggers (LT/RT)    : DIRECT Wrist 1 Rotation")
     print("  • Button A (Hold)     : Slowly CLOSE Gripper (OnRobot 2FG)")
     print("  • Button B (Hold)     : Slowly OPEN Gripper (OnRobot 2FG)")
     print("  • Select Button       : Go to Start / Home Position")
@@ -1284,13 +1284,13 @@ def run_standalone():
         print(f"\n[GAMEPAD] Status: {status} -> {name}")
 
     def on_vel(v: List[float]):
-        vx, vy, vz, w_base, w_w2, w_w3 = v
+        vx, vy, vz, w_base, w_w2, w_w1 = v
         has_motion = any(abs(x) > 1e-4 for x in v)
         if has_motion:
             heading_deg = math.degrees(teleop.get_base_angle())
             print(
                 f"\r\033[K[TELEOP] TCP:[{vx:+5.2f},{vy:+5.2f},{vz:+5.2f}] m/s "
-                f"| Base:{w_base:+5.2f} | W2:{w_w2:+5.2f} | W3:{w_w3:+5.2f} rad/s [Heading:{heading_deg:+4.0f}°]",
+                f"| Base:{w_base:+5.2f} | W1:{w_w1:+5.2f} | W2:{w_w2:+5.2f} rad/s [Heading:{heading_deg:+4.0f}°]",
                 end="",
                 flush=True,
             )

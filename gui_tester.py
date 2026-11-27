@@ -1189,10 +1189,11 @@ class PolicyRolloutWorker(QThread):
                     pred_grip_mm = float(step_action_full[6])
                     if not gripper_is_closed and pred_grip_mm < grip_close_thresh:
                         gripper_is_closed = True
-                        print(f"[GRIPPER POLICY] Step {step_count}: CLOSE triggered (pred={pred_grip_mm:.1f}mm < {grip_close_thresh:.1f}mm) -> Commanding {min_grip_w:.1f} mm (30N)")
+                        grip_force_n = getattr(self.gripper, "default_force_n", 85.0)
+                        print(f"[GRIPPER POLICY] Step {step_count}: CLOSE triggered (pred={pred_grip_mm:.1f}mm < {grip_close_thresh:.1f}mm) -> Commanding {min_grip_w:.1f} mm ({grip_force_n:.0f}N)")
                         if self.gripper is not None and hasattr(self.gripper, "grip"):
                             try:
-                                self.gripper.grip(min_grip_w, force_n=30.0, speed_percent=80, wait=False)
+                                self.gripper.grip(min_grip_w, speed_percent=80, wait=False)
                             except Exception as g_err:
                                 print(f"[GRIPPER ERROR] Policy close failed: {g_err}")
                         self.gripper_state_changed.emit(float(min_grip_w))
@@ -1201,7 +1202,7 @@ class PolicyRolloutWorker(QThread):
                         print(f"[GRIPPER POLICY] Step {step_count}: OPEN triggered (pred={pred_grip_mm:.1f}mm > {grip_open_thresh:.1f}mm) -> Commanding {max_grip_w:.1f} mm")
                         if self.gripper is not None and hasattr(self.gripper, "grip"):
                             try:
-                                self.gripper.grip(max_grip_w, force_n=30.0, speed_percent=80, wait=False)
+                                self.gripper.grip(max_grip_w, speed_percent=80, wait=False)
                             except Exception as g_err:
                                 print(f"[GRIPPER ERROR] Policy open failed: {g_err}")
                         self.gripper_state_changed.emit(float(max_grip_w))
@@ -1245,7 +1246,7 @@ class PolicyRolloutWorker(QThread):
             self.robot_worker.request_move_pose(start_action)
             if self.gripper is not None and hasattr(self.gripper, "grip"):
                 try:
-                    self.gripper.grip(self.start_gripper_mm, force_n=30.0, speed_percent=80, wait=False)
+                    self.gripper.grip(self.start_gripper_mm, speed_percent=80, wait=False)
                     self.gripper_state_changed.emit(float(self.start_gripper_mm))
                 except Exception:
                     pass
@@ -3523,8 +3524,9 @@ class UR5ePolicyTesterStudio(QMainWindow):
 
         if self.gripper is not None and self.gripper.is_connected:
             try:
-                self.gripper.grip(clamped, force_n=30.0, speed_percent=50, wait=False)
-                print(f"[GRIPPER] Commanded width to {clamped:.1f} mm (30N force).")
+                force_n = getattr(self.gripper, "default_force_n", 85.0)
+                self.gripper.grip(clamped, speed_percent=50, wait=False)
+                print(f"[GRIPPER] Commanded width to {clamped:.1f} mm ({force_n:.0f}N force).")
                 self.status_bar.showMessage(f"Gripper moving to {clamped:.1f} mm...", 3000)
             except Exception as e:
                 print(f"[GRIPPER ERROR] Failed to command gripper: {e}")

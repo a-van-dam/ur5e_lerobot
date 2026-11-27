@@ -3,17 +3,17 @@
     "shoulder_pan": -90.0,
     "shoulder_lift": -60.0,
     "elbow": -90.0,
-    "wrist_1": 130.0,
+    "wrist_1": 140.0,
     "wrist_2": -90.0,
-    "wrist_3": 112.0
+    "wrist_3": 122.0
   },
   "joints_list_deg": [
     -90.0,
     -60.0,
     -90.0,
-    130.0,
+    140.0,
     -90.0,
-    112.0
+    122.0
   ],
   "gripper_width_mm": 105.0,
   "description": "Default start position (temp home) for UR5e arm and OnRobot 2FG gripper. Edit these values directly in a text editor. All Python scripts read from this file."

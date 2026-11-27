@@ -605,12 +605,12 @@ def run_policy_rollout(
                     gripper_is_closed = True
                     print(f"\n[GRIPPER POLICY] Step {step_count}: CLOSE ({pred_grip_mm:.1f}mm < {grip_close_thresh:.1f}mm) -> {min_grip_w:.1f}mm")
                     if gripper is not None and hasattr(gripper, "grip"):
-                        gripper.grip(min_grip_w, force_n=30.0, speed_percent=80, wait=False)
+                        gripper.grip(min_grip_w, speed_percent=80, wait=False)
                 elif gripper_is_closed and pred_grip_mm > grip_open_thresh:
                     gripper_is_closed = False
                     print(f"\n[GRIPPER POLICY] Step {step_count}: OPEN ({pred_grip_mm:.1f}mm > {grip_open_thresh:.1f}mm) -> {max_grip_w:.1f}mm")
                     if gripper is not None and hasattr(gripper, "grip"):
-                        gripper.grip(max_grip_w, force_n=30.0, speed_percent=80, wait=False)
+                        gripper.grip(max_grip_w, speed_percent=80, wait=False)
 
             # 7. Live terminal progress bar
             elapsed = time.perf_counter() - start_rollout_time

@@ -1080,7 +1080,7 @@ class UR5eGamepadTeleop(QThread):
                             self._last_gripper_cmd_time = time.perf_counter()
                             if self.gripper is not None and hasattr(self.gripper, "grip"):
                                 try:
-                                    self.gripper.grip(target_to_send, force_n=30.0, speed_percent=80, wait=False)
+                                    self.gripper.grip(target_to_send, speed_percent=80, wait=False)
                                 except Exception:
                                     pass
                             self.gripper_width_updated.emit(target_to_send)
@@ -1093,7 +1093,7 @@ class UR5eGamepadTeleop(QThread):
                             self._last_gripper_cmd_time = time.perf_counter()
                             if self.gripper is not None and hasattr(self.gripper, "grip"):
                                 try:
-                                    self.gripper.grip(target_to_send, force_n=30.0, speed_percent=80, wait=False)
+                                    self.gripper.grip(target_to_send, speed_percent=80, wait=False)
                                 except Exception:
                                     pass
                             self.gripper_width_updated.emit(target_to_send)
@@ -1122,7 +1122,7 @@ class UR5eGamepadTeleop(QThread):
                                 self._last_gripper_cmd_time = now
                                 if self.gripper is not None and hasattr(self.gripper, "grip"):
                                     try:
-                                        self.gripper.grip(target_to_send, force_n=30.0, speed_percent=50, wait=False)
+                                        self.gripper.grip(target_to_send, speed_percent=50, wait=False)
                                     except Exception:
                                         pass
                                 self.gripper_width_updated.emit(target_to_send)
@@ -1132,7 +1132,7 @@ class UR5eGamepadTeleop(QThread):
                             final_w = self._gripper_target_width
                         if self.gripper is not None and hasattr(self.gripper, "grip"):
                             try:
-                                self.gripper.grip(final_w, force_n=30.0, speed_percent=50, wait=False)
+                                self.gripper.grip(final_w, speed_percent=50, wait=False)
                             except Exception:
                                 pass
                         self.gripper_width_updated.emit(final_w)

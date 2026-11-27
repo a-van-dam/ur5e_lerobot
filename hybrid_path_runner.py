@@ -430,7 +430,7 @@ class HybridPathWorker(QThread):
         cmd_init_w = float(min_w if prev_wp_closed else max_w)
         if self.gripper and hasattr(self.gripper, "grip"):
             try:
-                self.gripper.grip(cmd_init_w, force_n=30.0, speed_percent=80, wait=False)
+                self.gripper.grip(cmd_init_w, speed_percent=80, wait=False)
             except Exception:
                 pass
         if self.gamepad_teleop and hasattr(self.gamepad_teleop, "set_gripper_target_width"):
@@ -620,7 +620,7 @@ class HybridPathWorker(QThread):
                 last_gripper_cmd_time = now
                 if self.gripper and hasattr(self.gripper, "grip"):
                     try:
-                        self.gripper.grip(cmd_w, force_n=30.0, speed_percent=80, wait=False)
+                        self.gripper.grip(cmd_w, speed_percent=80, wait=False)
                     except Exception:
                         pass
                 if self.gamepad_teleop and hasattr(self.gamepad_teleop, "set_gripper_target_width"):

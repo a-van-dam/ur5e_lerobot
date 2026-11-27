@@ -1029,11 +1029,12 @@ class PathManager:
                 self._is_playing = False
                 return False
 
-        # Align initial gripper width
+        # Align initial gripper state (discrete open/close clamping so measured cube widths still clamp firmly)
         initial_gripper = self.get_start_gripper_width() if self.get_start_gripper_width() is not None else start_pt.gripper_width
+        init_cmd_w, _ = self._classify_replay_gripper(float(initial_gripper), is_closed=False)
         if self._gripper is not None:
             try:
-                self._gripper.grip(initial_gripper, wait=False)
+                self._gripper.grip(init_cmd_w, wait=False)
             except Exception as e:
                 logger.warning(f"Failed to command initial gripper width: {e}")
 
@@ -1074,10 +1075,10 @@ class PathManager:
         else:
             q_filtered = q_raw
 
-        # Fit clamped cubic spline (C^2 continuous: acceleration and velocity continuous, zero jerk at boundaries)
+        # Fit clamped cubic spline for joint trajectories; use oscillation-free linear lookup for gripper width
         if SCIPY_AVAILABLE and CubicSpline is not None and len(points) >= 4:
             cs_q = CubicSpline(t_raw, q_filtered, axis=0, bc_type='clamped')
-            cs_gripper = CubicSpline(t_raw, gripper_raw, axis=0)
+            cs_gripper = (lambda t_val, _tr=t_raw, _gr=gripper_raw: float(np.interp(t_val, _tr, _gr)))
         else:
             cs_q = None
             cs_gripper = None
@@ -1111,6 +1112,29 @@ class PathManager:
                 progress_callback=progress_callback,
             )
 
+    def _classify_replay_gripper(self, measured_w: float, is_closed: bool) -> Tuple[float, bool]:
+        """
+        Maps recorded gripper width (which stops at the object's physical width, e.g. ~80 mm on a cube)
+        into firm discrete OPEN / CLOSE commands with hysteresis.
+
+        Commanding min_width_mm (55 mm) instead of the recorded resting width (80.6 mm) ensures
+        the OnRobot 2FG actually clamps onto the cube with its configured grip force rather than
+        stopping right at the cube's surface with near-zero holding force.
+        """
+        min_w = float(getattr(self._gripper, "min_width_mm", 55.0)) if self._gripper else 55.0
+        max_w = float(getattr(self._gripper, "max_width_mm", 105.0)) if self._gripper else 105.0
+        close_thresh = max_w - 12.0  # e.g., < 93.0 mm -> CLOSE (command min_w so jaws clamp firmly)
+        open_thresh = max_w - 6.0    # e.g., >= 99.0 mm -> OPEN (command max_w)
+
+        next_closed = is_closed
+        if not is_closed and measured_w < close_thresh:
+            next_closed = True
+        elif is_closed and measured_w >= open_thresh:
+            next_closed = False
+
+        cmd_w = min_w if next_closed else max_w
+        return cmd_w, next_closed
+
     def _execute_speedj_playback(
         self,
         cs_q: Any,
@@ -1135,7 +1159,7 @@ class PathManager:
         max_vel_step = max_joint_acc * dt
 
         prev_qd = [0.0] * 6
-        prev_gripper_width = float(points[0].gripper_width)
+        prev_gripper_width, prev_gripper_closed = self._classify_replay_gripper(float(points[0].gripper_width), is_closed=False)
         last_gripper_cmd_time = time.perf_counter()
 
         playback_start_wall = time.perf_counter()
@@ -1178,17 +1202,20 @@ class PathManager:
             # Send speedj command (watchdog t=0.06s provides smooth buffer for 0.02s cycle)
             self._send_speedj_step(qd_cmd, a=max_joint_acc, t=0.06)
 
-            # Gripper update (interpolated from spline)
+            # Gripper update: firm discrete open/close transitions (prevents dropping cube on measured-width replay)
             if cs_gripper is not None:
-                target_gripper = float(cs_gripper(elapsed_scaled))
-                if abs(target_gripper - prev_gripper_width) >= 0.5 and (now - last_gripper_cmd_time) >= 0.08:
+                raw_gripper = float(cs_gripper(elapsed_scaled))
+                cmd_gripper, next_closed = self._classify_replay_gripper(raw_gripper, prev_gripper_closed)
+                if next_closed != prev_gripper_closed and (now - last_gripper_cmd_time) >= 0.12:
+                    prev_gripper_closed = next_closed
+                    prev_gripper_width = cmd_gripper
+                    last_gripper_cmd_time = now
                     if self._gripper is not None:
                         try:
-                            self._gripper.grip(target_gripper, wait=False)
-                            prev_gripper_width = target_gripper
-                            last_gripper_cmd_time = now
+                            self._gripper.grip(cmd_gripper, wait=False)
                         except Exception:
                             pass
+                target_gripper = prev_gripper_width
             else:
                 target_gripper = prev_gripper_width
 
@@ -1243,7 +1270,7 @@ class PathManager:
         lookahead = 0.18
         gain = 120
 
-        prev_gripper_width = float(points[0].gripper_width)
+        prev_gripper_width, prev_gripper_closed = self._classify_replay_gripper(float(points[0].gripper_width), is_closed=False)
         last_gripper_cmd_time = time.perf_counter()
 
         playback_start_wall = time.perf_counter()
@@ -1273,17 +1300,20 @@ class PathManager:
                 except Exception as e:
                     logger.error(f"Failed to transmit servoj command: {e}")
 
-            # Gripper update
+            # Gripper update: firm discrete open/close transitions
             if cs_gripper is not None:
-                target_gripper = float(cs_gripper(elapsed_scaled))
-                if abs(target_gripper - prev_gripper_width) >= 0.5 and (now - last_gripper_cmd_time) >= 0.08:
+                raw_gripper = float(cs_gripper(elapsed_scaled))
+                cmd_gripper, next_closed = self._classify_replay_gripper(raw_gripper, prev_gripper_closed)
+                if next_closed != prev_gripper_closed and (now - last_gripper_cmd_time) >= 0.12:
+                    prev_gripper_closed = next_closed
+                    prev_gripper_width = cmd_gripper
+                    last_gripper_cmd_time = now
                     if self._gripper is not None:
                         try:
-                            self._gripper.grip(target_gripper, wait=False)
-                            prev_gripper_width = target_gripper
-                            last_gripper_cmd_time = now
+                            self._gripper.grip(cmd_gripper, wait=False)
                         except Exception:
                             pass
+                target_gripper = prev_gripper_width
             else:
                 target_gripper = prev_gripper_width
 
@@ -1322,7 +1352,7 @@ class PathManager:
         progress_callback: Optional[Callable[[int, int, TrajectoryPoint], None]],
     ) -> bool:
         """Fallback waypoint-by-waypoint discrete movej streaming."""
-        prev_gripper_width = points[0].gripper_width
+        prev_gripper_width, prev_gripper_closed = self._classify_replay_gripper(float(points[0].gripper_width), is_closed=False)
         last_gripper_cmd_time = time.perf_counter()
         playback_start_wall = time.perf_counter()
         t_traj_start = points[0].timestamp
@@ -1344,13 +1374,14 @@ class PathManager:
             self._send_movej_step(pt.q, dt=dt)
 
             now = time.perf_counter()
-            width_diff = abs(pt.gripper_width - prev_gripper_width)
-            if width_diff >= 0.5 and (now - last_gripper_cmd_time) >= 0.08:
+            cmd_gripper, next_closed = self._classify_replay_gripper(float(pt.gripper_width), prev_gripper_closed)
+            if next_closed != prev_gripper_closed and (now - last_gripper_cmd_time) >= 0.12:
+                prev_gripper_closed = next_closed
+                prev_gripper_width = cmd_gripper
+                last_gripper_cmd_time = now
                 if self._gripper is not None:
                     try:
-                        self._gripper.grip(pt.gripper_width, wait=False)
-                        prev_gripper_width = pt.gripper_width
-                        last_gripper_cmd_time = now
+                        self._gripper.grip(cmd_gripper, wait=False)
                     except Exception:
                         pass
 

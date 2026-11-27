@@ -4146,8 +4146,9 @@ class UR5eRecorderStudio(QMainWindow):
 
         if self.gripper is not None and self.gripper.is_connected:
             try:
-                self.gripper.grip(clamped, force_n=30.0, speed_percent=80, wait=False)
-                print(f"[GRIPPER] Commanded width to {clamped:.1f} mm (30N force).")
+                force_n = getattr(self.gripper, "default_force_n", 85.0)
+                self.gripper.grip(clamped, speed_percent=80, wait=False)
+                print(f"[GRIPPER] Commanded width to {clamped:.1f} mm ({force_n:.0f}N force).")
                 self.status_bar.showMessage(f"Gripper moving to {clamped:.1f} mm...", 3000)
             except Exception as e:
                 print(f"[GRIPPER ERROR] Failed to command gripper: {e}")
@@ -4155,7 +4156,7 @@ class UR5eRecorderStudio(QMainWindow):
         else:
             if self.gripper is not None and hasattr(self.gripper, "grip"):
                 try:
-                    self.gripper.grip(clamped, force_n=30.0, speed_percent=80, wait=False)
+                    self.gripper.grip(clamped, speed_percent=80, wait=False)
                 except Exception:
                     pass
             print(f"[GRIPPER SIM] Commanded width: {clamped:.1f} mm.")

@@ -38,6 +38,9 @@ except ImportError:
 
 logger = logging.getLogger("OnRobot2FG")
 
+# Default gripping force ceiling in Newtons (OnRobot 2FG7 / 2FG14 range: 20..140 N)
+DEFAULT_GRIP_FORCE_N: float = 85.0
+
 
 class OnRobot2FGModbus:
     """
@@ -66,7 +69,7 @@ class OnRobot2FGModbus:
         # Gripper operational limits (auto-populated on connect)
         self.min_width_mm: float = 55.0
         self.max_width_mm: float = 105.0
-        self.default_force_n: float = 30.0
+        self.default_force_n: float = DEFAULT_GRIP_FORCE_N
         self.default_speed_pct: int = 80
 
         # Latest cache (initialized to wide-open default 105.0 mm)

@@ -148,11 +148,16 @@ from camera_roi import (
     load_camera_roi_from_dir,
     normalize_roi,
 )
+from camera_utils import (
+    detect_available_cameras,
+    open_video_capture,
+    resolve_camera_indices,
+)
 
 # Default Configuration
 DEFAULT_ROBOT_IP = "192.168.1.102"
-DEFAULT_CAMERA_INDEX = 4         # HD Webcam C525 (Workspace)
-DEFAULT_CAMERA_2_INDEX = 6       # eFace 1325R (Wrist Flange)
+DEFAULT_CAMERA_INDEX = 4         # Fallback preference; auto-resolved to connected cameras at startup
+DEFAULT_CAMERA_2_INDEX = 6       # Fallback preference; auto-resolved to connected cameras at startup
 DEFAULT_FPS = 30
 DEFAULT_DATASET_NAME = "ur5e_cube_pick_place"
 DEFAULT_DATASETS_DIR = Path(__file__).resolve().parent / "datasets"
@@ -204,31 +209,7 @@ except ImportError:
     persist_start_position = None
 
 
-def detect_available_cameras() -> List[Tuple[int, str]]:
-    """
-    Scans Linux v4l2 device nodes and returns a list of (camera_index, user_friendly_label).
-    Filters out unsupported or metadata-only sub-nodes using the sysfs 'index' attribute.
-    """
-    cameras = []
-    v4l_dir = Path("/sys/class/video4linux")
-    if v4l_dir.exists():
-        for dev in sorted(v4l_dir.glob("video*"), key=lambda p: int(p.name.replace("video", "")) if p.name.replace("video", "").isdigit() else 999):
-            idx_file = dev / "index"
-            if idx_file.exists():
-                try:
-                    if idx_file.read_text().strip() != "0":
-                        continue
-                except Exception:
-                    pass
-            idx = int(dev.name.replace("video", ""))
-            name_file = dev / "name"
-            dev_name = name_file.read_text().strip() if name_file.exists() else f"Camera {idx}"
-            clean_name = dev_name.split(":")[0].strip()
-            cameras.append((idx, f"/dev/video{idx}: {clean_name}"))
-
-    if not cameras:
-        cameras = [(0, "/dev/video0: Default Camera")]
-    return cameras
+# Camera discovery is provided by camera_utils.detect_available_cameras
 
 
 # =============================================================================
@@ -294,6 +275,7 @@ class CameraWorker(QThread):
         self.target_width = width
         self.target_height = height
         self.mock = mock
+        self._using_fallback = False
         self._grayscale = grayscale
         self._running = False
         self._cap = None
@@ -328,11 +310,9 @@ class CameraWorker(QThread):
         self._running = True
 
         if not self.mock:
-            self._cap = cv2.VideoCapture(self.camera_id)
-            # Request capture parameters from driver
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
-            self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+            self._cap = open_video_capture(
+                self.camera_id, self.target_width, self.target_height, self.target_fps
+            )
 
             if not self._cap.isOpened():
                 self.status_signal.emit(
@@ -340,8 +320,9 @@ class CameraWorker(QThread):
                     False,
                     f"Camera /dev/video{self.camera_id} unavailable (Falling back to test pattern)"
                 )
-                self.mock = True
+                self._using_fallback = True
             else:
+                self._using_fallback = False
                 self.status_signal.emit(
                     self.camera_id,
                     True,
@@ -373,19 +354,24 @@ class CameraWorker(QThread):
                         pass
                     self._cap = None
                 time.sleep(0.05)
-                self._cap = cv2.VideoCapture(self.camera_id)
-                self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, tw)
-                self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, th)
-                self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+                self._cap = open_video_capture(self.camera_id, tw, th, self.target_fps)
                 consecutive_failures = 0
                 if self._cap.isOpened():
+                    self._using_fallback = False
                     self.status_signal.emit(
                         self.camera_id,
                         True,
                         f"Camera /dev/video{self.camera_id} reconnected @ {self.target_fps} FPS"
                     )
+                else:
+                    self._using_fallback = True
+                    self.status_signal.emit(
+                        self.camera_id,
+                        False,
+                        f"Camera /dev/video{self.camera_id} unavailable (Falling back to test pattern)"
+                    )
 
-            if not self.mock and self._cap and self._cap.isOpened():
+            if not self.mock and not self._using_fallback and self._cap and self._cap.isOpened():
                 ret, frame = self._cap.read()
                 if not ret or frame is None:
                     consecutive_failures += 1
@@ -396,10 +382,7 @@ class CameraWorker(QThread):
                         except Exception:
                             pass
                         time.sleep(0.05)
-                        self._cap = cv2.VideoCapture(self.camera_id)
-                        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, tw)
-                        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, th)
-                        self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+                        self._cap = open_video_capture(self.camera_id, tw, th, self.target_fps)
                         consecutive_failures = 0
                     time.sleep(0.01)
                     continue
@@ -1419,9 +1402,13 @@ class UR5eRecorderStudio(QMainWindow):
     def __init__(self, robot_ip: str, camera_index: int, fps: int, camera_2_index: int = DEFAULT_CAMERA_2_INDEX, dual_cam: bool = False, mock: bool = False):
         super().__init__()
         self.robot_ip = robot_ip
-        self.camera_index = camera_index
-        self.camera_1_index = camera_index
-        self.camera_2_index = camera_2_index
+        self._available_cameras = detect_available_cameras()
+        resolved_cam1, resolved_cam2 = resolve_camera_indices(
+            self._available_cameras, camera_index, camera_2_index
+        )
+        self.camera_index = resolved_cam1
+        self.camera_1_index = resolved_cam1
+        self.camera_2_index = resolved_cam2
         self.enable_dual_cameras = False
         self.target_fps = fps
         self.mock_mode = mock
@@ -1729,7 +1716,7 @@ class UR5eRecorderStudio(QMainWindow):
         cam_ctrl_bar.addWidget(self.btn_toggle_cam2)
 
         # Discovered Cameras List
-        available_cameras = detect_available_cameras()
+        available_cameras = getattr(self, "_available_cameras", None) or detect_available_cameras()
 
         # Cam 1 Device Selector
         lbl_cam1 = QLabel("Cam 1:")
@@ -3192,39 +3179,87 @@ class UR5eRecorderStudio(QMainWindow):
             print(f"[DATASET] Recording sampling rate updated to {self.target_fps} FPS (dt = {1.0/self.target_fps:.3f}s)")
             self.active_dataset = None
 
+    def _restart_camera_worker_1(self):
+        if self.camera_worker_1 is not None:
+            self.camera_worker_1.stop()
+        self.cam_widget_1.camera_id = self.camera_1_index
+        self.cam_widget_1.lbl_title.setText(f"Camera 1: Workspace (/dev/video{self.camera_1_index})")
+        self.camera_worker_1 = CameraWorker(
+            self.camera_1_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode, self.is_grayscale
+        )
+        self.camera_worker_1.frame_ready.connect(self.on_cam1_frame_received)
+        self.camera_worker_1.fps_updated.connect(self.cam_widget_1.update_fps)
+        self.camera_worker_1.status_signal.connect(self.on_camera_status)
+        self.camera_worker_1.start()
+        self.camera_worker = self.camera_worker_1
+
+    def _restart_camera_worker_2(self):
+        if self.camera_worker_2 is not None:
+            self.camera_worker_2.stop()
+        self.cam_widget_2.camera_id = self.camera_2_index
+        self.cam_widget_2.lbl_title.setText(f"Camera 2: Wrist Flange (/dev/video{self.camera_2_index})")
+        if self.enable_dual_cameras:
+            self.camera_worker_2 = CameraWorker(
+                self.camera_2_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode, self.is_grayscale
+            )
+            self.camera_worker_2.frame_ready.connect(self.on_cam2_frame_received)
+            self.camera_worker_2.fps_updated.connect(self.cam_widget_2.update_fps)
+            self.camera_worker_2.status_signal.connect(self.on_camera_status)
+            self.camera_worker_2.start()
+        else:
+            self.camera_worker_2 = None
+
+    def _swap_cameras(self):
+        """Cleanly swaps Cam 1 and Cam 2 devices without V4L2 EBUSY collisions."""
+        old_cam1, old_cam2 = self.camera_1_index, self.camera_2_index
+        print(f"[CAMERA] Swapping cameras: Cam 1 -> /dev/video{old_cam2}, Cam 2 -> /dev/video{old_cam1}")
+        if self.camera_worker_1 is not None:
+            self.camera_worker_1.stop()
+            self.camera_worker_1 = None
+        if self.camera_worker_2 is not None:
+            self.camera_worker_2.stop()
+            self.camera_worker_2 = None
+
+        self.camera_1_index = old_cam2
+        self.camera_index = old_cam2
+        self.camera_2_index = old_cam1
+
+        if hasattr(self, "combo_cam1"):
+            self.combo_cam1.blockSignals(True)
+            m1 = self.combo_cam1.findData(self.camera_1_index)
+            if m1 >= 0:
+                self.combo_cam1.setCurrentIndex(m1)
+            self.combo_cam1.blockSignals(False)
+        if hasattr(self, "combo_cam2"):
+            self.combo_cam2.blockSignals(True)
+            m2 = self.combo_cam2.findData(self.camera_2_index)
+            if m2 >= 0:
+                self.combo_cam2.setCurrentIndex(m2)
+            self.combo_cam2.blockSignals(False)
+
+        self._restart_camera_worker_1()
+        self._restart_camera_worker_2()
+
     def on_cam1_device_changed(self, index: int):
         cam_id = self.combo_cam1.itemData(index)
         if cam_id is not None and cam_id != self.camera_1_index:
+            if cam_id == self.camera_2_index:
+                self._swap_cameras()
+                return
             print(f"[CAMERA 1] Switching Workspace camera to /dev/video{cam_id}...")
             self.camera_1_index = cam_id
             self.camera_index = cam_id
-            if self.camera_worker_1 is not None:
-                self.camera_worker_1.stop()
-                self.camera_worker_1 = CameraWorker(
-                    self.camera_1_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode, self.is_grayscale
-                )
-                self.camera_worker_1.frame_ready.connect(self.on_cam1_frame_received)
-                self.camera_worker_1.fps_updated.connect(self.cam_widget_1.update_fps)
-                self.camera_worker_1.status_signal.connect(self.on_camera_status)
-                self.camera_worker_1.start()
-                self.camera_worker = self.camera_worker_1
-            self.cam_widget_1.lbl_title.setText(f"Camera 1: Workspace (/dev/video{self.camera_1_index})")
+            self._restart_camera_worker_1()
 
     def on_cam2_device_changed(self, index: int):
         cam_id = self.combo_cam2.itemData(index)
         if cam_id is not None and cam_id != self.camera_2_index:
+            if cam_id == self.camera_1_index:
+                self._swap_cameras()
+                return
             print(f"[CAMERA 2] Switching Wrist camera to /dev/video{cam_id}...")
             self.camera_2_index = cam_id
-            if self.camera_worker_2 is not None:
-                self.camera_worker_2.stop()
-                self.camera_worker_2 = CameraWorker(
-                    self.camera_2_index, self.target_fps, self.camera_width, self.camera_height, self.mock_mode, self.is_grayscale
-                )
-                self.camera_worker_2.frame_ready.connect(self.on_cam2_frame_received)
-                self.camera_worker_2.fps_updated.connect(self.cam_widget_2.update_fps)
-                self.camera_worker_2.status_signal.connect(self.on_camera_status)
-                self.camera_worker_2.start()
-            self.cam_widget_2.lbl_title.setText(f"Camera 2: Wrist Flange (/dev/video{self.camera_2_index})")
+            self._restart_camera_worker_2()
 
     def on_resolution_changed(self, index: int):
         if index < 0 or index >= len(self.RESOLUTION_PRESETS):
@@ -3323,14 +3358,56 @@ class UR5eRecorderStudio(QMainWindow):
             self.combo_resolution.blockSignals(False)
 
     def refresh_camera_streams(self):
-        """Flushes and reconnects active camera capture workers to clear any V4L2 queue stall."""
-        print("[CAMERA] Refreshing camera streams...")
-        if hasattr(self, "camera_worker_1") and self.camera_worker_1:
+        """Rescans connected V4L2 devices and reconnects active camera capture workers."""
+        print("[CAMERA] Rescanning connected cameras and refreshing streams...")
+        available_cameras = detect_available_cameras()
+        self._available_cameras = available_cameras
+        resolved_cam1, resolved_cam2 = resolve_camera_indices(
+            available_cameras, self.camera_1_index, self.camera_2_index
+        )
+        cam1_changed = resolved_cam1 != self.camera_1_index
+        cam2_changed = resolved_cam2 != self.camera_2_index
+        self.camera_1_index = resolved_cam1
+        self.camera_index = resolved_cam1
+        self.camera_2_index = resolved_cam2
+
+        if hasattr(self, "combo_cam1"):
+            self.combo_cam1.blockSignals(True)
+            self.combo_cam1.clear()
+            for idx, label in available_cameras:
+                self.combo_cam1.addItem(label, idx)
+            m1 = self.combo_cam1.findData(self.camera_1_index)
+            if m1 >= 0:
+                self.combo_cam1.setCurrentIndex(m1)
+            self.combo_cam1.blockSignals(False)
+
+        if hasattr(self, "combo_cam2"):
+            self.combo_cam2.blockSignals(True)
+            self.combo_cam2.clear()
+            for idx, label in available_cameras:
+                self.combo_cam2.addItem(label, idx)
+            m2 = self.combo_cam2.findData(self.camera_2_index)
+            if m2 >= 0:
+                self.combo_cam2.setCurrentIndex(m2)
+            self.combo_cam2.blockSignals(False)
+
+        if cam1_changed:
+            self._restart_camera_worker_1()
+        elif hasattr(self, "camera_worker_1") and self.camera_worker_1:
             self.camera_worker_1.request_reconnect()
-        if hasattr(self, "camera_worker_2") and self.camera_worker_2:
+
+        if cam2_changed:
+            self._restart_camera_worker_2()
+        elif hasattr(self, "camera_worker_2") and self.camera_worker_2:
             self.camera_worker_2.request_reconnect()
+        else:
+            self.cam_widget_2.camera_id = self.camera_2_index
+            self.cam_widget_2.lbl_title.setText(f"Camera 2: Wrist Flange (/dev/video{self.camera_2_index})")
+
         if hasattr(self, "status_bar"):
-            self.status_bar.showMessage("Camera streams refreshed.", 3000)
+            self.status_bar.showMessage(
+                f"Detected {len(available_cameras)} camera(s); streams refreshed.", 3000
+            )
 
     def update_visualizer_command(self):
         clean_name = self.dataset_root.name

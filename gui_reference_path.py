@@ -130,13 +130,19 @@ except ImportError:
     LEROBOT_UR5E_AVAILABLE = False
 
 
+from camera_utils import (
+    detect_available_cameras,
+    open_video_capture,
+    resolve_camera_indices,
+)
+
 # Default Network and Kinematic Configuration
 DEFAULT_ROBOT_IP = "192.168.1.102"
 DEFAULT_GRIPPER_IP = "192.168.1.1"
 DEFAULT_COMMAND_PORT = 30002
 DEFAULT_FPS = 30
-DEFAULT_CAMERA_1_INDEX = 4       # Workspace Camera (/dev/video4)
-DEFAULT_CAMERA_2_INDEX = 6       # Wrist Flange Camera (/dev/video6)
+DEFAULT_CAMERA_1_INDEX = 4       # Fallback preference; auto-resolved to connected cameras at startup
+DEFAULT_CAMERA_2_INDEX = 6       # Fallback preference; auto-resolved to connected cameras at startup
 
 HOME_JOINTS_DICT: Dict[str, float] = {
     "shoulder_pan": 0.0,
@@ -171,38 +177,7 @@ except ImportError:
     persist_start_position = None
 
 
-def detect_available_cameras() -> List[Tuple[int, str]]:
-    """
-    Scans Linux v4l2 device nodes and returns a list of (camera_index, user_friendly_label).
-    Filters out metadata-only sub-nodes using the sysfs 'index' attribute.
-    """
-    cameras = []
-    v4l_dir = Path("/sys/class/video4linux")
-    if v4l_dir.exists():
-        devs = sorted(
-            v4l_dir.glob("video*"),
-            key=lambda p: int(p.name.replace("video", "")) if p.name.replace("video", "").isdigit() else 999,
-        )
-        for dev in devs:
-            idx_file = dev / "index"
-            if idx_file.exists():
-                try:
-                    if idx_file.read_text().strip() != "0":
-                        continue
-                except Exception:
-                    pass
-            idx = int(dev.name.replace("video", ""))
-            name_file = dev / "name"
-            dev_name = name_file.read_text().strip() if name_file.exists() else f"Camera {idx}"
-            clean_name = dev_name.split(":")[0].strip()
-            cameras.append((idx, f"/dev/video{idx}: {clean_name}"))
-
-    if not cameras:
-        cameras = [
-            (DEFAULT_CAMERA_1_INDEX, f"/dev/video{DEFAULT_CAMERA_1_INDEX}: Workspace Camera"),
-            (DEFAULT_CAMERA_2_INDEX, f"/dev/video{DEFAULT_CAMERA_2_INDEX}: Wrist Camera"),
-        ]
-    return cameras
+# Camera discovery is provided by camera_utils.detect_available_cameras
 
 
 # =============================================================================
@@ -234,6 +209,7 @@ class CameraWorker(QThread):
         self.target_width = width
         self.target_height = height
         self.mock = mock
+        self._using_fallback = False
         self._running = False
         self._cap: Optional[cv2.VideoCapture] = None
         self._mutex = QMutex()
@@ -264,10 +240,9 @@ class CameraWorker(QThread):
         self._running = True
 
         if not self.mock:
-            self._cap = cv2.VideoCapture(self.camera_id)
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
-            self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+            self._cap = open_video_capture(
+                self.camera_id, self.target_width, self.target_height, self.target_fps
+            )
 
             if not self._cap.isOpened():
                 self.status_signal.emit(
@@ -275,8 +250,9 @@ class CameraWorker(QThread):
                     False,
                     f"Camera /dev/video{self.camera_id} unavailable (Fallback synthetic feed)",
                 )
-                self.mock = True
+                self._using_fallback = True
             else:
+                self._using_fallback = False
                 self.status_signal.emit(
                     self.camera_id,
                     True,
@@ -304,18 +280,23 @@ class CameraWorker(QThread):
                         pass
                     self._cap = None
                 time.sleep(0.05)
-                self._cap = cv2.VideoCapture(current_id)
-                self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, tw)
-                self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, th)
-                self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+                self._cap = open_video_capture(current_id, tw, th, self.target_fps)
                 if self._cap.isOpened():
+                    self._using_fallback = False
                     self.status_signal.emit(
                         current_id,
                         True,
                         f"Camera /dev/video{current_id} reconnected @ {self.target_fps} FPS",
                     )
+                else:
+                    self._using_fallback = True
+                    self.status_signal.emit(
+                        current_id,
+                        False,
+                        f"Camera /dev/video{current_id} unavailable (Fallback synthetic feed)",
+                    )
 
-            if not self.mock and self._cap and self._cap.isOpened():
+            if not self.mock and not self._using_fallback and self._cap and self._cap.isOpened():
                 ret, frame = self._cap.read()
                 if not ret or frame is None:
                     time.sleep(0.01)
@@ -691,8 +672,10 @@ class ReferencePathStudio(QMainWindow):
         self.robot_ip = robot_ip
         self.gripper_host = gripper_ip
         self.target_fps = target_fps
-        self.camera_1_index = camera_1_index
-        self.camera_2_index = camera_2_index
+        self._available_cameras = detect_available_cameras()
+        self.camera_1_index, self.camera_2_index = resolve_camera_indices(
+            self._available_cameras, camera_1_index, camera_2_index
+        )
         self.mock_mode = mock_mode
 
         # Active Start Position initialized to requested defaults:
@@ -1118,7 +1101,7 @@ class ReferencePathStudio(QMainWindow):
         cam_ctrl_bar = QHBoxLayout()
         cam_ctrl_bar.setSpacing(8)
 
-        available_cams = detect_available_cameras()
+        available_cams = getattr(self, "_available_cameras", None) or detect_available_cameras()
 
         # Cam 1 Selector
         lbl_c1 = QLabel("Cam 1:")

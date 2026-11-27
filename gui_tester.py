@@ -131,13 +131,18 @@ from camera_roi import (
     load_camera_roi_from_dir,
     normalize_roi,
 )
+from camera_utils import (
+    detect_available_cameras,
+    open_video_capture,
+    resolve_camera_indices,
+)
 
 # =============================================================================
 # Defaults & Global Constants
 # =============================================================================
 DEFAULT_ROBOT_IP = "192.168.1.102"
-DEFAULT_CAMERA_INDEX = 4         # HD Webcam C525 (Workspace)
-DEFAULT_CAMERA_2_INDEX = 6       # eFace 1325R (Wrist Flange)
+DEFAULT_CAMERA_INDEX = 4         # Fallback preference; auto-resolved to connected cameras at startup
+DEFAULT_CAMERA_2_INDEX = 6       # Fallback preference; auto-resolved to connected cameras at startup
 DEFAULT_FPS = 30
 DEFAULT_TRAIN_DIR = Path(__file__).resolve().parent / "outputs" / "train"
 
@@ -186,28 +191,7 @@ except ImportError:
     persist_start_position = None
 
 
-def detect_available_cameras() -> List[Tuple[int, str]]:
-    """Scans Linux v4l2 device nodes and returns (index, name)."""
-    cameras = []
-    v4l_dir = Path("/sys/class/video4linux")
-    if v4l_dir.exists():
-        for dev in sorted(v4l_dir.glob("video*"), key=lambda p: int(p.name.replace("video", "")) if p.name.replace("video", "").isdigit() else 999):
-            idx_file = dev / "index"
-            if idx_file.exists():
-                try:
-                    if idx_file.read_text().strip() != "0":
-                        continue
-                except Exception:
-                    pass
-            idx = int(dev.name.replace("video", ""))
-            name_file = dev / "name"
-            dev_name = name_file.read_text().strip() if name_file.exists() else f"Camera {idx}"
-            clean_name = dev_name.split(":")[0].strip()
-            cameras.append((idx, f"/dev/video{idx}: {clean_name}"))
-
-    if not cameras:
-        cameras = [(0, "/dev/video0: Default Camera")]
-    return cameras
+# Camera discovery is provided by camera_utils.detect_available_cameras
 
 
 def scan_available_checkpoints() -> List[Tuple[str, Path]]:
@@ -298,13 +282,11 @@ class CameraWorker(QThread):
     def run(self):
         self._running = True
         if not self.mock:
-            self.cap = cv2.VideoCapture(self.camera_index)
+            self.cap = open_video_capture(self.camera_index, 640, 480, self.target_fps)
             if not self.cap.isOpened():
                 self.status_signal.emit(self.camera_index, False, f"Could not open device /dev/video{self.camera_index}")
                 self.mock = True
             else:
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 self.status_signal.emit(self.camera_index, True, f"Opened /dev/video{self.camera_index}")
 
         frame_interval = 1.0 / self.target_fps
@@ -1293,8 +1275,10 @@ class UR5ePolicyTesterStudio(QMainWindow):
         self.robot_ip = robot_ip
         self.mock_mode = mock
         self.target_fps = DEFAULT_FPS
-        self.camera_1_index = DEFAULT_CAMERA_INDEX
-        self.camera_2_index = DEFAULT_CAMERA_2_INDEX
+        self._available_cameras = detect_available_cameras()
+        self.camera_1_index, self.camera_2_index = resolve_camera_indices(
+            self._available_cameras, DEFAULT_CAMERA_INDEX, DEFAULT_CAMERA_2_INDEX
+        )
         self.enable_dual_cameras = False
         self.is_grayscale = False
         self.model_required_cams = 1
@@ -1830,7 +1814,7 @@ class UR5ePolicyTesterStudio(QMainWindow):
         cam_ctrl_bar = QHBoxLayout()
         cam_ctrl_bar.setSpacing(6)
 
-        available_cameras = detect_available_cameras()
+        available_cameras = getattr(self, "_available_cameras", None) or detect_available_cameras()
 
         lbl_cam1 = QLabel("Cam 1:")
         lbl_cam1.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px;")
@@ -2901,9 +2885,43 @@ class UR5ePolicyTesterStudio(QMainWindow):
                 self.camera_worker_2.stop()
                 self.camera_worker_2 = None
 
+    def _swap_cameras(self):
+        old_cam1, old_cam2 = self.camera_1_index, self.camera_2_index
+        self.camera_worker_1.stop()
+        if self.camera_worker_2:
+            self.camera_worker_2.stop()
+            self.camera_worker_2 = None
+        self.camera_1_index, self.camera_2_index = old_cam2, old_cam1
+
+        self.combo_cam1.blockSignals(True)
+        m1 = self.combo_cam1.findData(self.camera_1_index)
+        if m1 >= 0:
+            self.combo_cam1.setCurrentIndex(m1)
+        self.combo_cam1.blockSignals(False)
+
+        self.combo_cam2.blockSignals(True)
+        m2 = self.combo_cam2.findData(self.camera_2_index)
+        if m2 >= 0:
+            self.combo_cam2.setCurrentIndex(m2)
+        self.combo_cam2.blockSignals(False)
+
+        self.camera_worker_1 = CameraWorker(self.camera_1_index, self.target_fps, 320, 240, self.mock_mode, self.is_grayscale)
+        self.camera_worker_1.frame_ready.connect(self.cam_widget_1.update_frame)
+        self.camera_worker_1.fps_updated.connect(self.cam_widget_1.update_fps)
+        self.camera_worker_1.start()
+
+        if self.enable_dual_cameras:
+            self.camera_worker_2 = CameraWorker(self.camera_2_index, self.target_fps, 320, 240, self.mock_mode, self.is_grayscale)
+            self.camera_worker_2.frame_ready.connect(self.cam_widget_2.update_frame)
+            self.camera_worker_2.fps_updated.connect(self.cam_widget_2.update_fps)
+            self.camera_worker_2.start()
+
     def on_cam1_device_changed(self, index: int):
         dev_idx = self.combo_cam1.itemData(index)
         if dev_idx is not None and dev_idx != self.camera_1_index:
+            if dev_idx == self.camera_2_index:
+                self._swap_cameras()
+                return
             self.camera_1_index = dev_idx
             self.camera_worker_1.stop()
             self.camera_worker_1 = CameraWorker(self.camera_1_index, self.target_fps, 320, 240, self.mock_mode, self.is_grayscale)
@@ -2914,6 +2932,9 @@ class UR5ePolicyTesterStudio(QMainWindow):
     def on_cam2_device_changed(self, index: int):
         dev_idx = self.combo_cam2.itemData(index)
         if dev_idx is not None and dev_idx != self.camera_2_index:
+            if dev_idx == self.camera_1_index:
+                self._swap_cameras()
+                return
             self.camera_2_index = dev_idx
             if self.camera_worker_2:
                 self.camera_worker_2.stop()

@@ -1,0 +1,54 @@
+# =============================================================================
+# UR5e LeRobot — Python Package Requirements
+# =============================================================================
+# Requires Python >= 3.12 (tested on Python 3.12.14 with CUDA GPU).
+#
+# Standard pip / venv / uv usage:
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# Anaconda / Miniconda usage:
+#   conda env create -f environment.yml
+#   conda activate ur5e_lerobot
+#
+# GPU / CUDA note:
+#   On Linux, `pip install torch torchvision` installs CUDA-enabled wheels by
+#   default. If you need a specific CUDA toolkit build (e.g. CUDA 12.4/12.6),
+#   install PyTorch first from https://pytorch.org/get-started/locally/ and
+#   then run `pip install -r requirements.txt`.
+# =============================================================================
+
+# --- Core Deep Learning & Hugging Face LeRobot Framework ---
+torch>=2.4.0
+torchvision>=0.19.0
+# Requires LeRobot >= 0.6.0 (for RGBEncoderConfig, streaming_encoding, v3.0 datasets,
+# and make_pre_post_processors). If your PyPI mirror does not have >=0.6.0 yet,
+# install directly from GitHub:
+#   pip install "lerobot @ git+https://github.com/huggingface/lerobot.git"
+lerobot>=0.6.0
+av>=14.0.0                  # PyAV video encoding/decoding (H.264 streaming backend)
+pyarrow>=18.0.0             # Parquet dataset I/O and offline vision diagnostics
+datasets>=3.0.0             # Hugging Face datasets backend used by LeRobot
+huggingface-hub>=0.25.0
+
+# --- Desktop GUI (PyQt6 Studios: Recorder, Trainer, Tester, Reference Path) ---
+PyQt6>=6.7.0
+
+# --- Computer Vision, Numerics & Plotting ---
+# Use opencv-python-headless (NOT opencv-python) to prevent Qt/xcb plugin
+# library conflicts with PyQt6 on Linux desktop environments.
+opencv-python-headless>=4.10.0
+numpy>=2.0.0
+scipy>=1.13.0               # CubicSpline trajectory smoothing (path_manager.py)
+Pillow>=10.0.0
+matplotlib>=3.9.0           # Training & validation loss curve plotting
+
+# --- Hardware Interfaces (UR5e RTDE, OnRobot 2FG Gripper, Gamepad) ---
+ur-rtde>=1.5.7              # 125 Hz UR5e RTDE telemetry (rtde_receive / ur_rtde)
+pymodbus>=3.6.0             # OnRobot 2FG14 / 2FG7 Modbus TCP gripper driver
+pygame>=2.6.0               # USB/Bluetooth Xbox & PlayStation gamepad teleop
+
+# --- Optional Extras (uncomment if needed) ---
+# rerun-sdk>=0.22.0         # Interactive dataset visualization (lerobot-dataset-viz)
+# diffusers>=0.30.0         # Required only if training Diffusion Policy instead of ACT

@@ -1,0 +1,23 @@
+# =============================================================================
+# UR5e LeRobot — Anaconda / Miniconda / Mamba Environment Specification
+# =============================================================================
+# Create the environment:
+#   conda env create -f environment.yml
+#   conda activate ur5e_lerobot
+#
+# Update an existing environment after editing requirements.txt:
+#   conda env update -f environment.yml --prune
+# =============================================================================
+
+name: ur5e_lerobot
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - pip>=24.0
+  - ffmpeg                  # System codecs for PyAV / H.264 MP4 video encoding
+  - pip:
+      - -r requirements.txt
